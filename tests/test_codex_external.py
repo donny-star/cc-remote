@@ -53,12 +53,24 @@ def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
         (proc / "cmdline").write_bytes(
             b"\0".join(arg.encode() for arg in cmdline) + b"\0")
     if cwd is not None:
-        (proc / "cwd").symlink_to(cwd)
+        try:
+            (proc / "cwd").symlink_to(cwd)
+        except OSError as exc:
+            if sys.platform == "win32":
+                pytest.skip(
+                    f"Windows symlink privilege is unavailable: {exc}")
+            raise
     return proc
 
 
 def _fake_fd(proc: Path, fd: int, target: Path, flags: int) -> None:
-    (proc / "fd" / str(fd)).symlink_to(target)
+    try:
+        (proc / "fd" / str(fd)).symlink_to(target)
+    except OSError as exc:
+        if sys.platform == "win32":
+            pytest.skip(
+                f"Windows symlink privilege is unavailable: {exc}")
+        raise
     (proc / "fdinfo" / str(fd)).write_text(f"flags:\t0{flags:o}\n")
 
 
@@ -465,7 +477,13 @@ def test_writable_holder_uses_inode_not_path_text(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
     alias = tmp_path / "alias.jsonl"
-    alias.symlink_to(rollout)
+    try:
+        alias.symlink_to(rollout)
+    except OSError as exc:
+        if sys.platform == "win32":
+            pytest.skip(
+                f"Windows symlink privilege is unavailable: {exc}")
+        raise
     proc_root = tmp_path / "proc"
     writer = _fake_process(proc_root, 201, 2001)
     _fake_fd(writer, 3, alias, os.O_WRONLY)
