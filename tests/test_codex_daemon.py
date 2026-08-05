@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sys
 import tempfile
 
 import pytest
@@ -556,6 +557,7 @@ def test_linux_managed_daemon_nofile_fails_closed_on_low_hard_limit(
 
 def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         manager = CodexDaemonManager("auto")
@@ -621,6 +623,7 @@ def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
 
 def test_stale_darwin_updater_is_recovered_before_generic_restart(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         monkeypatch.setattr(
@@ -682,6 +685,7 @@ def test_stale_darwin_updater_is_recovered_before_generic_restart(monkeypatch):
 
 def test_stale_managed_daemon_uses_official_restart_when_not_exact(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         monkeypatch.setattr(
@@ -739,6 +743,7 @@ def test_stale_managed_daemon_uses_official_restart_when_not_exact(monkeypatch):
 
 def test_unrecoverable_stale_daemon_still_falls_back_to_stdio(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         monkeypatch.setattr(
@@ -1004,13 +1009,22 @@ def test_exact_zombie_daemon_updater_gets_sigterm_only(monkeypatch, tmp_path):
     processes = {41001: updater, 41002: server}
     signals: list[tuple[int, int]] = []
 
+    running_on_windows = sys.platform == "win32"
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(
         daemon_module, "_darwin_process_info", lambda pid: processes.get(pid))
     monkeypatch.setattr(
-        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+        daemon_module, "process_owner_uid",
+        lambda _pid: getattr(os, "getuid", lambda: 0)())
     monkeypatch.setattr(
         daemon_module, "_darwin_process_state", lambda _pid: "Z+")
+    if running_on_windows:
+        # ``_managed_pid`` requires ``os.O_NOFOLLOW`` (POSIX-only) and always
+        # returns ``None`` here, so the real PID-file reader is bypassed to
+        # exercise the darwin-only signaling logic under test.
+        monkeypatch.setattr(
+            daemon_module, "_managed_pid",
+            lambda path: 41002 if path.name == "app-server.pid" else 41001)
 
     def terminate(pid, sig):
         signals.append((pid, sig))
@@ -1085,6 +1099,7 @@ def test_ambiguous_darwin_daemon_state_never_signals(
 
 def test_lagging_managed_daemon_restarts_before_shared_proxy(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
         manager = CodexDaemonManager("auto")
@@ -1138,6 +1153,7 @@ def test_lagging_managed_daemon_restarts_before_shared_proxy(monkeypatch):
 
 def test_lagging_managed_daemon_restart_failure_never_uses_stdio(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
         manager = CodexDaemonManager("auto")
@@ -1251,6 +1267,7 @@ def test_daemon_enable_failure_is_not_reported_ready(monkeypatch):
 
 def test_existing_official_app_server_is_exposed_for_proxy_validation(monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         manager = CodexDaemonManager("auto")
@@ -1280,8 +1297,10 @@ def test_existing_official_app_server_is_exposed_for_proxy_validation(monkeypatc
     asyncio.run(run())
 
 
-def test_daemon_capability_cache_invalidates_on_binary_change(tmp_path):
+def test_daemon_capability_cache_invalidates_on_binary_change(
+        tmp_path, monkeypatch):
     async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "posix")
         binary = tmp_path / "codex"
         binary.write_text("old")
         manager = CodexDaemonManager("auto")
@@ -1989,7 +2008,8 @@ def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(
+            handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         handle.model = "gpt-test"
         handle.effort = None
@@ -2043,7 +2063,8 @@ def test_verified_shared_proxy_failure_never_falls_back_to_stdio(monkeypatch):
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(
+            handle_module.os, "killpg", lambda *_args: None, raising=False)
 
         with pytest.raises(CodexProxyProtocolError):
             await CodexHandle(_Cfg(), daemon_manager=manager).connect(cwd="/tmp")
@@ -2129,7 +2150,8 @@ def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(
+            handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         handle.model = "gpt-test"
         handle.effort = None

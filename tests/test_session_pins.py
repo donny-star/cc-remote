@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -80,7 +81,8 @@ def test_session_pin_store_persists_and_unpins(tmp_path):
     store.set_pinned("codex", "codex-1", True)
     assert SessionPinStore(tmp_path).ids("claude") == {"claude-1"}
     assert SessionPinStore(tmp_path).ids("codex") == {"codex-1"}
-    assert oct(os.stat(tmp_path / "session-pins.json").st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":
+        assert oct(os.stat(tmp_path / "session-pins.json").st_mode & 0o777) == "0o600"
 
     store.set_pinned("claude", "claude-1", False)
     assert SessionPinStore(tmp_path).ids("claude") == set()

@@ -27,6 +27,7 @@ from typing import Any, Mapping, Optional
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
+from cc_remote.wrapper.os_compat import current_uid
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
     ProcessIdentity,
@@ -344,7 +345,7 @@ def _managed_pid(path: Path) -> Optional[int]:
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != os.getuid()
+                or file_stat.st_uid != current_uid()
                 or file_stat.st_size > _PID_RECORD_MAX):
             return None
         data = os.read(descriptor, _PID_RECORD_MAX + 1)
@@ -592,8 +593,8 @@ def _terminate_stale_darwin_daemon_updater(
         return False
     if updater_bin != os.path.realpath(codex_bin):
         return False
-    if (process_owner_uid(updater_pid) != os.getuid()
-            or process_owner_uid(app_server_pid) != os.getuid()
+    if (process_owner_uid(updater_pid) != current_uid()
+            or process_owner_uid(app_server_pid) != current_uid()
             or not (_darwin_process_state(app_server_pid) or "").startswith("Z")):
         return False
     # Close the PID-reuse window immediately before signalling both identities.

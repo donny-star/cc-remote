@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -593,7 +594,8 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     store.invalidate_session("session-2")
     assert store.get_page(
         "session-2", "claude", source, before=None, limit=4) is None
-    assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":
+        assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
 def test_agent_detail_cache_is_source_bound_and_invalidatable(tmp_path):

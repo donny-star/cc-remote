@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from types import SimpleNamespace
 
@@ -22,6 +23,14 @@ from cc_remote.wrapper.codex_forks import CodexForkJournal
 from cc_remote.wrapper.codex_forks import ForkJournalError
 from cc_remote.wrapper.codex_rpc import CodexRpcOutcomeUnknown, CodexRpcRejected
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+# The source production path (machine.py's ``_handle_fork_session_locked``)
+# normalizes the source cwd with ``os.path.realpath`` before using it as a
+# journal identity key. On Windows that turns a bare "/repo/component" into
+# "D:\\repo\\component" (drive-relative root), while POSIX leaves it
+# unchanged, so tests must route every occurrence through the same call to
+# stay aligned with what the code under test actually stores/compares.
+_SOURCE_CWD = os.path.realpath("/repo/component")
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +68,7 @@ def _ctx(state: str = "idle"):
     ctx = _mk_ctx("parent", "parent")
     ctx.engine = "codex"
     ctx.state = state
-    ctx.cwd = "/repo/component"
+    ctx.cwd = _SOURCE_CWD
     ctx.sdk = SimpleNamespace(model="gpt-test")
     return ctx
 
@@ -448,7 +457,7 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
             "approvalPolicy": "never",
         }, None)]
         assert result.session_id == "forked-thread"
-        assert result.cwd == "/repo/component"
+        assert result.cwd == _SOURCE_CWD
         assert result.target == "same_cwd"
         assert result.git_branch is None
         assert result.last_turn_id == "turn-2"
@@ -459,7 +468,7 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
         # the in-memory command ACK cache.
         reloaded = CodexForkJournal(machine.cfg.state_dir)
         entry = reloaded.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _SOURCE_CWD)
         assert entry["status"] == "complete"
         assert entry["session_id"] == "forked-thread"
 
@@ -691,7 +700,7 @@ def test_codex_same_cwd_fork_recovers_committed_rollout_intent(monkeypatch):
         machine, _ = _mk_machine()
         machine.sessions = {"parent": _ctx()}
         machine._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _SOURCE_CWD)
 
         async def is_codex(_sid): return True
         async def list_sessions(_cmd): return None
@@ -703,7 +712,7 @@ def test_codex_same_cwd_fork_recovers_committed_rollout_intent(monkeypatch):
         monkeypatch.setattr(machine_module, "codex_rpc", rpc)
         monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: {
             "session_id": "recovered-thread",
-            "cwd": "/repo/component",
+            "cwd": _SOURCE_CWD,
             "thread_source": "cc-remote-fork:request-1",
             "forked_from_id": "parent",
         })
@@ -779,7 +788,7 @@ def test_codex_same_cwd_fork_unknown_rpc_outcome_only_reconciles_on_retry(monkey
                 return None
             return {
                 "session_id": child,
-                "cwd": "/repo/component",
+                "cwd": _SOURCE_CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             }
@@ -836,7 +845,7 @@ def test_codex_same_cwd_fork_background_reconcile_acks_current_connection(monkey
                 return None
             return {
                 "session_id": "background-child",
-                "cwd": "/repo/component",
+                "cwd": _SOURCE_CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             }
@@ -876,7 +885,7 @@ def test_codex_same_cwd_fork_restart_submitted_state_never_reforks(monkeypatch):
     async def run():
         first, first_transport = _mk_machine()
         first._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _SOURCE_CWD)
         first._codex_forks.mark_submitted("request-1")
 
         transport = type(first_transport)()
@@ -920,7 +929,7 @@ def test_codex_same_identity_new_request_aliases_submitted_child(monkeypatch):
         machine.FORK_RECONCILE_DELAY = 0
         machine.FORK_BACKGROUND_ATTEMPTS = 1
         machine._codex_forks.begin(
-            "request-old", "parent", "turn-2", "/repo/component")
+            "request-old", "parent", "turn-2", _SOURCE_CWD)
         machine._codex_forks.mark_submitted("request-old")
         rpc_calls = []
         visible = {"child": None}
@@ -935,7 +944,7 @@ def test_codex_same_identity_new_request_aliases_submitted_child(monkeypatch):
                 return None
             return {
                 "session_id": visible["child"],
-                "cwd": "/repo/component",
+                "cwd": _SOURCE_CWD,
                 "thread_source": marker,
                 "forked_from_id": "parent",
             }
