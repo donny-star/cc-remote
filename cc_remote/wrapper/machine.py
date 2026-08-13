@@ -7652,6 +7652,7 @@ class WrapperMachine:
                     profile.home / "shell_snapshots")
             if shared_darwin_snapshot is not None:
                 scan_kwargs["darwin_snapshot"] = shared_darwin_snapshot
+            scan_kwargs.setdefault("wrapper_pid", os.getpid())
             scan = await asyncio.to_thread(
                 writable_rollout_holders,
                 native_paths,

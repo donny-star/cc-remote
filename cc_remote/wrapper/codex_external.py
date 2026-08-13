@@ -30,6 +30,7 @@ from cc_remote.wrapper.process_scan import (
     darwin_process_snapshot,
     process_command,
     process_command_environment_value,
+    process_identity,
 )
 
 MAX_FDS_PER_PROCESS = 8192
@@ -637,6 +638,156 @@ def _darwin_writable_rollout_holders(
     )
 
 
+def _win32_process_parent_map() -> dict[int, int] | None:
+    """Return {pid: ppid} for every live process via Toolhelp32."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            return None
+        parent_map: dict[int, int] = {}
+        while True:
+            parent_map[int(entry.th32ProcessID)] = int(
+                entry.th32ParentProcessID)
+            if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+        return parent_map
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def _win32_is_descendant(
+    pid: int,
+    ancestor_pid: int,
+    parent_map: Mapping[int, int],
+) -> bool:
+    """True if ``pid`` is ``ancestor_pid`` or any of its descendants."""
+    current = pid
+    seen: set[int] = set()
+    while current and current not in seen:
+        if current == ancestor_pid:
+            return True
+        seen.add(current)
+        current = parent_map.get(current)
+        if current is None:
+            return False
+    return False
+
+
+def _win32_writable_rollout_holders(
+    paths: Mapping[str, str],
+    own_processes: Iterable[ProcessIdentity],
+    *,
+    wrapper_pid: int,
+) -> HolderScan:
+    """Windows implementation of writable_rollout_holders.
+
+    Windows has no /proc, so the inode/FD walk and lsof are unavailable.  The
+    primary Linux signal (a second process holding the rollout open for writing)
+    is replaced here by argv evidence: a foreign process naming a watched
+    thread id or rollout file owns that session.  Wrapper children (including
+    the SDK app-server and its descendants) are excluded via the Toolhelp32
+    parent map, and ``own_processes`` covers the exact SDK process identities.
+
+    Unreadable protected processes are the norm on Windows and are never Codex
+    clients; they are skipped without marking the scan incomplete, matching the
+    established ``_win32_claude_session_holders`` convention.  ``complete`` is
+    therefore only False when the process snapshot itself fails or overflows.
+    """
+    import win32process
+
+    result = {sid: set() for sid in paths}
+    passive = {sid: set() for sid in paths}
+    private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
+    client_proxies: dict[ProcessIdentity, int] = {}
+    sid_by_arg = {sid.encode(): sid for sid in paths}
+    rollout_names = {
+        sid: os.path.basename(path).encode()
+        for sid, path in paths.items() if path
+    }
+    own = set(own_processes)
+    parent_map = _win32_process_parent_map()
+
+    try:
+        pids = win32process.EnumProcesses()
+    except Exception:
+        return HolderScan(result, False, passive, client_proxies, private)
+    complete = True
+    if len(pids) > MAX_PROC_SCAN:
+        complete = False
+        pids = pids[:MAX_PROC_SCAN]
+
+    for pid in pids:
+        if pid == 0 or pid == wrapper_pid:
+            continue
+        identity = process_identity(pid)
+        if identity is None or identity in own:
+            continue
+        if parent_map is not None and _win32_is_descendant(
+                pid, wrapper_pid, parent_map):
+            continue
+        args = process_command(identity)
+        if args is None:
+            continue
+        # Reject PID reuse/exit races: only a live identity with the exact
+        # start ticks may claim ownership of a watched rollout.
+        if process_identity(pid) != identity:
+            continue
+        interactive_tui = _is_interactive_codex_tui(args, 1)
+        is_proxy = _is_app_server_proxy(args, 0)
+        if is_proxy or interactive_tui:
+            client_proxies[identity] = identity.start_ticks
+        logical_sids = _codex_resume_sids(args, sid_by_arg)
+        matched: set[str] = set()
+        for arg in args:
+            sid = sid_by_arg.get(arg)
+            if sid is not None:
+                matched.add(sid)
+                continue
+            for watched_sid, rollout_name in rollout_names.items():
+                if rollout_name and rollout_name in arg:
+                    matched.add(watched_sid)
+        if not matched and not logical_sids:
+            continue
+        for sid in logical_sids:
+            result[sid].add(identity)
+            if sid not in matched:
+                logical[sid].add(identity)
+        for sid in matched:
+            result[sid].add(identity)
+            if _is_passive_app_server(None, 0, args):
+                passive[sid].add(identity)
+                if not _is_managed_shared_app_server(args):
+                    private[sid].add(identity)
+    return HolderScan(result, complete, passive, client_proxies, private,
+                      logical_holders=logical)
+
+
 def writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity] = (),
@@ -644,6 +795,7 @@ def writable_rollout_holders(
     proc_root: str = "/proc",
     shell_snapshot_root: str | None = None,
     darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
+    wrapper_pid: int | None = None,
 ) -> HolderScan:
     """Return writable holders of each rollout, excluding exact wrapper children.
 
@@ -654,6 +806,10 @@ def writable_rollout_holders(
     if sys.platform == "darwin" and proc_root == "/proc":
         return _darwin_writable_rollout_holders(
             paths, own_processes, process_snapshot=darwin_snapshot)
+    if sys.platform == "win32" and proc_root == "/proc":
+        return _win32_writable_rollout_holders(
+            paths, own_processes, wrapper_pid=(
+                wrapper_pid if wrapper_pid is not None else os.getpid()))
 
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
