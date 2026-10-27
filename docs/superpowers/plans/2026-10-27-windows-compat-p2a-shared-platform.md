@@ -33,6 +33,9 @@
 - 文件归属：只改本计划"文件结构"表里列出的文件；`cc_remote/platform/ipc.py`、`cc_remote/platform/pty.py` 属于 P3，不能碰。
 - 工作目录 `C:\Users\xuhaodong\work\cc-remote-p2`，分支 `win/2-wrapper`（PR 用独立分支 `win/2a-shared-platform`，见收尾任务）。
 - Windows 上 Bash 用 Git Bash；命令里的 `.venv/Scripts/python.exe` 在 Linux CI 上对应 `.venv/bin/python`。
+- MAX_PATH：本机 `LongPathsEnabled=0`。如果 pytest 的临时目录很深（例如 TEMP 位于 `…\Temp\codeg-acp\<id>\` 下），
+  部分用例会因路径超过 260 字符而失败（`FileNotFoundError`/`WinError 3`），这不是本计划的回归。验收时给 pytest 加
+  `--basetemp=C:\t\<测试文件名>` 之类的短路径。长路径支持属 P5 环境检查（见 P2d"跨子项目依赖"），P2 不改注册表。
 
 ## 文件结构
 
@@ -44,6 +47,7 @@
 | `tests/conftest.py` | 修改 | `requires_symlink` 的 reason 必填校验和"无法建符号链接时 skip" |
 | `tests/test_platform_harness.py` | 修改 | 标记自检 |
 | `cc_remote/platform/files.py` | 修改 | 新增 `is_reparse_point`、`open_nofollow`；抽出 Windows `CreateFileW` 公共实现 |
+| `tests/unix_socket.py` | 新建 | 在两个平台上绑定真实 AF_UNIX 监听（Windows 用 Winsock ctypes），供 P2a/P2b/P2d 的 reparse point 与 socket 夹具复用 |
 | `tests/test_platform_files.py` | 修改 | 两个新接口的测试 |
 
 ## 准备工作（执行者开始前做一次）
@@ -75,6 +79,8 @@ Expected: 最后一行输出 `ok`。
   `procs._tombstones: collections.OrderedDict[int, int | None]`、`procs._created: dict[int, int | None]`、
   `procs._TOMBSTONE_LIMIT: int = 4096`、`procs._bury_locked(pid: int) -> None`、
   `procs._register(pid: int, job: Any, created: int | None) -> None`（新增第三个参数）。
+  墓碑上限 4096 条，按 LRU 淘汰；被淘汰的极旧 pid 回到原来的 `taskkill` 路径（调用方本来只对自己启动的组长调用
+  `killpg`，见 handoff"进程"一节），这一点写进 `_TOMBSTONE_LIMIT` 的注释。POSIX 分支不变。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -197,6 +203,8 @@ Windows 分支里，把
     # an unrelated tree that inherited the recycled pid.
     _created: dict[int, int | None] = {}
     _tombstones: OrderedDict[int, int | None] = OrderedDict()
+    # Bounded LRU: an evicted (very old) pid falls back to taskkill, which is
+    # acceptable only because callers killpg nothing but their own groups.
     _TOMBSTONE_LIMIT = 4096
 
     def _bury_locked(pid: int) -> None:
@@ -451,6 +459,7 @@ EOF
 在 Windows、Linux 上全部通过。
 
 **Files:**
+- Create: `tests/unix_socket.py`（AF_UNIX 监听夹具，Step 0 先验证可行性）
 - Modify: `cc_remote/platform/files.py`（新增 `is_reparse_point`、`open_nofollow`、Windows 私有 helper
   `_kernel32()`、`_win32_create(...)`；`open_with_share_delete` 改为调用 `_win32_create`，行为不变）
 - Test: `tests/test_platform_files.py`
@@ -464,11 +473,109 @@ EOF
     `os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)`；Windows：带
     `FILE_FLAG_OPEN_REPARSE_POINT` 打开，若打开的对象是 reparse point 则关闭句柄并抛
     `OSError(errno.ELOOP, ...)`；其余语义同 `open_with_share_delete`（share-delete、二进制、`mode` 在 Windows 上忽略）。
-    只用于普通文件；目录请用 P2c 的 `DirHandle`。
+    只用于普通文件；目录请用 P2c 的 `DirHandle`（Windows 上对目录或 junction 打开会得到 `PermissionError`）。
+    **截断顺序（实测修订）**：Windows 上带 `FILE_FLAG_OPEN_REPARSE_POINT` 用 `CREATE_ALWAYS` 打开一个 reparse point，
+    会先把它替换成普通文件（本机实测 AF_UNIX socket 文件属性 `0x420` → `0x20`），检查来不及发生。因此
+    `refuse_reparse=True` 时 `O_TRUNC` 一律先以 `OPEN_ALWAYS`/`OPEN_EXISTING` 打开、确认不是 reparse point，再
+    `os.ftruncate(fd, 0)`。`open_with_share_delete`（`refuse_reparse=False`）的处置方式保持原样。
+  - `tests.unix_socket.short_temp_root() -> str`、`tests.unix_socket.unix_listener(path: Path)`（上下文管理器，
+    产出监听句柄；退出时关闭但不删除 socket 文件）——P2b、P2d 复用。
+
+- [ ] **Step 0: 可行性验证（AF_UNIX 夹具）**
+
+新建 `tests/unix_socket.py`：
+
+```python
+"""Bind a real AF_UNIX listener on every platform for socket-file fixtures.
+
+CPython on Windows has no ``socket.AF_UNIX``, but Windows 10 1803+ supports
+AF_UNIX in Winsock. The bound path is a reparse point tagged
+IO_REPARSE_TAG_AF_UNIX, exactly what the official Codex daemon creates.
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import socket
+import sys
+import tempfile
+from pathlib import Path
+
+
+def short_temp_root() -> str:
+    """A temp root short enough for the 108-byte ``sun_path`` limit."""
+    if sys.platform != "win32":
+        return "/tmp"
+    local = os.environ.get("LOCALAPPDATA")
+    candidate = os.path.join(local, "Temp") if local else ""
+    return candidate if candidate and os.path.isdir(candidate) else tempfile.gettempdir()
+
+
+@contextlib.contextmanager
+def unix_listener(path: Path):
+    """Bind and listen on ``path``; close (but do not unlink) on exit."""
+    if sys.platform != "win32":
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path))
+            listener.listen()
+            yield listener
+        return
+    import ctypes
+
+    ws2 = ctypes.WinDLL("ws2_32")
+
+    class _WsaData(ctypes.Structure):
+        _fields_ = [("data", ctypes.c_byte * 512)]
+
+    class _SockaddrUn(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]
+
+    if ws2.WSAStartup(0x0202, ctypes.byref(_WsaData())) != 0:
+        raise OSError("WSAStartup failed")
+    ws2.socket.restype = ctypes.c_size_t
+    ws2.bind.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    ws2.listen.argtypes = [ctypes.c_size_t, ctypes.c_int]
+    ws2.closesocket.argtypes = [ctypes.c_size_t]
+    raw = os.fsencode(path)
+    if len(raw) >= 108:
+        raise OSError(f"AF_UNIX path too long ({len(raw)} bytes): {path}")
+    handle = ws2.socket(1, 1, 0)  # AF_UNIX, SOCK_STREAM
+    if handle == ctypes.c_size_t(-1).value:
+        raise OSError(f"AF_UNIX socket failed: {ws2.WSAGetLastError()}")
+    try:
+        address = _SockaddrUn(1, raw)
+        if ws2.bind(handle, ctypes.byref(address), ctypes.sizeof(address)) != 0:
+            raise OSError(f"AF_UNIX bind failed: {ws2.WSAGetLastError()}")
+        if ws2.listen(handle, 4) != 0:
+            raise OSError(f"AF_UNIX listen failed: {ws2.WSAGetLastError()}")
+        yield handle
+    finally:
+        ws2.closesocket(handle)
+```
+
+验证它在本机可用、并且 socket 文件确实是 reparse point（后续测试都依赖这一点）：
+
+```bash
+PYTHONUTF8=1 .venv/Scripts/python.exe - <<'EOF'
+import os, shutil, tempfile
+from pathlib import Path
+from tests.unix_socket import short_temp_root, unix_listener
+root = Path(tempfile.mkdtemp(prefix="cc-p2a-", dir=short_temp_root()))
+with unix_listener(root / "s.sock"):
+    info = os.lstat(root / "s.sock")
+    print(hex(info.st_file_attributes & 0x400), hex(getattr(info, "st_reparse_tag", 0)))
+shutil.rmtree(root)
+print("cleanup", not root.exists())
+EOF
+```
+
+Expected（Windows）：`0x400 0x80000023` 与 `cleanup True`（2026-10-28 本机已实测通过）。若 `WSAStartup`/`bind` 失败，停止执行本任务，
+报告 controller：P2a 的 AF_UNIX 用例、P2b `is_unix_socket` 与 P2d Task 6 的夹具都要改方案。
 
 - [ ] **Step 1: 写失败测试**
 
-在 `tests/test_platform_files.py` 顶部 import 区加入 `import errno`、`import sys`，然后在文件末尾追加：
+在 `tests/test_platform_files.py` 顶部 import 区加入 `import errno`、`import sys`、`import tempfile`、
+`from pathlib import Path`，然后在文件末尾追加：
 
 ```python
 def _link_directory(target, link) -> None:
@@ -571,40 +678,64 @@ def test_open_nofollow_refuses_to_create_through_dangling_symlink(tmp_path) -> N
     assert not (tmp_path / "elsewhere").exists()
 
 
+def test_open_nofollow_truncates_regular_files(tmp_path) -> None:
+    path = tmp_path / "f"
+    for flags in (os.O_WRONLY | os.O_TRUNC, os.O_WRONLY | os.O_CREAT | os.O_TRUNC):
+        path.write_bytes(b"old content")
+        fd = files.open_nofollow(path, flags)
+        try:
+            os.write(fd, b"n")
+        finally:
+            os.close(fd)
+        assert path.read_bytes() == b"n"
+
+
+def test_open_nofollow_refuses_a_directory_link(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_directory(target, link)
+    # POSIX: ELOOP from O_NOFOLLOW. Windows: a directory (junction) cannot be
+    # opened as a file at all (PermissionError); either way nothing is opened.
+    with pytest.raises(OSError):
+        files.open_nofollow(link, os.O_RDONLY)
+    assert files.is_reparse_point(link) is True
+
+
+@pytest.fixture
+def socket_dir():
+    from tests.unix_socket import short_temp_root
+
+    with tempfile.TemporaryDirectory(prefix="cc-p2a-", dir=short_temp_root()) as root:
+        yield Path(root)
+
+
 @pytest.mark.windows_only(reason="AF_UNIX socket files are reparse points only on Windows")
-def test_open_nofollow_refuses_windows_af_unix_socket_file(tmp_path) -> None:
-    import ctypes
+@pytest.mark.parametrize("flags", [
+    os.O_RDONLY,
+    os.O_WRONLY | os.O_CREAT,
+    os.O_WRONLY | os.O_TRUNC,
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+], ids=["read", "create", "truncate", "create-truncate"])
+def test_open_nofollow_refuses_a_reparse_point_without_superseding_it(socket_dir, flags) -> None:
+    from tests.unix_socket import unix_listener
 
-    ws2 = ctypes.WinDLL("ws2_32")
-
-    class _WsaData(ctypes.Structure):
-        _fields_ = [("data", ctypes.c_byte * 512)]
-
-    class _SockaddrUn(ctypes.Structure):
-        _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]
-
-    assert ws2.WSAStartup(0x0202, ctypes.byref(_WsaData())) == 0
-    ws2.socket.restype = ctypes.c_size_t
-    ws2.bind.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
-    ws2.closesocket.argtypes = [ctypes.c_size_t]
-    sock = ws2.socket(1, 1, 0)  # AF_UNIX, SOCK_STREAM
-    path = tmp_path / "s.sock"
-    address = _SockaddrUn(1, os.fsencode(path))
-    try:
-        assert ws2.bind(sock, ctypes.byref(address), ctypes.sizeof(address)) == 0
+    path = socket_dir / "s.sock"
+    with unix_listener(path):
         assert files.is_reparse_point(path) is True
         with pytest.raises(OSError) as caught:
-            files.open_nofollow(path, os.O_RDONLY)
+            files.open_nofollow(path, flags)
         assert caught.value.errno == errno.ELOOP
-    finally:
-        ws2.closesocket(sock)
+        # CREATE_ALWAYS would have replaced the socket with a regular file.
+        assert files.is_reparse_point(path) is True
 ```
 
 - [ ] **Step 2: 运行测试，确认失败**
 
 Run: `PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/test_platform_files.py -p no:xdist -o addopts="" -q`
 Expected: 新用例 FAIL：`AttributeError: module 'cc_remote.platform.files' has no attribute 'is_reparse_point'`
-（以及 `open_nofollow`）；需要符号链接的 4 个用例在未开开发者模式的 Windows 上 SKIPPED。
+（以及 `open_nofollow`）；需要符号链接的 4 个用例在未开开发者模式的 Windows 上 SKIPPED。Linux 上 `windows_only` 的
+4 个参数化用例 SKIPPED。
 
 - [ ] **Step 3: 实现**
 
@@ -651,7 +782,13 @@ def _win32_handle_attributes(handle: int) -> int:
 
 
 def _win32_create(path: StrPath, flags: int, *, refuse_reparse: bool) -> int:
-    """CreateFileW with POSIX open() dispositions and FILE_SHARE_DELETE."""
+    """CreateFileW with POSIX open() dispositions and FILE_SHARE_DELETE.
+
+    With ``refuse_reparse`` the reparse point itself is opened and refused.
+    CREATE_ALWAYS would supersede a reparse point before it can be inspected
+    (an AF_UNIX socket file became a regular file), so truncation then
+    happens only after the check.
+    """
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -678,8 +815,13 @@ def _win32_create(path: StrPath, flags: int, *, refuse_reparse: bool) -> int:
     else:
         disposition = open_existing
     attributes = file_attribute_normal
+    truncate_after_check = False
     if refuse_reparse:
         attributes |= _FILE_FLAG_OPEN_REPARSE_POINT
+        if disposition == create_always:
+            disposition, truncate_after_check = open_always, True
+        elif disposition == truncate_existing:
+            disposition, truncate_after_check = open_existing, True
 
     kernel32 = _kernel32()
     handle = kernel32.CreateFileW(
@@ -689,11 +831,18 @@ def _win32_create(path: StrPath, flags: int, *, refuse_reparse: bool) -> int:
     try:
         if refuse_reparse and _win32_handle_attributes(handle) & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise OSError(errno.ELOOP, "refusing to open a reparse point", os.fspath(path))
-        return msvcrt.open_osfhandle(
+        fd = msvcrt.open_osfhandle(
             handle, access_flags | os.O_BINARY | (flags & os.O_APPEND))
     except BaseException:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
         raise
+    if truncate_after_check:
+        try:
+            os.ftruncate(fd, 0)
+        except BaseException:
+            os.close(fd)
+            raise
+    return fd
 
 
 def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
@@ -743,14 +892,15 @@ Expected: `test_platform_files.py`、`test_platform_locks.py` 全部 PASS（需�
 - [ ] **Step 5: lint 并提交**
 
 ```bash
-uvx --from ruff==0.15.13 ruff check cc_remote/platform/files.py tests/test_platform_files.py
-git add cc_remote/platform/files.py tests/test_platform_files.py
+uvx --from ruff==0.15.13 ruff check cc_remote/platform/files.py tests/test_platform_files.py tests/unix_socket.py
+git add cc_remote/platform/files.py tests/test_platform_files.py tests/unix_socket.py
 git commit -F - <<'EOF'
 feat(platform): add reparse-point checks and no-follow file opens
 
 - is_reparse_point reports links on POSIX and any reparse point on Windows, raising FileNotFoundError for missing paths
-- open_nofollow adds O_NOFOLLOW|O_CLOEXEC on POSIX and refuses reparse points with ELOOP on Windows
+- open_nofollow adds O_NOFOLLOW|O_CLOEXEC on POSIX and refuses reparse points with ELOOP on Windows, truncating only after the check
 - Share one CreateFileW helper between open_with_share_delete and open_nofollow
+- Add a cross-platform AF_UNIX listener test helper
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -792,8 +942,9 @@ gh pr create --repo donny-star/cc-remote --base windows-compat-v2 --head win/2a-
 Phase A of sub-project 2 (coordination doc §2), merged before P2b–P2d and P3 rebase:
 
 - procs.killpg tombstones drained Job pids and never taskkills them
-- files.is_reparse_point / files.open_nofollow with the agreed signatures
+- files.is_reparse_point / files.open_nofollow with the agreed signatures (Windows truncates only after refusing reparse points)
 - requires_symlink(reason=...) pytest marker
+- tests/unix_socket.py: real AF_UNIX listeners on both platforms for reparse-point and socket fixtures
 
 Checks: Windows per-file pytest for tests/test_platform_*.py, ruff, git diff --check. Linux pytest runs in CI.
 
@@ -802,3 +953,8 @@ EOF
 ```
 
 Expected: 输出 PR URL；Linux CI 通过后由 controller 合并。合并后通知 P3：可以 rebase。
+
+## 跨子项目依赖
+
+无。本计划只改 P2 归属的 `cc_remote/platform/{procs,files}.py`、`tests/conftest.py`、`pytest.ini` 与测试；P3 合并后按协作约定
+§2 的签名直接调用 `files.is_reparse_point`/`files.open_nofollow`、`requires_symlink` 与 `procs.killpg`。

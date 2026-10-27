@@ -11,11 +11,12 @@
   （当前目录、环境变量），`process_scan` 新增 `win32_process_snapshot()`/`win32_process_info()`/`win32_process_cwds()`，
   行结构与 `DarwinProcessInfo` 相同。Claude 复用 Darwin 的快照判定函数（参数化快照与 cwd 读取器）；Codex 移植旧分支
   `b7eafef` 的 argv 判定，但排除规则改用上游的"精确自有进程 + npm launcher 的原生子进程"，不再排除整棵后代树。
-- 可执行文件：`platform.executables` 新增 `default_cli_path()`、`command_name()`；所有 `[codex_bin, …]` 启动点改为
-  `[*executables.command_for(codex_bin), …]`（POSIX 上 `command_for` 返回 `[path]`，argv 不变）。
+- 可执行文件：`platform.executables` 新增 `default_cli_path()`、`command_name()`；`command_for` 加 POSIX 守卫（P1 版本在
+  POSIX 上也会解析 `.cmd` 后缀文件）；所有 `[codex_bin, …]` 启动点改为 `[*executables.command_for(codex_bin), …]`
+  （POSIX 上 `command_for` 恒返回 `[path]`，argv 逐字不变）。
 - 进程组：所有 `start_new_session=True`/`os.killpg` 改为 `procs.popen_group`/`create_subprocess_exec_group`/`killpg`；
   Windows 上 `SIGTERM` 等于立即强杀，所以需要优雅退出的地方先关 stdin 等待（`procs.SIGTERM_IS_GRACEFUL`）。
-- Codex daemon：`socket_identity` 用 `files.is_unix_socket` 与 `perms.*_info`；测试夹具用 P2b 的 `tests/unix_socket.py`
+- Codex daemon：`socket_identity` 用 `files.is_unix_socket` 与 `perms.*_info`；测试夹具用 P2a 的 `tests/unix_socket.py`
   绑定真实 Windows AF_UNIX 监听；只有"Python 自己起 AF_UNIX 服务端"的用例标 `posix_only`。
 
 **Tech Stack:** Python 3.13、ctypes（kernel32/ntdll/ws2_32）、pywin32 312、pytest 9。
@@ -47,22 +48,26 @@
 - 业务模块写 `from cc_remote.platform import files as platform_files`；`procs`、`perms`、`executables` 直接导入模块。
 - 测试 skip 只能用 `posix_only(reason=…)`、`windows_only(reason=…)`、`requires_symlink(reason=…)`；每个新 skip 都要能对应到
   spec §1 非目标、§7 允许的 POSIX 专有行为（`SO_PEERCRED`、`/proc`、systemd、launchd、cgroup、launch barrier），或"夹具必须建符号链接"。
+- MAX_PATH：本机 `LongPathsEnabled=0`；pytest 临时目录很深时部分用例会因路径超过 260 字符失败，验收时加
+  `--basetemp=C:	\<测试文件名>`。长路径支持属 P5（见文末"跨子项目依赖"第 4 条），P2 不改注册表。
 
 ## 文件结构
 
 | 文件 | 动作 | 职责 |
 |---|---|---|
 | `cc_remote/platform/win32_process.py` | 修改 | 新增 `process_parameters(pid)`：从 PEB 读当前目录和环境块 |
-| `cc_remote/platform/executables.py` | 修改 | 新增 `default_cli_path(name)`、`command_name(arg)` |
+| `cc_remote/platform/executables.py` | 修改 | 新增 `default_cli_path(name)`（Task 4A）、`command_name(arg)`（Task 2）；`command_for` 的 POSIX 守卫（Task 4B） |
 | `cc_remote/platform/procs.py` | 修改 | 新增 `SIGTERM_IS_GRACEFUL` |
 | `cc_remote/platform/files.py` | 修改 | 新增 `create_symlink_entry(target, path)`（Git 风格的符号链接回退） |
 | `cc_remote/wrapper/process_scan.py` | 修改 | Windows 快照、单进程信息、cwd 批量读取、环境变量读取 |
 | `cc_remote/wrapper/codex_external.py` | 修改 | `command_name`；`_win32_writable_rollout_holders`；分派 |
 | `cc_remote/wrapper/claude_external.py` | 修改 | 快照后端参数化；分派 |
-| `cc_remote/config.py`、`cc_remote/wrapper/{codex_handle,codex_models,codex_rpc,codex_readiness,codex_daemon,codex_runtime,claude_runtime}.py`、`cc_remote/codex_daemon_restart.py` | 修改 | 默认 CLI 路径；`command_for` 启动；`nofile` 在 Windows 上为 no-op |
-| `cc_remote/wrapper/{claude_usage,git_diff,codex_handle,codex_readiness}.py`、`cc_remote/wrapper/machine.py`（`_run_office_conversion`）、`cc_remote/codex_daemon_restart.py` | 修改 | 进程组启动与终止 |
+| `cc_remote/config.py`、`cc_remote/wrapper/claude_runtime.py` | 修改 | Task 4A：默认 Claude CLI 路径 |
+| `cc_remote/wrapper/{codex_handle,codex_models,codex_rpc,codex_readiness,codex_daemon,codex_runtime}.py`、`cc_remote/codex_daemon_restart.py` | 修改 | Task 4B：`command_for` 启动；`nofile` 在 Windows 上为 no-op |
+| `cc_remote/wrapper/{claude_usage,git_diff}.py`、`cc_remote/wrapper/machine.py`（`_run_office_conversion`） | 修改 | Task 5A：辅助子进程的进程组 |
+| `cc_remote/wrapper/{codex_handle,codex_readiness}.py`、`cc_remote/codex_daemon_restart.py` | 修改 | Task 5B：Codex 进程组与优雅退出 |
 | `cc_remote/wrapper/codex_daemon.py` | 修改 | `socket_identity` 平台化 |
-| `cc_remote/wrapper/codex_checkpoints.py` | 修改 | 恢复符号链接条目走 `files.create_symlink_entry` |
+| `cc_remote/wrapper/codex_checkpoints.py` | 修改 | 恢复符号链接条目走 `files.create_symlink_entry`（锁位置已在 P2c Task 6 处理） |
 | `tests/test_platform_win32_process.py`、`test_platform_executables.py`、`test_platform_procs.py`、`test_platform_files.py`、`test_process_scan_windows.py`（新建） | 修改/新建 | 平台 helper 与快照测试 |
 | `tests/test_codex_external.py`、`test_claude_external.py`、`test_codex_npm_ownership.py`、`test_child_env.py`、`test_wrapper_core_fixes.py`、`test_codex_daemon.py`、`test_codex_readiness.py`、`test_codex_rpc.py`、`test_codex_service.py`、`test_codex_launch_barrier.py`、`test_codex_app_tools.py`、`test_codex_desktop.py` 及 Task 7/8 列出的文件 | 修改 | 新行为测试、平台标记、夹具 |
 | `docs/superpowers/windows-baseline.md`、`docs/superpowers/windows-baseline.json` | 修改 | Task 8 刷新子项目 2 部分 |
@@ -844,23 +849,18 @@ EOF
 
 ---
 
-### Task 4: 引擎可执行文件解析与启动
+### Task 4A: Claude 日常 CLI 的默认路径
 
-基线：`tests/test_child_env.py` 的 "other" 5（`RuntimeError: CLAUDE_BIN must be an absolute path` 4、默认路径断言 1）；
-`tests/test_codex_rpc.py` 的 "other" 1（`ValueError: invalid POSIX Codex RPC nofile limit`——产品缺陷：
-`_CODEX_ARCHIVE_NOFILE_SOFT_LIMIT` 在所有平台都会传入，Windows 上归档因此失败）。
+基线：`tests/test_child_env.py` 的 "other" 5（`RuntimeError: CLAUDE_BIN must be an absolute path` 4、默认路径断言 1）。
 
 **Files:**
 - Modify: `cc_remote/platform/executables.py`（`default_cli_path`）
 - Modify: `cc_remote/config.py`（`_claude_bin`）
-- Modify: `cc_remote/wrapper/codex_handle.py`（`_open_process`）、`codex_models.py`（`_rpc_model_list`）、
-  `codex_rpc.py`（`_rpc_connection`、第二处 `create_subprocess_exec`、`nofile` 校验）、`codex_readiness.py`（`probe_proxy`）、
-  `codex_daemon.py`（`_run_command`）、`codex_runtime.py`（`codex_version`）、`claude_runtime.py`（`probe_claude_cli_version`）、
-  `cc_remote/codex_daemon_restart.py`（`subprocess.run([codex_bin, ...])` 与 `subprocess.Popen(argv, ...)`）
-- Test: `tests/test_platform_executables.py`、`tests/test_child_env.py`、`tests/test_codex_rpc.py`
+- Modify: `cc_remote/wrapper/claude_runtime.py`（`probe_claude_cli_version`）
+- Test: `tests/test_platform_executables.py`、`tests/test_child_env.py`
 
 **Interfaces:**
-- Consumes: `executables.find`、`executables.command_for`（P1）。
+- Consumes: `executables.command_for`（P1；Task 4B 给它加 POSIX 守卫）。
 - Produces: `executables.default_cli_path(name: str) -> str`——POSIX：`str(Path.home() / ".local/bin" / name)`
   （与原 `str(Path.home() / ".local/bin/claude")` 相同）；Windows：依次取 `~/.local/bin/<name>.exe`（存在时）、PATH 上的安装
   （npm `.cmd` shim 能解成单个原生 exe 时返回该 exe，否则返回 shim 路径）、最后返回 `~/.local/bin/<name>.exe`。
@@ -895,7 +895,7 @@ def test_default_cli_path_on_windows(monkeypatch, tmp_path) -> None:
     assert executables.default_cli_path("claude") == str(native)
 ```
 
-`tests/test_child_env.py`：import 区加 `import sys` 与 `from tests.platform_paths import native_path`。
+`tests/test_child_env.py`：import 区加 `import sys` 与 `from tests.platform_paths import native_path`（P2c）。
 `WrapperConfig(claude_bin="/fake/claude")` 全部改为 `WrapperConfig(claude_bin=native_path("/fake/claude"))`。把
 `test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured` 开头改为：
 
@@ -914,32 +914,12 @@ def test_default_cli_path_on_windows(monkeypatch, tmp_path) -> None:
     assert WrapperConfig().claude_bin == expected
 ```
 
-`tests/test_codex_rpc.py`：给 `test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit` 加
-`@pytest.mark.posix_only(reason="RLIMIT_NOFILE and the rlimit_exec wrapper are POSIX-only")`，并追加：
-
-```python
-@pytest.mark.windows_only(reason="Windows has no RLIMIT_NOFILE; Codex starts unwrapped")
-def test_codex_rpc_nofile_limit_is_a_no_op_on_windows(monkeypatch):
-    seen = []
-
-    async def fake_exec(*argv, **kwargs):
-        seen.append(argv)
-        raise OSError("stop after argv capture")
-
-    monkeypatch.setattr(codex_rpc_module.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(codex_rpc_module, "_resolve_codex_bin", lambda: "C:/npm/codex.exe")
-    with pytest.raises(OSError, match="stop after argv capture"):
-        asyncio.run(codex_rpc_module.codex_rpc(
-            "thread/archive", {"threadId": "t"}, nofile_soft_limit=4096))
-    assert seen and seen[0][:3] == ("C:/npm/codex.exe", "app-server", "--stdio")
-```
-
-（`codex_rpc_module` 是该测试文件已有的 `from cc_remote.wrapper import codex_rpc as codex_rpc_module`。）
+（`PATH=""` 只在 POSIX 上多设一个变量；POSIX 默认路径不读 PATH，结果不变。）
 
 - [ ] **Step 2: 运行测试，确认失败**
 
-Run: `for f in tests/test_platform_executables.py tests/test_child_env.py tests/test_codex_rpc.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -4; done`
-Expected: `default_cli_path` 不存在；`test_child_env.py` 默认路径断言失败；`nofile` 用例抛 `ValueError: invalid POSIX Codex RPC nofile limit`。
+Run: `for f in tests/test_platform_executables.py tests/test_child_env.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -4; done`
+Expected: `default_cli_path` 不存在；`test_child_env.py` 默认路径断言失败。
 
 - [ ] **Step 3: 实现**
 
@@ -975,7 +955,119 @@ def _claude_bin() -> str:
     return configured or executables.default_cli_path("claude")
 ```
 
-（import：`from cc_remote.platform import executables`。）
+（import：`from cc_remote.platform import executables`。）`cc_remote/wrapper/claude_runtime.py` 的
+`probe_claude_cli_version`：`[path, "--version"]` 改为 `[*executables.command_for(path), "--version"]`，补
+`from cc_remote.platform import executables`。
+
+- [ ] **Step 4: 运行测试**
+
+Run: `for f in tests/test_platform_executables.py tests/test_child_env.py tests/test_claude_runtime.py; do [ -f "$f" ] && PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done`
+Expected: 全部 0 failed。
+
+- [ ] **Step 5: 本机冒烟（只读、不调用模型）**
+
+```bash
+PYTHONUTF8=1 .venv/Scripts/python.exe - <<'EOF'
+from cc_remote.platform import executables
+from cc_remote.wrapper.claude_runtime import probe_claude_cli_version
+claude = executables.default_cli_path("claude")
+print("claude:", claude, probe_claude_cli_version(claude))
+EOF
+```
+
+Expected: 打印本机 Claude 的路径与版本（2.1.278）。
+
+- [ ] **Step 6: lint 并提交**
+
+```bash
+uvx --from ruff==0.15.13 ruff check cc_remote/platform/executables.py cc_remote/config.py cc_remote/wrapper/claude_runtime.py tests/test_platform_executables.py tests/test_child_env.py
+git add cc_remote/platform/executables.py cc_remote/config.py cc_remote/wrapper/claude_runtime.py \
+  tests/test_platform_executables.py tests/test_child_env.py
+git commit -F - <<'EOF'
+fix(wrapper): default CLAUDE_BIN to the Windows daily Claude CLI
+
+- Add executables.default_cli_path: POSIX keeps ~/.local/bin/claude, Windows prefers the native .exe or the executable behind the npm shim
+- Probe the Claude CLI version through executables.command_for
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 4B: Codex CLI 经 npm shim 启动，`nofile` 在 Windows 上为 no-op
+
+基线：`tests/test_codex_rpc.py` 的 "other" 1（`ValueError: invalid POSIX Codex RPC nofile limit`——产品缺陷：
+`_CODEX_ARCHIVE_NOFILE_SOFT_LIMIT` 在所有平台都会传入，Windows 上归档因此失败）；以及 Windows 上 Codex 启动点直接执行
+`codex.cmd` 时经 `cmd.exe` 转发参数的问题（spec §3 `executables` 一行）。
+
+**Files:**
+- Modify: `cc_remote/platform/executables.py`（`command_for` 的 POSIX 守卫）
+- Modify: `cc_remote/wrapper/codex_handle.py`（`_open_process`）、`codex_models.py`（`_rpc_model_list`）、
+  `codex_rpc.py`（`_rpc_connection`、第二处 `create_subprocess_exec`、`nofile` 校验）、`codex_readiness.py`（`probe_proxy`）、
+  `codex_daemon.py`（`_run_command`）、`codex_runtime.py`（`codex_version`）、`cc_remote/codex_daemon_restart.py`
+  （`subprocess.run([codex_bin, ...])` 与 `subprocess.Popen(argv, ...)`）
+- Test: `tests/test_platform_executables.py`、`tests/test_codex_rpc.py`
+
+（生产文件多，但每处都是同一个一行替换；按启动点逐个评审即可。）
+
+**Interfaces:**
+- Consumes: `executables.command_for`（P1）。
+- Produces: `executables.command_for(path: str) -> list[str]` 签名不变；语义收紧为"POSIX 上恒返回 `[path]`"。P1 的实现在 POSIX
+  上也会解析以 `.cmd`/`.bat` 结尾的文件，可能把一个恰好叫 `x.cmd` 的 POSIX 可执行文件改成 `cmd.exe /c …`——本任务给它加
+  `IS_WINDOWS` 守卫，保证所有启动点在 POSIX 上的 argv 逐字不变。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/test_platform_executables.py`：给已有的 `test_exe_shim_resolves_to_the_real_binary`、
+`test_node_shim_prefers_bundled_node`、`test_unparseable_shim_falls_back_to_cmd` 各加
+`@pytest.mark.windows_only(reason="npm .cmd shims are only unwrapped on Windows")`，并追加：
+
+```python
+@pytest.mark.posix_only(reason="POSIX never unwraps .cmd files; argv must stay exactly [path]")
+def test_cmd_suffix_is_returned_unchanged_on_posix(tmp_path) -> None:
+    shim = tmp_path / "codex.cmd"
+    shim.write_text(CODEX_SHIM)
+    assert executables.command_for(str(shim)) == [str(shim)]
+```
+
+`tests/test_codex_rpc.py`：给 `test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit` 加
+`@pytest.mark.posix_only(reason="RLIMIT_NOFILE and the rlimit_exec wrapper are POSIX-only")`，并追加：
+
+```python
+@pytest.mark.windows_only(reason="Windows has no RLIMIT_NOFILE; Codex starts unwrapped")
+def test_codex_rpc_nofile_limit_is_a_no_op_on_windows(monkeypatch):
+    seen = []
+
+    async def fake_exec(*argv, **kwargs):
+        seen.append(argv)
+        raise OSError("stop after argv capture")
+
+    monkeypatch.setattr(codex_rpc_module.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(codex_rpc_module, "_resolve_codex_bin", lambda: "C:/npm/codex.exe")
+    with pytest.raises(OSError, match="stop after argv capture"):
+        asyncio.run(codex_rpc_module.codex_rpc(
+            "thread/archive", {"threadId": "t"}, nofile_soft_limit=4096))
+    assert seen and seen[0][:3] == ("C:/npm/codex.exe", "app-server", "--stdio")
+```
+
+（`codex_rpc_module` 是该测试文件已有的 `from cc_remote.wrapper import codex_rpc as codex_rpc_module`。）
+
+- [ ] **Step 2: 运行测试，确认失败**
+
+Run: `for f in tests/test_platform_executables.py tests/test_codex_rpc.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -4; done`
+Expected（Windows）：`nofile` 用例抛 `ValueError: invalid POSIX Codex RPC nofile limit`。（Linux CI 上
+`test_cmd_suffix_is_returned_unchanged_on_posix` 失败，返回 `cmd.exe /d /c …`。）
+
+- [ ] **Step 3: 实现**
+
+`cc_remote/platform/executables.py` 的 `command_for` 第一行改为：
+
+```python
+def command_for(path: str) -> list[str]:
+    if not IS_WINDOWS or Path(path).suffix.lower() not in {".cmd", ".bat"}:
+        return [path]
+```
 
 启动点逐个改为 `command_for`：
 
@@ -988,9 +1080,11 @@ def _claude_bin() -> str:
 | `codex_readiness.probe_proxy` | `binary, "app-server", "proxy", "--sock", socket_path,` | `*executables.command_for(binary), "app-server", "proxy", "--sock", socket_path,` |
 | `codex_daemon._run_command` | `command_argv = argv` | `command_argv = (*executables.command_for(argv[0]), *argv[1:])`；POSIX lifecycle 分支的 rlimit 包装改为 `(sys.executable, _RLIMIT_EXEC, str(_DAEMON_NOFILE_SOFT_LIMIT), *command_argv)` |
 | `codex_runtime.codex_version` | `[path, "--version"]` | `[*executables.command_for(path), "--version"]` |
-| `claude_runtime.probe_claude_cli_version` | `[path, "--version"]` | `[*executables.command_for(path), "--version"]` |
 | `codex_daemon_restart`（restart 命令） | `[codex_bin, "app-server", "daemon", "restart"]` | `[*executables.command_for(codex_bin), "app-server", "daemon", "restart"]` |
 | `codex_daemon_restart`（后台 `Popen(argv, ...)`） | `argv` | `[*executables.command_for(argv[0]), *argv[1:]]` |
+
+POSIX 核对：守卫之后 `command_for(x) == [x]`，上表每一行在 POSIX 上展开成与原来逐字相同的 argv（rlimit 包装里的 `*argv`
+与 `*process_argv`/`*command_argv` 也相同）。
 
 `codex_rpc` 的 `nofile` 校验：把条件里的 `or os.name != "posix"` 删除，并在该 `if ...: raise ValueError(...)` 之后加：
 
@@ -1001,12 +1095,12 @@ def _claude_bin() -> str:
         nofile_soft_limit = None
 ```
 
-（这是对已有平台判断的收窄，不是新增分支。）各文件补 `from cc_remote.platform import executables`。
+（这是对已有平台判断的收窄，不是新增分支；POSIX 路径不变。）各文件补 `from cc_remote.platform import executables`。
 
 - [ ] **Step 4: 运行测试**
 
-Run: `for f in tests/test_platform_executables.py tests/test_child_env.py tests/test_codex_rpc.py tests/test_codex_daemon_restart.py tests/test_codex_models.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done`
-Expected: 全部 0 failed（Linux 上 `command_for` 返回原路径，argv 断言不变）。
+Run: `for f in tests/test_platform_executables.py tests/test_codex_rpc.py tests/test_codex_daemon_restart.py tests/test_codex_models.py tests/test_codex_daemon.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done`
+Expected: 前四个文件 0 failed；`tests/test_codex_daemon.py` 失败数不高于基线（其余失败属 Task 5B、Task 6）。
 
 - [ ] **Step 5: 本机冒烟（只读、不调用模型）**
 
@@ -1014,29 +1108,25 @@ Expected: 全部 0 failed（Linux 上 `command_for` 返回原路径，argv 断�
 PYTHONUTF8=1 .venv/Scripts/python.exe - <<'EOF'
 from cc_remote.platform import executables
 from cc_remote.wrapper.codex_runtime import resolve_codex_bin, codex_version
-from cc_remote.wrapper.claude_runtime import probe_claude_cli_version
-claude = executables.default_cli_path("claude")
-print("claude:", claude, probe_claude_cli_version(claude))
 codex = resolve_codex_bin()
 print("codex:", codex, executables.command_for(codex), codex_version(codex))
 EOF
 ```
 
-Expected: 打印本机 Claude（2.1.278）与 Codex（0.164.0）的版本；`command_for(codex)` 为 `[node.exe, ...codex.js]`。
+Expected: 打印本机 Codex（0.164.0）的版本；`command_for(codex)` 为 `[node.exe, ...codex.js]`，不含 `cmd.exe`。
 
 - [ ] **Step 6: lint 并提交**
 
 ```bash
-uvx --from ruff==0.15.13 ruff check cc_remote tests/test_platform_executables.py tests/test_child_env.py tests/test_codex_rpc.py
-git add cc_remote/platform/executables.py cc_remote/config.py cc_remote/wrapper/codex_handle.py cc_remote/wrapper/codex_models.py \
+uvx --from ruff==0.15.13 ruff check cc_remote tests/test_platform_executables.py tests/test_codex_rpc.py
+git add cc_remote/platform/executables.py cc_remote/wrapper/codex_handle.py cc_remote/wrapper/codex_models.py \
   cc_remote/wrapper/codex_rpc.py cc_remote/wrapper/codex_readiness.py cc_remote/wrapper/codex_daemon.py \
-  cc_remote/wrapper/codex_runtime.py cc_remote/wrapper/claude_runtime.py cc_remote/codex_daemon_restart.py \
-  tests/test_platform_executables.py tests/test_child_env.py tests/test_codex_rpc.py
+  cc_remote/wrapper/codex_runtime.py cc_remote/codex_daemon_restart.py \
+  tests/test_platform_executables.py tests/test_codex_rpc.py
 git commit -F - <<'EOF'
-fix(wrapper): resolve and launch engine CLIs through npm shims on Windows
+fix(wrapper): launch Codex through npm shims without cmd.exe on Windows
 
-- Default CLAUDE_BIN to the native .exe or the executable behind the npm shim on Windows; POSIX keeps ~/.local/bin/claude
-- Launch every Codex and Claude CLI argv through executables.command_for, never through cmd.exe
+- Launch every Codex argv through executables.command_for, which now returns [path] unchanged on POSIX
 - Treat the Codex RPC nofile limit as a no-op on Windows instead of rejecting archive requests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1045,22 +1135,21 @@ EOF
 
 ---
 
-### Task 5: 进程组启动与终止（全部 `killpg`/`start_new_session` 调用点）
+### Task 5A: 辅助子进程的进程组启动与终止
 
-基线：`posix_os_calls` 中 `tests/test_codex_daemon.py` 的 7 条（`<module 'os' (frozen)> has no attribute 'killpg'`）、
-`tests/test_wrapper_core_fixes.py` 的 `test_bounded_subprocess_discards_residual_output_without_communicate`、
+基线：`posix_os_calls` 中 `tests/test_wrapper_core_fixes.py` 的 `test_bounded_subprocess_discards_residual_output_without_communicate`、
 `test_bounded_subprocess_output_has_wall_clock_timeout`、`test_git_diff_output_is_streamed_to_a_hard_limit`。
 
 **Files:**
 - Modify: `cc_remote/platform/procs.py`（`SIGTERM_IS_GRACEFUL`）
-- Modify: `cc_remote/wrapper/claude_usage.py`、`codex_readiness.py`（`probe_proxy`）、`git_diff.py`（`bounded_process_output`）、
-  `codex_handle.py`（`_open_process`、断开时的 `stop`）、`machine.py`（`_run_office_conversion`）、`cc_remote/codex_daemon_restart.py`
-- Test: `tests/test_platform_procs.py`、`tests/test_wrapper_core_fixes.py`、`tests/test_codex_daemon.py`
+- Modify: `cc_remote/wrapper/git_diff.py`（`bounded_process_output`）、`claude_usage.py`（usage helper 启动与 `finally`）、
+  `machine.py`（`_run_office_conversion`）
+- Test: `tests/test_platform_procs.py`、`tests/test_wrapper_core_fixes.py`
 
 **Interfaces:**
 - Consumes: `procs.popen_group`、`procs.create_subprocess_exec_group`、`procs.killpg`、`procs.SIGTERM`、`procs.SIGKILL`（P1/P2a）。
 - Produces: `procs.SIGTERM_IS_GRACEFUL: bool`——POSIX True（进程组收到可处理的 SIGTERM）；Windows False（`killpg` 任何信号都是
-  `TerminateJobObject`）。需要优雅退出的调用方在 False 时先走引擎协议（关 stdin / shutdown RPC）并等待，再 `killpg`。
+  `TerminateJobObject`）。需要优雅退出的调用方在 False 时先走引擎协议（关 stdin / shutdown RPC）并等待，再 `killpg`（Task 5B 使用）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1092,13 +1181,10 @@ def test_sigterm_grace_flag_matches_platform() -> None:
     assert signals[0] == (process.pid, procs.SIGTERM)
 ```
 
-`tests/test_codex_daemon.py`：三处 `monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)` 改为
-`monkeypatch.setattr(handle_module.procs, "killpg", lambda *_args: None)`。
-
 - [ ] **Step 2: 运行测试，确认失败**
 
-Run: `for f in tests/test_platform_procs.py tests/test_wrapper_core_fixes.py tests/test_codex_daemon.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line -k "grace or bounded_subprocess or git_diff_output or proxy" 2>&1 | tail -3; done`
-Expected: `SIGTERM_IS_GRACEFUL` 不存在；`git_diff` 无 `procs` 属性；`handle_module` 无 `procs` 属性。
+Run: `for f in tests/test_platform_procs.py tests/test_wrapper_core_fixes.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line -k "grace or bounded_subprocess or git_diff_output" 2>&1 | tail -3; done`
+Expected: `SIGTERM_IS_GRACEFUL` 不存在；`git_diff` 无 `procs` 属性。
 
 - [ ] **Step 3: 实现**
 
@@ -1112,24 +1198,6 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
 ```
 
 并把 `"SIGTERM_IS_GRACEFUL"` 加入 `__all__`。
-
-`cc_remote/wrapper/claude_usage.py`：
-
-```python
-            process = await procs.create_subprocess_exec_group(
-                *executables.command_for(command[0]), *command[1:],
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                cwd=Path.home(), env=env,
-            )
-```
-
-`finally` 中 `os.killpg(process.pid, signal.SIGKILL)` 改为 `procs.killpg(process.pid, procs.SIGKILL)`（pid 是本函数刚用
-`create_subprocess_exec_group` 启动的组长；Windows 上走 Job/墓碑，不会落到阻塞的 `taskkill`）。
-
-`cc_remote/wrapper/codex_readiness.py` 的 `probe_proxy`：`asyncio.create_subprocess_exec(` 改为
-`procs.create_subprocess_exec_group(` 并删去 `start_new_session=True,`；`os.killpg(process.pid, signal.SIGKILL)` 改为
-`procs.killpg(process.pid, procs.SIGKILL)`（stdin 已先关闭，满足"优雅优先"）。
 
 `cc_remote/wrapper/git_diff.py` 的 `bounded_process_output`：
 
@@ -1149,11 +1217,82 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
             pass
 ```
 
-其后的 `stop_group(signal.SIGKILL)`（4 处）改为 `stop_group(procs.SIGKILL)`，`stop_group(signal.SIGTERM)` 改为
-`stop_group(procs.SIGTERM)`。（截断时 diff 子进程不需要优雅退出，Windows 上直接终止 Job 是正确的。）
+其后的 `stop_group(signal.SIGKILL)`（3 处）改为 `stop_group(procs.SIGKILL)`，`stop_group(signal.SIGTERM)` 改为
+`stop_group(procs.SIGTERM)`。（截断时 diff 子进程不需要优雅退出，Windows 上直接终止 Job 是正确的；POSIX 上
+`procs.killpg` 就是 `os.killpg`，`procs.SIGTERM == signal.SIGTERM`。）
+
+`cc_remote/wrapper/claude_usage.py`：
+
+```python
+            process = await procs.create_subprocess_exec_group(
+                *executables.command_for(command[0]), *command[1:],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                cwd=Path.home(), env=env,
+            )
+```
+
+`finally` 中 `os.killpg(process.pid, signal.SIGKILL)` 改为 `procs.killpg(process.pid, procs.SIGKILL)`（pid 是本函数刚用
+`create_subprocess_exec_group` 启动的组长；Windows 上走 Job/墓碑，不会落到阻塞的 `taskkill`）。
 
 `cc_remote/wrapper/machine.py` 的 `_run_office_conversion`：`subprocess.Popen(` 改为 `procs.popen_group(` 并删去
 `start_new_session=True,`；`os.killpg(process.pid, signal.SIGKILL)` 改为 `procs.killpg(process.pid, procs.SIGKILL)`。
+
+各文件补 `from cc_remote.platform import procs`（`claude_usage.py` 还要 `executables`），删除不再使用的 `signal` import
+（`machine.py` 的 `signal` 仍被其它代码使用，保留）。
+
+- [ ] **Step 4: 运行测试**
+
+```bash
+for f in tests/test_platform_procs.py tests/test_wrapper_core_fixes.py tests/test_claude_usage.py tests/test_turn_changes.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done
+```
+
+Expected: 本任务列出的 3 条基线通过；`killpg`/`SIGKILL` 相关 `AttributeError` 不再出现在这些文件里。
+
+- [ ] **Step 5: lint 并提交**
+
+```bash
+uvx --from ruff==0.15.13 ruff check cc_remote tests/test_platform_procs.py tests/test_wrapper_core_fixes.py
+git add cc_remote/platform/procs.py cc_remote/wrapper/git_diff.py cc_remote/wrapper/claude_usage.py cc_remote/wrapper/machine.py \
+  tests/test_platform_procs.py tests/test_wrapper_core_fixes.py
+git commit -F - <<'EOF'
+fix(wrapper): run diff, usage and office helpers as platform process groups
+
+- Replace start_new_session and os.killpg with procs group spawns and killpg for helper subprocesses
+- Add procs.SIGTERM_IS_GRACEFUL for callers that need a graceful stop
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 5B: Codex app-server、readiness probe 与 daemon restart 的进程组
+
+基线：`posix_os_calls` 中 `tests/test_codex_daemon.py` 的 7 条（`<module 'os' (frozen)> has no attribute 'killpg'`）。
+
+**Files:**
+- Modify: `cc_remote/wrapper/codex_handle.py`（`_open_process`、`disconnect` 里的 `stop`）、`codex_readiness.py`（`probe_proxy`）、
+  `cc_remote/codex_daemon_restart.py`（后台 `Popen`）
+- Test: `tests/test_codex_daemon.py`
+
+**Interfaces:**
+- Consumes: Task 5A 的 `procs.SIGTERM_IS_GRACEFUL`；`procs.create_subprocess_exec_group`、`procs.popen_group`、`procs.killpg`。
+- Produces: 无。
+
+- [ ] **Step 1: 改测试（失败测试）**
+
+`tests/test_codex_daemon.py`：三处 `monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)` 改为
+`monkeypatch.setattr(handle_module.procs, "killpg", lambda *_args: None)`。
+
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_codex_daemon.py -p no:xdist -o addopts="" -q --tb=line -k proxy 2>&1 | tail -3`
+Expected: `AttributeError: ... has no attribute 'procs'`。
+
+- [ ] **Step 2: 实现**
+
+`cc_remote/wrapper/codex_readiness.py` 的 `probe_proxy`：`asyncio.create_subprocess_exec(` 改为
+`procs.create_subprocess_exec_group(` 并删去 `start_new_session=True,`；`os.killpg(process.pid, signal.SIGKILL)` 改为
+`procs.killpg(process.pid, procs.SIGKILL)`（stdin 已先关闭，满足"优雅优先"）。
 
 `cc_remote/codex_daemon_restart.py` 的后台 `subprocess.Popen(...)`：改为 `procs.popen_group(...)` 并删去
 `start_new_session=True,`（它要比父进程活得久——Job 不设 `KILL_ON_JOB_CLOSE`，与 POSIX 新会话语义一致）。
@@ -1163,9 +1302,11 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
 1. `_open_process` 里 `proc = await asyncio.create_subprocess_exec(` 改为 `proc = await procs.create_subprocess_exec_group(`，
    删去 `start_new_session=(os.name == "posix"),`；`self._process_group = proc.pid if os.name == "posix" else None` 改为
    `self._process_group = proc.pid`。
-2. 断开流程中的 `stop`：
+2. `disconnect` 中的 `stop` 及其后的调用整体替换为：
 
 ```python
+            signal_names = {procs.SIGTERM: "SIGTERM", procs.SIGKILL: "SIGKILL"}
+
             def stop(sig: int, *, force: bool = False) -> None:
                 try:
                     if process_group is not None:
@@ -1176,7 +1317,7 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
                     pass
                 except Exception as exc:
                     log.warning("codex process stop failed",
-                                signal=getattr(sig, "name", str(sig)), error=str(exc))
+                                signal=signal_names.get(sig, str(sig)), error=str(exc))
 
             if proc.returncode is None and not procs.SIGTERM_IS_GRACEFUL:
                 # Windows: SIGTERM would hard-kill the Job immediately. Let the
@@ -1189,7 +1330,7 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
                 except asyncio.TimeoutError:
                     pass
             if proc.returncode is None:
-                stop(signal.SIGTERM)
+                stop(procs.SIGTERM)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=3.0)
                 except asyncio.TimeoutError:
@@ -1202,34 +1343,35 @@ SIGTERM_IS_GRACEFUL = not IS_WINDOWS
                 stop(procs.SIGKILL, force=True)
 ```
 
-各文件补 `from cc_remote.platform import procs`（`claude_usage.py` 还要 `executables`），删除不再使用的 `signal` import。
+POSIX 核对：`SIGTERM_IS_GRACEFUL` 为 True，新增的 stdin 分支不执行；`procs.killpg` 即 `os.killpg`，`procs.SIGTERM`/`SIGKILL`
+与 `signal.SIGTERM`/`SIGKILL` 数值相同；日志的 `signal` 字段仍是 `"SIGTERM"`/`"SIGKILL"`（原代码用 `sig.name`）。原代码的
+`getattr(signal, "SIGKILL", signal.SIGTERM)` 回退在 POSIX 上就是 `SIGKILL`，与 `procs.SIGKILL` 相同。
 
-- [ ] **Step 4: 确认 P2 文件已无直接调用**
+各文件补 `from cc_remote.platform import procs`，删除不再使用的 `signal` import。
+
+- [ ] **Step 3: 确认 P2 文件已无直接调用**
 
 Run: `bash -c 'grep -rnE "os\.killpg|start_new_session|signal\.SIGKILL" cc_remote --include=*.py | grep -vE "cc_remote/(platform|claude_service|claude_broker|tui|viewer|update|timed_tasks|async_tasks|task_)|claude_remote|claude_broker_handle|session_messages|codex_desktop|codex_app_tools"'`
 Expected: 无输出（`codex_desktop`/`codex_app_tools` 是 macOS App 专有、spec §1 非目标，保持原样）。
 
-- [ ] **Step 5: 复跑**
+- [ ] **Step 4: 复跑**
 
 ```bash
-for f in tests/test_platform_procs.py tests/test_wrapper_core_fixes.py tests/test_codex_daemon.py tests/test_claude_usage.py tests/test_codex_rich_stream.py tests/test_codex_runtime_events.py tests/test_turn_changes.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done
+for f in tests/test_codex_daemon.py tests/test_codex_rich_stream.py tests/test_codex_runtime_events.py tests/test_codex_daemon_restart.py tests/test_codex_readiness.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line 2>&1 | tail -2 | sed "s|^|$f: |"; done
 ```
 
-Expected: 本任务列出的基线条目全部通过；`killpg`/`SIGKILL` 相关 `AttributeError` 不再出现。
+Expected: `tests/test_codex_daemon.py` 的 7 条 `killpg` 基线通过；其余文件失败数不高于基线（`af_unix` 失败由 Task 6 处理）。
 
-- [ ] **Step 6: lint 并提交**
+- [ ] **Step 5: lint 并提交**
 
 ```bash
-uvx --from ruff==0.15.13 ruff check cc_remote tests/test_platform_procs.py tests/test_wrapper_core_fixes.py tests/test_codex_daemon.py
-git add cc_remote/platform/procs.py cc_remote/wrapper/claude_usage.py cc_remote/wrapper/codex_readiness.py cc_remote/wrapper/git_diff.py \
-  cc_remote/wrapper/codex_handle.py cc_remote/wrapper/machine.py cc_remote/codex_daemon_restart.py \
-  tests/test_platform_procs.py tests/test_wrapper_core_fixes.py tests/test_codex_daemon.py
+uvx --from ruff==0.15.13 ruff check cc_remote tests/test_codex_daemon.py
+git add cc_remote/wrapper/codex_handle.py cc_remote/wrapper/codex_readiness.py cc_remote/codex_daemon_restart.py tests/test_codex_daemon.py
 git commit -F - <<'EOF'
-fix(wrapper): start and stop helper and engine processes as platform groups
+fix(wrapper): run Codex app-servers and probes as platform process groups
 
-- Replace start_new_session and os.killpg with procs group spawns and killpg in every wrapper call site
+- Start Codex app-server, readiness proxy and daemon restart helpers through procs group spawns
 - Let Codex app-servers exit on stdin EOF before the Windows Job is terminated
-- Add procs.SIGTERM_IS_GRACEFUL for callers that need a graceful stop
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -1256,7 +1398,7 @@ socket（二进制字符串可见 `app-server-control.sock`、`app-server contro
 
 **Interfaces:**
 - Consumes: `files.is_unix_socket`、`perms.owned_info`、`perms.private_mode_info`、`perms.no_foreign_write_info`（P2b）、
-  `tests.unix_socket.unix_listener`、`tests.unix_socket.short_temp_root`（P2b）、`tests.platform_paths.native_path`（P2c）。
+  `tests.unix_socket.unix_listener`、`tests.unix_socket.short_temp_root`（P2a）、`tests.platform_paths.native_path`（P2c）。
 - Produces: `socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, int, int]` 签名与 POSIX 语义不变。
 
 - [ ] **Step 1: 改夹具（它们是失败测试）**
@@ -1572,8 +1714,10 @@ Expected: `--stat` 只含 `cc_remote/platform/files.py`、`cc_remote/wrapper/cod
 | `WindowsPath('C:/Users/…/.claude') == WindowsPath('…/.claude')` | `tests/test_claude_storage_root.py`、`tests/test_claude_profiles.py`、`tests/test_claude_permission_state.py`、`tests/test_wrapper_startup.py`、`tests/test_wrapper_core_fixes.py`、`tests/test_workspace_browser.py` | 测试只 `setenv("HOME")`；Windows 的 `Path.home()` 读 `USERPROFILE` | 每个 `monkeypatch.setenv("HOME", X)` 旁加 `monkeypatch.setenv("USERPROFILE", X)` |
 | `'http://old.example:7890' == 'http://new.example:8080'`、`None == 'http://explicit.example:8080'` | `tests/test_transport_bounds.py`（2） | `test_connect_honors_explicit_http_proxy_and_bypass` 中有两组参数同时设置 `HTTPS_PROXY` 与 `https_proxy`（或 `HTTP_PROXY` 与 `http_proxy`）并期望小写优先；Windows 环境变量名不区分大小写，两者是同一个变量 | 把这两组参数（期望值分别为 `"http://new.example:8080"`、`"http://explicit.example:8080"` 的那两条）改写成 `pytest.param(..., marks=pytest.mark.posix_only(reason="POSIX environment names are case-sensitive; Windows has a single HTTPS_PROXY/https_proxy variable"))` |
 | `TypeError: 'NoneType' object is not subscriptable`（`tests/test_turn_file_pages.py:77,100`） | `tests/test_turn_file_pages.py`（2） | P2b/P2c 合入后复测；若仍失败，按该行所读的 `cwd`/文件路径用 `native_path` 修夹具 | 同 P2c Task 4 的 `native_path` 模式 |
-| `FileNotFoundError: [WinError 3] …\projects\-workspace-long-project-…` | `tests/test_claude_catalog_cwd.py` | ① 夹具 cwd 为 POSIX 路径（`/workspace/...`、`/original-project`）；② 长 cwd 用例的项目目录超过 `MAX_PATH`，本机 `LongPathsEnabled=0` | ① 用 `native_path`；② 见"跨子项目依赖/裁定"第 4 条，在该裁定落地前这些长路径用例保持失败并在 PR 中列出 nodeid |
-| `CheckpointError: Unable to retire Codex checkpoint journal`（`WinError 5`） | `tests/test_codex_checkpoints.py` | `cleanup_codex_checkpoint_session` 在会话目录里持有 `journal.lock` 句柄时把目录 `os.replace` 成墓碑；Windows 不允许重命名含打开句柄的目录 | 见"跨子项目依赖/裁定"第 5 条（需要 controller 裁定锁位置），落地前在 PR 中列出 |
+| `FileNotFoundError: [WinError 3] …\projects\-workspace-long-project-…` | `tests/test_claude_catalog_cwd.py` | ① 夹具 cwd 为 POSIX 路径（`/workspace/...`、`/original-project`）；② 长 cwd 用例的项目目录超过 `MAX_PATH`，本机 `LongPathsEnabled=0` | ① 用 `native_path`；② 不在 P2 修：属"跨子项目依赖"第 4 条（P5 环境检查），这些长路径用例保持失败，在 PR 和刷新后的基线里列出 nodeid 并指向该条 |
+| `FileNotFoundError: … '<tmp>'`（路径超过 260 字符） | `tests/test_codex_checkpoints.py`（23）等 | pytest 临时目录过深触发 MAX_PATH（2026-10-28 实测） | 用短 `--basetemp` 复跑（Step 3 已这样跑）；短路径下仍失败才算真实失败 |
+| `CheckpointError: Unable to retire Codex checkpoint journal`（`WinError 5`） | `tests/test_codex_checkpoints.py` | 持锁时重命名含锁句柄的会话目录 | 已由 P2c Task 6（`dirs.lock_path`）修复；此处只复核 |
+| `TimeoutError` | `timeout_error` 根因的 6 个文件（37 条） | P2b Task 2 预计已消除（迁移未完成导致等待超时）；`tests/test_dsh_runtime.py` 还依赖 P2c Task 4 | 复测；仍失败的按新首行定位根因修复，不得 skip |
 | `Claude service directory must be private and owned by this user` | `tests/test_claude_native_permissions.py`、`tests/test_manual_compaction.py`、`tests/test_claude_live_context.py` | 来自 `cc_remote/claude_service/wire.py`（P3） | 跨子项目依赖第 1 条 |
 | `Task state directory must be private and owned by this user`、`Custom task MCP launcher` | `tests/test_codex_task_activity.py`、`tests/test_codex_agent_activity.py`、`tests/test_task_refresh.py` | 来自 `cc_remote/task_store.py`、`cc_remote/task_refresh.py`（基线归属规则 `task_*` → P4） | 跨子项目依赖第 2 条 |
 | 首行在 `deploy\check_codex_readiness.py` | `tests/test_codex_readiness.py` | `deploy/`（P5） | 跨子项目依赖第 3 条 |
@@ -1642,7 +1786,7 @@ Expected: `new (not in baseline): 0`；最后一行 `no timeouts`；剩余失败
 用 Step 3 的结果更新 `docs/superpowers/windows-baseline.json`：删除已通过的 owner-2 条目；仍失败的条目保留并把
 `root_cause_key`/`first_error_line` 更新为当前首行；在 `docs/superpowers/windows-baseline.md` 顶部"运行方式说明"之后加一段
 "P2 合并后（`<本分支 HEAD 短 SHA>`）"小节：owner-2 剩余条数、按文件的表、以及每条剩余原因指向的跨子项目依赖编号。
-不改动其它子项目的条目。
+不改动其它子项目的条目；唯一例外是"跨子项目依赖"第 2 条的误归属条目（owner 2 → 4，md 中注明）。
 
 - [ ] **Step 5: 门禁、推送与 PR**
 
@@ -1680,16 +1824,34 @@ EOF
    service 的用例。请 P3 改用 `perms.owned_info`/`perms.private_mode_info`（P2b 提供）。
 2. **P4**：`cc_remote/task_store.py`（`TaskStore.db` 的 `st_uid`/`st_mode & 0o077` 与 `os.O_NOFOLLOW`）、`cc_remote/task_refresh.py`。
    影响 `tests/test_codex_task_activity.py`（14+1）、`tests/test_codex_agent_activity.py`（4）、`tests/test_task_refresh.py`。
-   基线把这些 nodeid 记在 owner 2 名下，但按基线自身的归属规则 `task_*` 属于 P4；P2 不修改这些文件。
+   基线把这些 nodeid 记在 owner 2 名下，这是**基线的错误归属**：按基线自身的归属规则 `task_*` 属于 P4（报错首行也来自
+   `cc_remote/task_store.py`/`task_refresh.py`）。P2 不修改这些文件；Task 8 刷新基线时保留这些条目，把 md 里的归属标注为
+   "P4（原误记为 2）"、json 的 `owner` 改为 4，并在 PR 描述中说明，供 controller 复核。
 3. **P5**：`deploy/check_codex_readiness.py`（`os.O_NOFOLLOW`、`os.geteuid`）被 `tests/test_codex_readiness.py` 的
    `installer.*` 用例驱动（含 `test_live_installer_check_is_fresh_and_runs_only_as_service_owner[*]`）。
-4. **裁定（长路径）**：Claude 项目目录名最长约 200 字符，`~/.claude/projects/<名>/<uuid>.jsonl` 在 Windows 上可超过 260 字符；
-   本机 `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 0`。建议把 `LongPathsEnabled=1` 列为 Windows 环境要求，
-   由 P5 安装器检测并提示（修改注册表需要管理员，必须征得用户同意）；`tests/test_claude_catalog_cwd.py` 的长路径用例在开启后应通过。
-5. **裁定（checkpoint 墓碑）**：`codex_checkpoints.cleanup_codex_checkpoint_session` 需要在持锁时重命名会话目录，Windows 不允许。
-   可选方案：(a) 把 `journal.lock` 移到会话目录之外（`<repo>/<session>.lock`），两平台一致但改变了 POSIX 的锁位置；
-   (b) Windows 上在锁内逐个删除 journal 文件后释放锁再删目录。P2 倾向 (a) 并需要 controller 确认"锁文件位置变化"不违反
-   "POSIX 行为完全不变"。
+4. **P5（长路径，controller 裁定：不在 P2）**：Claude 项目目录名最长约 200 字符，`~/.claude/projects/<名>/<uuid>.jsonl` 在
+   Windows 上可超过 260 字符；pytest 的深临时目录也会触发同样的限制。本机
+   `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 0`。请 P5 安装器做环境检查：检测该值并提示用户；
+   修改注册表需要管理员权限，**未经用户同意绝不修改**。P2 代码只在任务本来就需要时（例如 P1 的 `force_rmtree`）使用 `\\?\` 前缀，
+   不为长路径另开任务。受影响：`tests/test_claude_catalog_cwd.py` 的长 cwd 用例（开启长路径后应通过）。
+5. **已裁定并落地（记录）**：Codex checkpoint 会话锁位置——POSIX 保持 `<会话目录>/journal.lock` 不变，Windows 用目录旁的兄弟锁文件，
+   由 `cc_remote/platform/dirs.py` 的 `lock_path`/`discard_lock` 选择（P2c Task 6）。
 6. **已知限制（记录，不阻塞）**：Windows 上无法廉价枚举他进程句柄，Codex 归属只能依据 argv（`resume SID`、命名的线程或 rollout）
    与 turn marker；以管理员身份运行的同用户 CLI 打不开时视为不存在（handoff 已记录的 fail-open）。Windows 环境变量名不区分大小写，
    `process_command_environment_value` 仍按精确键名匹配。
+7. **已知限制（记录，留给后续 p2e）**：P2 自有文件里还有几处在 Windows 上"恒为真"的属主判断或静默退化的 no-follow，它们不造成测试
+   失败，但在 Windows 上不提供 POSIX 的防护：`cc_remote/wrapper/preview_capabilities.py`（`st_uid != current_euid()` 与
+   `getattr(os, "O_NOFOLLOW", 0)`）、`cc_remote/wrapper/codex_daemon.py` 的 `_prepare_profile_standalone`（Linux standalone 布局，
+   Windows 的 npm 安装不会走到）、`cc_remote/wrapper/machine.py` 中临时文件清理的 `info.st_uid != current_uid()`。p2e 应逐个换成
+   `perms.owned_info(..., effective=…)` 与 `platform_files.open_nofollow`/`DirHandle`。
+
+## 后续 p2e：Artifact 发现不识别 Windows 绝对路径（controller 裁定：不在 P2）
+
+问题：模型在 Windows 上输出的交付文件路径是 `C:\Users\…\report.pdf` 或 `C:/Users/…/report.pdf` 形式，但
+`cc_remote/wrapper/session_artifacts.py` 的 `local_links()` / `_inline_local_paths()` 只认 POSIX 写法：行内代码里含 `\` 的值被
+`[<>|*?;$={}\\]` 过滤掉，`C:` 前缀被当成 URL scheme（`^[a-zA-Z][a-zA-Z0-9+.-]*:`）丢弃，Markdown 链接经 `urlsplit` 后
+`scheme == "c"` 也被拒绝，结果 Windows 上 Artifact 面板永远看不到这些文件。P2c Task 5 只把测试期望改成平台绝对路径（输入仍是
+POSIX 写法），没有改变这一行为。受影响模块：`cc_remote/wrapper/session_artifacts.py`（路径识别）与 `tests/test_session_artifacts.py`。
+验收：在 Windows 上，正文、行内代码、表格文件列与 Markdown 链接中的 `C:\…`、`C:/…`、`\\server\share\…` 路径都被识别并按
+`os.path.abspath` 规范化；单字母盘符以外的 URL scheme（`http:`、`file:` 等）仍按原规则处理；POSIX 上
+`tests/test_session_artifacts.py` 的全部现有断言不变，新增用例以 `windows_only` 标注，Linux CI 通过。

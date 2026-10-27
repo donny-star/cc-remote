@@ -4,7 +4,8 @@
 
 **Goal:** 用一个平台层 `DirHandle` 取代业务代码里 POSIX 专有的 `os.open(<目录>)` + `dir_fd=` 遍历，让文件预览、Markdown
 保存、Work 附件暂存和工作区浏览在 Windows 上工作且保持"每一级都不跟随链接"的防护；同时把测试里写死的 POSIX
-绝对路径改成平台正确的绝对路径。
+绝对路径改成平台正确的绝对路径；按 controller 裁定，用 `dirs.lock_path` 把 Codex checkpoint 会话锁在 Windows 上移到目录旁
+（POSIX 位置不变）。
 
 **Architecture:** 新文件 `cc_remote/platform/dirs.py` 提供 `DirHandle`。POSIX 分支持有 `O_DIRECTORY|O_NOFOLLOW` fd，
 子项用 `dir_fd` 解析——与现有代码逐字等价。Windows 分支持有用 `FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT`
@@ -37,13 +38,18 @@
   （`machine.py` 有名为 `files`、`dirs` 的局部变量）。
 - 测试里的 skip 只能用 `posix_only(reason=…)`、`windows_only(reason=…)`、`requires_symlink(reason=…)`，且只用于测的本来就是
   平台专有行为或夹具必须建符号链接的用例。
+- MAX_PATH：本机 `LongPathsEnabled=0`；pytest 临时目录很深时部分用例会因路径超过 260 字符失败，验收时加
+  `--basetemp=C:\t\<测试文件名>`。长路径支持属 P5 环境检查（P2d"跨子项目依赖"），P2 不改注册表。
+- 所有 `perms.owned_info` 替换：原表达式比对 `current_euid()` 的，必须写 `perms.owned_info(..., effective=True)`（P2b），
+  POSIX 才逐字等价。
 
 ## 文件结构
 
 | 文件 | 动作 | 职责 |
 |---|---|---|
-| `cc_remote/platform/dirs.py` | 新建 | `DirHandle`：不跟随链接、可钉住的目录句柄与相对子项操作 |
-| `tests/test_platform_dirs.py` | 新建 | `DirHandle` 测试 |
+| `cc_remote/platform/dirs.py` | 新建 | `DirHandle`：不跟随链接、可钉住的目录句柄与相对子项操作；Task 6 再加 `lock_path`/`discard_lock`（可被重命名的目录的锁位置） |
+| `tests/test_platform_dirs.py` | 新建 | `DirHandle` 与锁位置 helper 测试 |
+| `cc_remote/wrapper/codex_checkpoints.py`、`tests/test_codex_checkpoints.py` | 修改 | Task 6：checkpoint 会话锁经 `dirs.lock_path` 定位（POSIX 不变，Windows 放在目录旁） |
 | `cc_remote/wrapper/machine.py` | 修改 | `_read_session_file`、`_write_markdown_file`、`_write_staged_attachment`、`_open_work_upload_dir`、`_stash_files`、`_stash_images`、`_stash_work_attachments` |
 | `cc_remote/workspaces.py` | 修改 | `WorkRegistry._is_managed_upload_root` |
 | `cc_remote/wrapper/workspace_browser.py` | 修改 | `browse_workspace` |
@@ -98,7 +104,55 @@ class DirHandle:
   语义：`open_root`/`open_dir` 拒绝最后一级是链接（POSIX `ELOOP`/`ENOTDIR`，Windows `OSError(errno.ELOOP)`），不是目录时抛
   `NotADirectoryError`；`open_file` 在调用方 `flags` 上加 no-follow（POSIX `O_NOFOLLOW|O_CLOEXEC` + `dir_fd`，Windows
   `files.open_nofollow(child_path(name), …)`）。Windows 上 `name` 必须是单个路径分量（不能为空、`.`、`..`、含分隔符或盘符），
-  否则抛 `OSError(errno.EINVAL)`；POSIX 不做额外校验（与原 `dir_fd` 调用完全一致）。
+  否则抛 `OSError(errno.EINVAL)`；POSIX 不做额外校验（与原 `dir_fd` 调用完全一致）。POSIX 的 `open_root` 原样打开调用方
+  传入的路径（不先 `abspath`，避免改变含 `..` 的路径语义）；`path` 属性只用于 `child_path` 和 Windows 分支。
+
+- [ ] **Step 0: 可行性验证（目录钉住）**
+
+本计划的 Windows 安全论证依赖"不带 `FILE_SHARE_DELETE` 打开的目录句柄会让该目录及其所有祖先都不能被改名或删除，而目录内的
+创建/替换/删除不受影响"。先在本机实测（2026-10-28 已实测通过，执行者开工前复核一次）：
+
+```bash
+PYTHONUTF8=1 .venv/Scripts/python.exe - <<'EOF'
+import ctypes, os, shutil, tempfile
+from ctypes import wintypes
+from cc_remote.platform import files
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                          wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+k.CreateFileW.restype = wintypes.HANDLE
+k.CloseHandle.argtypes = [wintypes.HANDLE]
+root = tempfile.mkdtemp()
+child = os.path.join(root, "parent", "child")
+os.makedirs(child)
+handle = k.CreateFileW(child, 0x1 | 0x80 | 0x20000 | 0x100000, 0x1 | 0x2, None, 3,
+                       0x02000000 | 0x00200000, None)
+assert handle != wintypes.HANDLE(-1).value
+for src, dst in ((child, child + "-moved"), (os.path.dirname(child), os.path.join(root, "moved"))):
+    try:
+        os.rename(src, dst)
+        print("RENAMED", src)
+    except OSError as exc:
+        print("refused", exc.winerror)
+try:
+    os.rmdir(child)
+    print("RMDIR")
+except OSError as exc:
+    print("rmdir refused", exc.winerror)
+inner = os.path.join(child, "ok")
+open(inner, "wb").close()
+files.replace(inner, inner + "2")
+os.unlink(inner + "2")
+print("inner ops ok")
+k.CloseHandle(handle)
+os.rename(os.path.join(root, "parent"), os.path.join(root, "moved"))
+print("released ok")
+shutil.rmtree(root)
+EOF
+```
+
+Expected（Windows）：`refused 32`、`refused 5`、`rmdir refused 32`、`inner ops ok`、`released ok`。出现任何 `RENAMED`/`RMDIR`
+都说明钉住不成立，停止本计划并回报 controller（此时 Windows 的 `DirHandle` 需要改为逐级 `GetFinalPathNameByHandle` 复核）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -302,10 +356,12 @@ class DirHandle:
 
     @classmethod
     def open_root(cls, path: StrPath) -> "DirHandle":
-        absolute = os.path.abspath(os.fspath(path))
+        raw = os.fspath(path)
+        absolute = os.path.abspath(raw)
         if IS_WINDOWS:
             return cls(absolute, _win32_open_directory(absolute))
-        return cls(absolute, os.open(absolute, _POSIX_DIR_FLAGS))
+        # POSIX opens exactly what the caller passed, as the dir_fd walks did.
+        return cls(absolute, os.open(raw, _POSIX_DIR_FLAGS))
 
     def child_path(self, name: str) -> str:
         if IS_WINDOWS:
@@ -672,7 +728,8 @@ EOF
   `tests/test_workspaces.py` 中建符号链接的用例加 `requires_symlink`
 
 **Interfaces:**
-- Consumes: `DirHandle`（Task 1）、`perms.owned_info`（P2b）、`platform_files.fchmod(fd, path, mode)`（P1）。
+- Consumes: `DirHandle`（Task 1）、`perms.owned_info(target, info, *, effective=True)`（P2b；这几处原来都比对 `current_euid()`）、
+  `platform_files.fchmod(fd, path, mode)`（P1）。
 - Produces（签名变化，仅 machine 内部与测试使用）：
   - `WrapperMachine._stash_files(self, prompt, files, temp_dir, engine="claude", *, directory: DirHandle | None = None) -> str`
   - `WrapperMachine._stash_images(self, images, temp_dir, *, directory: DirHandle | None = None) -> list`
@@ -724,7 +781,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
-                or not perms.owned_info(descriptor, info)
+                or not perms.owned_info(descriptor, info, effective=True)
                 or info.st_nlink != 1
             ):
                 raise RuntimeError("attachment target is not a private file")
@@ -756,7 +813,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
                 workspace_info = os.fstat(workspace.fd)
                 if (
                     not stat.S_ISDIR(workspace_info.st_mode)
-                    or not perms.owned_info(workspace.fd, workspace_info)
+                    or not perms.owned_info(workspace.fd, workspace_info, effective=True)
                 ):
                     raise RuntimeError(
                         "Work workspace is not a private directory")
@@ -771,7 +828,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
                 uploads_info = os.fstat(uploads.fd)
                 if (
                     not stat.S_ISDIR(uploads_info.st_mode)
-                    or not perms.owned_info(uploads.fd, uploads_info)
+                    or not perms.owned_info(uploads.fd, uploads_info, effective=True)
                 ):
                     raise RuntimeError(
                         "Work uploads path is not a private directory")
@@ -800,7 +857,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
                             len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
                     if (
                         not stat.S_ISREG(marker_info.st_mode)
-                        or not perms.owned_info(marker_fd, marker_info)
+                        or not perms.owned_info(marker_fd, marker_info, effective=True)
                         or marker_info.st_nlink != 1
                         or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
                     ):
@@ -815,7 +872,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
                 message_info = os.fstat(message.fd)
                 if (
                     not stat.S_ISDIR(message_info.st_mode)
-                    or not perms.owned_info(message.fd, message_info)
+                    or not perms.owned_info(message.fd, message_info, effective=True)
                 ):
                     raise RuntimeError("Work message upload path is unsafe")
                 platform_files.fchmod(message.fd, message.path, 0o700)
@@ -858,7 +915,7 @@ root_cause_key 为 `symlink_privilege` 的那几条 nodeid 对应的测试函数
             marker = os.fstat(marker_fd)
             with os.fdopen(marker_fd, "rb", closefd=False) as stream:
                 payload = stream.read(len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
-            owned = perms.owned_info(marker_fd, marker)
+            owned = perms.owned_info(marker_fd, marker, effective=True)
         except OSError:
             return False
         finally:
@@ -939,7 +996,7 @@ git commit -F - <<'EOF'
 fix(wrapper): stage Work uploads and browse workspaces through directory handles
 
 - Replace dir_fd walks in Work upload staging, upload-root detection and workspace browsing with DirHandle
-- Check upload ownership with perms.owned_info and refuse Windows junctions while browsing
+- Check upload ownership with perms.owned_info(effective=True) and refuse Windows junctions while browsing
 - Mark symlink-planting fixtures requires_symlink
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1136,14 +1193,236 @@ EOF
 
 ---
 
-### Task 6: P2c 收尾
+### Task 6: Codex checkpoint 会话锁的位置（controller 裁定）
+
+基线：`tests/test_codex_checkpoints.py::test_cleanup_session_removes_journals_from_every_repository`
+（`CheckpointError: Unable to retire Codex checkpoint journal`，根因 `WinError 5`）。
+根因（2026-10-28 本机实测）：`cleanup_codex_checkpoint_session` 和 `CodexCheckpointJournal.cleanup` 都在持有
+`<会话目录>/journal.lock` 句柄时把会话目录 `os.replace` 成墓碑；Windows 不允许重命名内部有打开句柄的目录（`WinError 5`），
+而锁文件放在目录旁边时重命名成功。
+裁定：POSIX 的锁位置**完全不变**（`<会话目录>/journal.lock`）；Windows 上锁是目录旁的兄弟文件
+`<仓库目录>/.<会话 key>.journal.lock`，由平台 helper 选择，业务代码不出现 `sys.platform` 分支。
+
+**Files:**
+- Modify: `cc_remote/platform/dirs.py`（新增 `lock_path`、`discard_lock`）
+- Modify: `cc_remote/wrapper/codex_checkpoints.py`（`cleanup_codex_checkpoint_session`、`CodexCheckpointJournal.__init__`、
+  `CodexCheckpointJournal.cleanup`）
+- Test: `tests/test_platform_dirs.py`、`tests/test_codex_checkpoints.py`
+
+**Interfaces:**
+- Produces:
+  - `dirs.lock_path(directory: StrPath, name: str) -> str`——POSIX：`os.path.join(directory, name)`（锁在目录内，与现状
+    相同）；Windows：`os.path.join(<父目录>, f".{<目录名>}.{name}")`（锁在目录旁，目录可以在持锁时被重命名）。
+  - `dirs.discard_lock(directory: StrPath, name: str) -> None`——目录已删除之后调用。POSIX：no-op（锁随目录一起删除）；
+    Windows：尽力 `unlink` 兄弟锁文件，`FileNotFoundError`/`PermissionError` 忽略。Windows 上普通 `os.open` 句柄不带
+    `FILE_SHARE_DELETE`，只要还有人打开着（持锁或在等锁），unlink 就会以 `WinError 32` 失败，因此不会拆散一把正被使用的锁
+    （本机已实测）。
+- Consumes: `locks.flock`（P1）。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/test_platform_dirs.py` 末尾追加：
+
+```python
+def test_lock_path_stays_inside_on_posix_and_beside_on_windows(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    session = tmp_path / "repo" / "abc"
+    if sys.platform == "win32":
+        assert dirs.lock_path(session, "journal.lock") == str(tmp_path / "repo" / ".abc.journal.lock")
+    else:
+        assert dirs.lock_path(session, "journal.lock") == str(session / "journal.lock")
+
+
+def test_directory_can_be_renamed_while_its_lock_is_held(tmp_path) -> None:
+    from cc_remote.platform import dirs, locks
+
+    session = tmp_path / "repo" / "abc"
+    session.mkdir(parents=True)
+    (session / "manifest.json").write_text("{}")
+    fd = os.open(dirs.lock_path(session, "journal.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        locks.flock(fd, locks.LOCK_EX)
+        os.replace(session, tmp_path / "repo" / ".abc.delete-1")
+    finally:
+        locks.flock(fd, locks.LOCK_UN)
+        os.close(fd)
+    assert not session.exists()
+
+
+@pytest.mark.windows_only(reason="sibling lock files only exist on Windows")
+def test_discard_lock_never_removes_a_lock_in_use(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    session = tmp_path / "abc"
+    path = dirs.lock_path(session, "journal.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        dirs.discard_lock(session, "journal.lock")
+        assert os.path.exists(path)
+    finally:
+        os.close(fd)
+    dirs.discard_lock(session, "journal.lock")
+    assert not os.path.exists(path)
+    dirs.discard_lock(session, "journal.lock")  # already gone: no error
+
+
+@pytest.mark.posix_only(reason="POSIX keeps the lock inside the removed directory")
+def test_discard_lock_is_a_no_op_on_posix(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    marker = tmp_path / "abc" / "journal.lock"
+    marker.parent.mkdir()
+    marker.write_text("")
+    dirs.discard_lock(tmp_path / "abc", "journal.lock")
+    assert marker.exists()
+```
+
+`tests/test_codex_checkpoints.py` 末尾追加（两个平台都运行；它复现基线失败，并验证 POSIX 锁位置不变）：
+
+```python
+def test_journal_lock_location_comes_from_the_platform_helper(tmp_path):
+    from cc_remote.platform import dirs
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "session-lock")
+    assert str(journal.lock_path) == dirs.lock_path(journal.session_dir, "journal.lock")
+    if sys.platform != "win32":
+        assert journal.lock_path == journal.session_dir / "journal.lock"
+```
+
+（`_repo(tmp_path, files)` 与 `CodexCheckpointJournal(repository_root, state_dir, session_id)` 是该文件现有的写法，见
+`tests/test_codex_checkpoints.py:32,92`；若文件顶部没有 `import sys`，补上。）
+
+- [ ] **Step 2: 运行测试，确认失败**
+
+Run: `PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/test_platform_dirs.py tests/test_codex_checkpoints.py -p no:xdist -o addopts="" -q --tb=line --basetemp=C:\\t\\p2c-t6 -k "lock or cleanup_session"`
+Expected: `AttributeError: module 'cc_remote.platform.dirs' has no attribute 'lock_path'`；Windows 上
+`test_cleanup_session_removes_journals_from_every_repository` 仍为 `Unable to retire Codex checkpoint journal`。
+
+- [ ] **Step 3: 实现 helper**
+
+`cc_remote/platform/dirs.py` 在 `class DirHandle` 之前加入，并把 `__all__` 改为 `["DirHandle", "discard_lock", "lock_path"]`：
+
+```python
+def lock_path(directory: StrPath, name: str) -> str:
+    """Where to lock ``directory`` when it may be renamed while locked.
+
+    POSIX keeps the lock inside the directory, as before. Windows refuses to
+    rename a directory that contains an open handle, so the lock is the
+    sibling file ``.<directory name>.<name>`` next to it.
+    """
+    directory = os.fspath(directory)
+    if not IS_WINDOWS:
+        return os.path.join(directory, name)
+    parent, base = os.path.split(os.path.normpath(directory))
+    return os.path.join(parent, f".{base}.{name}")
+
+
+def discard_lock(directory: StrPath, name: str) -> None:
+    """Best-effort removal of a sibling lock once ``directory`` is gone.
+
+    POSIX locks were removed with the directory. On Windows plain handles
+    lack FILE_SHARE_DELETE, so the unlink fails while anyone still holds or
+    waits on the lock; it never splits a lock that is in use.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        os.unlink(lock_path(directory, name))
+    except (FileNotFoundError, PermissionError):
+        pass
+```
+
+- [ ] **Step 4: `codex_checkpoints.py` 使用 helper**
+
+import 区：`from cc_remote.platform import files as platform_files, locks`（P2b Task 3B 之后的写法）改为
+`from cc_remote.platform import dirs, files as platform_files, locks`。
+
+`cleanup_codex_checkpoint_session` 中：
+
+```python
+            lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
+```
+
+改为
+
+```python
+            lock_fd = os.open(dirs.lock_path(candidate, "journal.lock"), lock_flags, 0o600)
+```
+
+同函数 `shutil.rmtree(tombstone, ignore_errors=False)` 成功之后、`removed += 1` 之前加一行：
+
+```python
+            dirs.discard_lock(candidate, "journal.lock")
+```
+
+`CodexCheckpointJournal.__init__` 中：
+
+```python
+        self.lock_path = self.session_dir / "journal.lock"
+```
+
+改为
+
+```python
+        self.lock_path = Path(dirs.lock_path(self.session_dir, "journal.lock"))
+```
+
+`CodexCheckpointJournal.cleanup` 末尾：
+
+```python
+        if tombstone is not None:
+            shutil.rmtree(tombstone, ignore_errors=False)
+```
+
+改为
+
+```python
+        if tombstone is not None:
+            shutil.rmtree(tombstone, ignore_errors=False)
+            dirs.discard_lock(self.session_dir, "journal.lock")
+```
+
+POSIX 核对：`lock_path` 返回的字符串与原 `candidate / "journal.lock"`、`self.session_dir / "journal.lock"` 指向同一路径，
+`os.open` 的 flags 不变；`discard_lock` 在 POSIX 上是 no-op。`_locked()` 里的
+`self.session_dir.mkdir(..., parents=True, exist_ok=True)` 保证 Windows 的兄弟锁所在的父目录存在，无需改动。
+
+- [ ] **Step 5: 运行测试**
+
+```bash
+for f in tests/test_platform_dirs.py tests/test_codex_checkpoints.py; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=line --basetemp="C:\\t\\$(basename $f .py)" 2>&1 | tail -2 | sed "s|^|$f: |"; done
+```
+
+Expected: `tests/test_platform_dirs.py` 全部通过；`tests/test_codex_checkpoints.py` 中 `Unable to retire Codex checkpoint journal`
+不再出现（剩余的只能是 P2d Task 7 处理的 `WinError 1314` 符号链接条目）。
+
+- [ ] **Step 6: lint 并提交**
+
+```bash
+uvx --from ruff==0.15.13 ruff check cc_remote/platform/dirs.py cc_remote/wrapper/codex_checkpoints.py tests/test_platform_dirs.py tests/test_codex_checkpoints.py
+git add cc_remote/platform/dirs.py cc_remote/wrapper/codex_checkpoints.py tests/test_platform_dirs.py tests/test_codex_checkpoints.py
+git commit -F - <<'EOF'
+fix(wrapper): place Codex checkpoint session locks through a platform helper
+
+- dirs.lock_path keeps the POSIX lock inside the session directory and moves it beside the directory on Windows
+- Windows can therefore retire a locked checkpoint session by renaming its directory
+- dirs.discard_lock removes the Windows sibling lock only when no handle still uses it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
+### Task 7: P2c 收尾
 
 **Files:** 无代码改动。
 
 - [ ] **Step 1: 本计划涉及的全部测试文件逐个跑**
 
 ```bash
-FILES="tests/test_platform_dirs.py tests/test_markdown_preview.py tests/test_audio_preview.py tests/test_spreadsheet_preview.py tests/test_codex_generated_images.py tests/test_wrapper_core_fixes.py tests/test_attachments.py tests/test_workspaces.py tests/test_workspace_browser.py tests/test_claude_forks.py tests/test_claude_session_fork.py tests/test_command_reliability.py tests/test_history_turn_changes.py tests/test_turn_changes.py tests/test_session_artifacts.py tests/test_link_preview_images.py $(ls tests/test_dsh_*.py | tr '\n' ' ')"
+FILES="tests/test_platform_dirs.py tests/test_codex_checkpoints.py tests/test_markdown_preview.py tests/test_audio_preview.py tests/test_spreadsheet_preview.py tests/test_codex_generated_images.py tests/test_wrapper_core_fixes.py tests/test_attachments.py tests/test_workspaces.py tests/test_workspace_browser.py tests/test_claude_forks.py tests/test_claude_session_fork.py tests/test_command_reliability.py tests/test_history_turn_changes.py tests/test_turn_changes.py tests/test_session_artifacts.py tests/test_link_preview_images.py $(ls tests/test_dsh_*.py | tr '\n' ' ')"
 for f in $FILES; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest "$f" -p no:xdist -o addopts="" -q --tb=no 2>&1 | tail -1 | sed "s|^|$f: |"; done
 ```
 
@@ -1161,9 +1440,17 @@ gh pr create --repo donny-star/cc-remote --base windows-compat-v2 --head win/2c-
 - cc_remote.platform.dirs.DirHandle: POSIX keeps O_DIRECTORY|O_NOFOLLOW + dir_fd; Windows pins reparse-point-refusing directory handles without FILE_SHARE_DELETE
 - File previews, Markdown save, Work upload staging, upload-root detection and workspace browsing use it
 - Test fixtures build platform-absolute paths; FIFO tests posix_only; symlink fixtures requires_symlink; bounded parametrize ids
+- Codex checkpoint session locks are placed by dirs.lock_path: unchanged on POSIX, beside the directory on Windows
 
 Checks: Windows per-file pytest for every touched test file; ruff; git diff --check. Linux pytest runs in CI.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 ```
+
+## 跨子项目依赖
+
+完整列表见 P2d 末尾"跨子项目依赖与待裁定事项"。与本计划直接相关的：
+
+1. **P5**：MAX_PATH / `LongPathsEnabled` 环境检查（`tests/test_claude_catalog_cwd.py` 的长 cwd 用例等；P2 不改注册表）。
+2. **后续 p2e**：Artifact 发现不识别 `C:\…` 路径（Task 5 只改测试期望），见 P2d 末尾"后续 p2e"一节。
