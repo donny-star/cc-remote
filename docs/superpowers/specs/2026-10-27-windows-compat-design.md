@@ -45,7 +45,7 @@ App 接入（`codex_desktop`、`desktop_remote_ui`）、多用户和 supervisor 
 |---|---|---|
 | `locks.py` | `fcntl.flock`（支持 LOCK_NB） | `msvcrt.locking`，移植自旧分支的 `file_lock_compat`，LOCK_NB 只尝试一次 `LK_NBLCK` |
 | `files.py` | `os.open` / `os.replace` | 打开时带 `FILE_SHARE_DELETE`（移植 `open_with_share_delete`）；`replace` 遇到短暂的 `PermissionError` 时有限次退避重试 |
-| `perms.py` | `chmod 0o600/0o700`、属主和权限位校验 | 用 icacls 给当前用户设独占 ACL，校验时检查 ACL 没有对其他主体开放；无法设置时降级为 no-op 并写日志 |
+| `perms.py` | `chmod 0o600/0o700`、属主和权限位校验 | 用 pywin32 给当前用户设独占 DACL，校验时检查 ACL 没有对其他主体开放；无法设置时抛 `OSError`（见 §3.1，不再降级为 no-op） |
 | `identity.py` | `getuid` / `pwd` | 当前用户 SID 加 `USERNAME`；凡是比对 uid 的地方都改用 `current_identity()` |
 | `procs.py` | `start_new_session` + `killpg` | `CREATE_NEW_PROCESS_GROUP` 加 Job Object（`KILL_ON_JOB_CLOSE`）；先发 `CTRL_BREAK_EVENT` 温和终止，宽限期过后用 `TerminateJobObject` 强杀 |
 | `proc_scan.py` | `/proc`、`ps`、`lsof` | EnumProcesses、Toolhelp32（父子链）、PEB 读命令行，移植自旧分支；提供统一的 `ProcessIdentity(pid, start_time)`，防止 PID 复用后误杀 |
@@ -108,6 +108,12 @@ App 接入（`codex_desktop`、`desktop_remote_ui`）、多用户和 supervisor 
   旧句柄读到的仍是旧内容，与 POSIX 的 inode 语义一致。如果占用方没给 share-delete，
   会报错误码 32，此时退避重试。文件系统不支持 POSIX 重命名时（FAT），退回
   `os.replace`。
+- **`make_private` 失败时抛错**（P1 最终评审后的裁定）：给保存密钥的文件设置私有权限
+  如果悄悄降级成 no-op，token 就会被其他用户读到，所以失败时一律抛 `OSError`（由
+  `pywintypes.error` 转换而来）。平台层对外只抛 `OSError` 家族的异常，不让
+  `pywintypes.error` 漏出去。另外新增 `perms.is_private_fd(fd)` 和
+  `perms.owned_by_current_user(fd|path)`，后续子项目按 fd 做私有/属主校验时直接用
+  这两个，不要自己再写 `IS_WINDOWS` 分支。
 - **依赖**：`pywin32==312; sys_platform == "win32"` 显式加入
   `requirements-common.txt`。它原本是通过 mcp 间接引入的。
 
