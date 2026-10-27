@@ -11,8 +11,10 @@ endpoint 文件 + 双向 HMAC 挑战-应答），并把 `cc_remote/claude_servic
 私有目录检查、过期 socket 探测、0600 绑定、peer uid 校验原样搬进来（service 原来的 `same_user`
 是同一语义）。Windows 分支在原 `.sock` 路径写私有 JSON endpoint 记录，服务端只监听
 `127.0.0.1` 随机端口（`SO_EXCLUSIVEADDRUSE`），连接后先做固定长度、带超时的双向 HMAC
-握手，token 从不上线路；客户端连接前按 `pid + start_time` 判定过期。claude_service 只改
-调用点：目录检查、监听、连接、journal 权限、锁、信号。
+握手，token 从不上线路；客户端连接前按 `pid + start_time` 判定过期。同一路径上的多个启动者用
+`<endpoint>.lock` 串行化"回收旧记录 → 发布新记录"，发布用不覆盖的原子重命名；关闭时先撤下记录再释放
+端口。claude_service 只改调用点：目录检查（含 `wire.py:55` 的 POSIX 权限位判定）、监听、连接、journal
+权限、锁、信号。
 
 **Tech Stack:** Python 3.13（uv）、asyncio streams、`hmac`/`hashlib`/`secrets`、pywin32 312
 （`win32profile`、`win32security`）、pytest 9 + pytest-asyncio。
@@ -101,7 +103,7 @@ class IpcServer:
     path: Path                     # property
     auth_failures: int             # property
     def is_serving(self) -> bool
-    def close(self) -> None        # stop listening; unlink the endpoint only if it is still ours
+    def close(self) -> None        # withdraw the endpoint (only if still ours), then stop listening
     async def wait_closed(self) -> None
     async def serve_forever(self) -> None
     async def __aenter__(self) -> IpcServer
@@ -123,8 +125,27 @@ def write_endpoint(path, endpoint: Endpoint) -> tuple[int, int]
 | 过期（POSIX 连接被拒；Windows 记录的进程已不在、start_time 不符或端口不通） | `ConnectionRefusedError` |
 | 目录/endpoint 不私有、不属于当前用户、是链接、格式不对 | `UnsafeEndpointError` |
 | 对端不是同一用户（peer uid 不符或 HMAC 不通过、握手超时） | `AuthenticationError` |
-| `start_server` 时已有活的服务端 | `AlreadyRunningError`（消息含 `already running`） |
+| `start_server` 时已有活的服务端（POSIX 能连上；Windows 握手成功） | `AlreadyRunningError`（消息含 `already running`） |
+| `start_server` 时另一个启动者持有启动锁超过 10 s | `AlreadyRunningError`（消息含 `another server is starting`） |
 | `start_server` 时路径上是别的东西 | `UnsafeEndpointError`（消息含 `refusing to replace`） |
+| `start_server` 时旧记录无法判定（Windows：记录的进程仍存活，但端口 3 s 内不接受连接，或握手超时/中断） | `UnsafeEndpointError`（消息含 `cannot verify`，对应 POSIX 探测的其它 `OSError`） |
+
+Windows 发布与回收规则（Task 4、5 实现，Task 4、5 的测试逐条覆盖）：
+
+1. `start_server` 在 `<endpoint>.lock`（`locks.flock`，非阻塞轮询，最多 10 s）里完成"读旧记录 → 判定 →
+   删除旧记录 → 发布新记录"，所以两个同时启动的服务端不会互删对方刚发布的记录；锁文件留在私有目录里，不删除
+   （删锁文件会重新引入竞态）。
+2. 判定旧记录：读不出来（不私有、不是本人、链接、格式错）→ `refusing to replace`；对记录的端口做一次完整握手：
+   成功 → `already running`；连接被拒或对端证明不了 token → 过期，删除；连接超时、握手超时或中断 → 只有当
+   记录的 `pid + start_time` 仍对得上时才拒绝（`cannot verify`），否则按过期删除。监听中的服务端会立即接受回环
+   连接，所以记录的进程已不在时连接只等 0.5 s，不付 Windows 拒绝连接的约 2 s。删除在发布之前、在锁内完成。
+3. 发布用不覆盖的原子重命名（`os.rename` → `MoveFileExW` 不带 `REPLACE_EXISTING`），目标已存在 →
+   `AlreadyRunningError`，与 POSIX `bind()` 的 `EADDRINUSE` 同义。
+4. `IpcServer.close()` 先撤下记录（仅当路径上的文件仍是自己发布的那个），再关闭监听：记录在、端口就在，
+   不存在"记录还指着这个端口、记录的进程也活着、但端口已经空出来"的窗口。
+5. 客户端：读记录（私有、属主、非链接、格式严格，fail-closed）→ `pid + start_time` 必须对得上 → 连接
+   （Windows 上连接一个没人监听的回环端口约 2 s 才报拒绝，连接超时同样按过期报 `ConnectionRefusedError`）→
+   双向 HMAC 握手（先验服务端，再给出自己的证明）。
 
 ---
 
@@ -239,6 +260,15 @@ def test_ensure_private_directory_rejects_a_junction(tmp_path):
         check=True, capture_output=True)
     with pytest.raises(ipc.UnsafeEndpointError, match="real directory"):
         ipc.ensure_private_directory(junction)
+
+
+@pytest.mark.windows_only(reason="Windows ownership comes from the security descriptor")
+def test_ensure_private_directory_fails_closed_when_ownership_is_unverifiable(tmp_path, monkeypatch):
+    target = ipc.ensure_private_directory(tmp_path / "unverifiable")
+    # perms.owned_by_current_user returns False on any inspection failure.
+    monkeypatch.setattr(ipc.perms, "owned_by_current_user", lambda _target: False)
+    with pytest.raises(ipc.UnsafeEndpointError, match="owned by the current"):
+        ipc.ensure_private_directory(target)
 
 
 @pytest.mark.windows_only(reason="the profile boundary only exists for Windows endpoints")
@@ -374,8 +404,8 @@ def _check_windows_directory(directory: Path) -> None:
 - [ ] **Step 5: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
-Expected（Windows，未开开发者模式）：`8 passed, 2 skipped`（skip 的是 `posix_only` 和 `requires_symlink`）。
-开了开发者模式时 `9 passed, 1 skipped`。
+Expected（Windows，未开开发者模式）：`9 passed, 2 skipped`（skip 的是 `posix_only` 和 `requires_symlink`）。
+开了开发者模式时 `10 passed, 1 skipped`。
 
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/ipc.py tests/ipc_helpers.py tests/test_platform_ipc.py`
 Expected: `All checks passed!`
@@ -454,6 +484,7 @@ def test_endpoint_record_round_trips():
 
 @pytest.mark.parametrize("mutate", [
     lambda value: value.update(v=2),
+    lambda value: value.update(v=True),
     lambda value: value.update(extra=1),
     lambda value: value.pop("token"),
     lambda value: value.update(port=0),
@@ -463,7 +494,7 @@ def test_endpoint_record_round_trips():
     lambda value: value.update(start_time=0),
     lambda value: value.update(token=base64.b64encode(b"short").decode("ascii")),
     lambda value: value.update(token="not base64!"),
-], ids=["version", "extra", "missing", "port-zero", "port-high", "port-text",
+], ids=["version", "version-bool", "extra", "missing", "port-zero", "port-high", "port-text",
         "pid-bool", "start-zero", "token-short", "token-text"])
 def test_endpoint_record_rejects_deviations(mutate):
     value = json.loads(_endpoint().encode())
@@ -607,7 +638,8 @@ class Endpoint:
         if not isinstance(value, dict) or set(value) != {"v", "port", "token", "pid", "start_time"}:
             raise ValueError("endpoint record has unexpected fields")
         port, pid, start_time = value["port"], value["pid"], value["start_time"]
-        if (value["v"] != ENDPOINT_VERSION
+        # type() rather than isinstance(): JSON true must not pass as 1.
+        if (type(value["v"]) is not int or value["v"] != ENDPOINT_VERSION
                 or not all(type(item) is int for item in (port, pid, start_time))
                 or not 0 < port < 65536 or pid <= 0 or start_time <= 0
                 or not isinstance(value["token"], str)):
@@ -687,7 +719,7 @@ def _publish(temporary: Path, target: Path, attempts: int = 10) -> None:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
-Expected（Windows，未开开发者模式）：`25 passed, 3 skipped`。
+Expected（Windows，未开开发者模式）：`27 passed, 3 skipped`。
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/ipc.py tests/test_platform_ipc.py`
 Expected: `All checks passed!`
 
@@ -863,6 +895,61 @@ async def test_server_rejects_its_own_proof_reflected_back():
         writer.write(reply[ipc.NONCE_BYTES:])
         await writer.drain()
         assert await asyncio.wait_for(result, 2) is False
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_rejects_a_replayed_client_proof():
+    """Bytes captured from a successful handshake are useless in a new one."""
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        client_nonce = os.urandom(ipc.NONCE_BYTES)
+        writer.write(client_nonce)
+        await writer.drain()
+        reply = await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        proof = ipc._mac(TOKEN, b"cli", reply[:ipc.NONCE_BYTES], client_nonce)
+        writer.write(proof)
+        await writer.drain()
+        assert await asyncio.wait_for(result, 2) is True
+    finally:
+        await _shutdown(server, writer)
+
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        writer.write(client_nonce)
+        await writer.drain()
+        fresh = await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        assert fresh[:ipc.NONCE_BYTES] != reply[:ipc.NONCE_BYTES]
+        writer.write(proof)
+        await writer.drain()
+        assert await asyncio.wait_for(result, 2) is False
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_a_replayed_server_reply():
+    """A recorded server reply only proves the token for the nonce it answered."""
+    old_client_nonce = os.urandom(ipc.NONCE_BYTES)
+    old_server_nonce = os.urandom(ipc.NONCE_BYTES)
+    recorded = old_server_nonce + ipc._mac(TOKEN, b"srv", old_client_nonce, old_server_nonce)
+
+    async def replayer(reader, writer):
+        await reader.readexactly(ipc.NONCE_BYTES)
+        writer.write(recorded)
+        await writer.drain()
+        return await reader.read()
+
+    server, reader, writer, result = await _loopback(replayer)
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc._client_handshake(reader, writer, TOKEN)
+        writer.close()
+        # The client sent nothing after its nonce: no proof for the replayer.
+        assert await asyncio.wait_for(result, 2) == b""
     finally:
         await _shutdown(server, writer)
 
@@ -1102,7 +1189,7 @@ class _Guard:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
-Expected（Windows，未开开发者模式）：`35 passed, 4 skipped`。
+Expected（Windows，未开开发者模式）：`38 passed, 4 skipped`。
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/ipc.py tests/test_platform_ipc.py`
 Expected: `All checks passed!`（`base64`/`errno` 等此时都已被使用；`IS_WINDOWS` 在 Task 1 已被使用。）
 
@@ -1124,29 +1211,34 @@ git commit -F /tmp/msg-p3a-3.txt
 
 ---
 
-### Task 4: `start_server` / `open_connection` / `connect_sync` 与 `IpcServer`
+### Task 4: Windows 存活判定、过期回收与启动锁
 
 **Files:**
 - Modify: `cc_remote/platform/ipc.py`
 - Modify: `tests/test_platform_ipc.py`
 
 **Interfaces:**
-- Consumes: Task 1–3 全部；`win32_process.creation_time(pid) -> int | None`（Windows，`None` 表示已退出或无法查询）。
-- Produces: `DEFAULT_LIMIT`、`IpcServer`、`start_server`、`open_connection`、`connect_sync`（签名见"接口总览"）。
-  POSIX 行为与原 broker 实现逐条一致：父目录私有检查 → 过期 socket 探测（拒绝/不存在 → unlink；能连上 →
-  `AlreadyRunningError`；非本人或非 socket → `UnsafeEndpointError`）→ `umask(0o177)` 绑定 → `chmod 0600` 复核 →
-  `start_unix_server(sock=...)`；客户端先查 socket 属主/类型/0600，连上后核对对端 uid。
+- Consumes: Task 1–3；`win32_process.creation_time(pid) -> int | None`（Windows，`None` 表示已退出或无法查询）；
+  `locks.flock(fd, op)`、`locks.LOCK_EX`、`locks.LOCK_NB`（冲突抛 `BlockingIOError`；关闭句柄即释放）。
+- Produces（Task 5 的 Windows 后端直接调用）：
+  - `_close_quietly(writer) -> None`（async）
+  - `_process_start_time(pid) -> int | None`、`_owner_alive(endpoint) -> bool`、
+    `_require_live(endpoint) -> None`（不符抛 `ConnectionRefusedError`）
+  - `_PROBE_QUICK_CONNECT_TIMEOUT = 0.5`、`_PROBE_CONNECT_TIMEOUT = 3.0`、`async _probe(endpoint) -> str`：
+    `"live"`（对端证明了 token）、`"gone"`（连接被拒、对端证明不了 token，或记录的进程已不在且端口 0.5 s 内不接受连接）、
+    `"unknown"`（记录的进程仍在但端口 3 s 内不接受连接、握手超时或中断）
+  - `async _reclaim_windows(target) -> None`：按"接口总览"的规则 2 处理旧记录
+  - `_START_LOCK_TIMEOUT = 10.0`、`_start_lock(target)`：异步上下文管理器，持有 `<endpoint>.lock` 的排他锁
 
 - [ ] **Step 1: 写失败的测试**
 
-import 区再追加 `dataclasses`、`shutil`、`sys`、`tempfile`，以及 helper 的 `SHORT_TMP`：
+import 区再追加 `shutil`、`sys`、`tempfile`，以及 `IS_WINDOWS` 和 helper 的 `SHORT_TMP`：
 
 ```python
 from __future__ import annotations
 
 import asyncio
 import base64
-import dataclasses
 import hashlib
 import hmac
 import json
@@ -1165,7 +1257,7 @@ from cc_remote.platform import IS_WINDOWS, ipc, perms
 from tests.ipc_helpers import SHORT_TMP, share_with_everyone
 ```
 
-文件末尾追加：
+文件末尾追加（这里的 fixture/helper 也供 Task 5 使用）：
 
 ```python
 @pytest.fixture
@@ -1183,6 +1275,12 @@ def _own_start_time() -> int:
     return win32_process.creation_time(os.getpid())
 
 
+def _dead_pid() -> int:
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    return finished.pid
+
+
 def _closed_port() -> int:
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
@@ -1191,13 +1289,19 @@ def _closed_port() -> int:
     return port
 
 
+def _record(path: Path, port: int, token: bytes, *, pid: int | None = None,
+            start_time: int | None = None) -> None:
+    ipc.ensure_private_directory(path.parent)
+    ipc.write_endpoint(path, ipc.Endpoint(
+        port=port, token=token, pid=pid or os.getpid(),
+        start_time=start_time or _own_start_time()))
+
+
 def _leave_stale_endpoint(path: Path) -> None:
     """What a killed server leaves behind: an owned endpoint nobody listens on."""
     ipc.ensure_private_directory(path.parent)
     if IS_WINDOWS:
-        ipc.write_endpoint(path, ipc.Endpoint(
-            port=_closed_port(), token=os.urandom(32),
-            pid=os.getpid(), start_time=_own_start_time()))
+        _record(path, _closed_port(), os.urandom(32))
         return
     old_umask = os.umask(0o177)
     try:
@@ -1208,6 +1312,330 @@ def _leave_stale_endpoint(path: Path) -> None:
         os.umask(old_umask)
 
 
+async def _listen(behaviour):
+    server = await asyncio.start_server(behaviour, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _silent(reader, writer):
+    """Accept and never answer: a hung or impostor listener."""
+    await reader.read()
+    writer.close()
+
+
+async def _random_reply(reader, writer):
+    """Answer the nonce with garbage: another process reused the port."""
+    await reader.readexactly(ipc.NONCE_BYTES)
+    writer.write(os.urandom(ipc.NONCE_BYTES + ipc.MAC_BYTES))
+    await writer.drain()
+    await reader.read()
+    writer.close()
+
+
+async def _stop(listener) -> None:
+    listener.close()
+    await listener.wait_closed()
+
+
+windows_reclaim = pytest.mark.windows_only(
+    reason="endpoint records and their reclaim rules exist only on Windows")
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_a_live_server(endpoint_path):
+    token = os.urandom(32)
+
+    async def genuine(reader, writer):
+        await ipc._server_handshake(reader, writer, token)
+        await reader.read()
+        writer.close()
+
+    listener, port = await _listen(genuine)
+    try:
+        _record(endpoint_path, port, token)
+        with pytest.raises(ipc.AlreadyRunningError, match="already running"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert ipc.read_endpoint(endpoint_path).port == port
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_a_record_whose_port_is_closed(endpoint_path):
+    # The owner (this process) is alive; nothing listens: Windows refuses after ~2 s.
+    _leave_stale_endpoint(endpoint_path)
+    await ipc._reclaim_windows(endpoint_path)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_of_a_dead_owner_does_not_wait_for_the_refusal(endpoint_path):
+    # A crashed server's record must not cost the ~2 s Windows refusal: a
+    # restarted broker has to publish within claude-remote's 3 s readiness wait.
+    _record(endpoint_path, _closed_port(), os.urandom(32), pid=_dead_pid(), start_time=1)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await ipc._reclaim_windows(endpoint_path)
+    assert loop.time() - started < 1.5
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_a_record_whose_port_was_taken_by_another_process(endpoint_path):
+    listener, port = await _listen(_random_reply)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_an_unverifiable_record_of_a_live_owner(endpoint_path, monkeypatch):
+    # A live owner whose loop is busy must never lose its endpoint to a second starter.
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    listener, port = await _listen(_silent)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        with pytest.raises(ipc.UnsafeEndpointError, match="cannot verify"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_an_unverifiable_record_of_a_dead_owner(endpoint_path, monkeypatch):
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    listener, port = await _listen(_silent)
+    try:
+        _record(endpoint_path, port, os.urandom(32), pid=_dead_pid(), start_time=1)
+        await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_ignores_a_missing_record_and_refuses_foreign_files(endpoint_path):
+    ipc.ensure_private_directory(endpoint_path.parent)
+    await ipc._reclaim_windows(endpoint_path)
+    endpoint_path.write_text("do not replace", encoding="utf-8")
+    with pytest.raises(ipc.UnsafeEndpointError, match="refusing to replace"):
+        await ipc._reclaim_windows(endpoint_path)
+    assert endpoint_path.read_text(encoding="utf-8") == "do not replace"
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_start_lock_serializes_starters_and_gives_up(endpoint_path, monkeypatch):
+    ipc.ensure_private_directory(endpoint_path.parent)
+    order = []
+
+    async def starter(name: str, hold: float) -> None:
+        async with ipc._start_lock(endpoint_path):
+            order.append(f"{name}+")
+            await asyncio.sleep(hold)
+            order.append(f"{name}-")
+
+    first = asyncio.create_task(starter("a", 0.3))
+    await asyncio.sleep(0.05)
+    await starter("b", 0)
+    await first
+    assert order == ["a+", "a-", "b+", "b-"]
+
+    monkeypatch.setattr(ipc, "_START_LOCK_TIMEOUT", 0.2)
+    holder = asyncio.create_task(starter("c", 1.0))
+    await asyncio.sleep(0.05)
+    with pytest.raises(ipc.AlreadyRunningError, match="another server is starting"):
+        await starter("d", 0)
+    await holder
+```
+
+- [ ] **Step 2: 运行，确认失败**
+
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
+Expected: 8 个新用例 FAIL，`AttributeError: module 'cc_remote.platform.ipc' has no attribute '_reclaim_windows'`
+（或 `_start_lock`）。
+
+- [ ] **Step 3: 实现**
+
+import 区 `from cc_remote.platform import IS_WINDOWS, files, perms` 改为
+`from cc_remote.platform import IS_WINDOWS, files, locks, perms`；常量区 `_SHARING_VIOLATION = 32` 下方加：
+
+```python
+# A listening server accepts a loopback connect at once, but Windows reports a
+# refused one only after ~2 s of SYN retries. A dead owner's port gets the
+# quick bound; a live owner's gets one long enough to see the refusal.
+_PROBE_QUICK_CONNECT_TIMEOUT = 0.5
+_PROBE_CONNECT_TIMEOUT = 3.0
+_START_LOCK_TIMEOUT = 10.0
+_START_LOCK_POLL = 0.02
+```
+
+文件末尾追加：
+
+```python
+# --- Windows liveness, stale endpoints and start serialization ---------------
+
+async def _close_quietly(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+
+
+def _process_start_time(pid: int) -> int | None:
+    from cc_remote.platform import win32_process
+
+    return win32_process.creation_time(pid)
+
+
+def _owner_alive(endpoint: Endpoint) -> bool:
+    return _process_start_time(endpoint.pid) == endpoint.start_time
+
+
+def _require_live(endpoint: Endpoint) -> None:
+    if not _owner_alive(endpoint):
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "endpoint owner is no longer running")
+
+
+async def _probe(endpoint: Endpoint) -> str:
+    """``live`` (proved the token), ``gone`` (stale) or ``unknown``."""
+    connection = None
+    for timeout in (_PROBE_QUICK_CONNECT_TIMEOUT, _PROBE_CONNECT_TIMEOUT):
+        try:
+            connection = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", endpoint.port), timeout)
+            break
+        except ConnectionRefusedError:
+            return "gone"
+        except (OSError, asyncio.TimeoutError):
+            # Only a live owner earns the long wait that tells a refused port
+            # from a full backlog; a dead owner's silent port is simply stale.
+            if not _owner_alive(endpoint):
+                return "gone"
+    if connection is None:
+        return "unknown"
+    reader, writer = connection
+    try:
+        await asyncio.wait_for(
+            _client_handshake(reader, writer, endpoint.token), HANDSHAKE_TIMEOUT)
+        return "live"
+    except AuthenticationError:
+        return "gone"
+    except (OSError, EOFError, asyncio.TimeoutError):
+        return "unknown"
+    finally:
+        await _close_quietly(writer)
+
+
+async def _reclaim_windows(target: Path) -> None:
+    """Remove a dead server's record; refuse a live or unverifiable one.
+
+    A completed handshake is the proof of a running server; it also covers an
+    owner whose process cannot be inspected (e.g. elevated). An inconclusive
+    probe only counts as stale once the recorded owner is provably gone.
+    """
+    try:
+        endpoint = read_endpoint(target)  # also proves the file is ours
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # unsafe, malformed, a directory, unreadable
+        raise UnsafeEndpointError(
+            "refusing to replace a non-owned or non-endpoint path") from exc
+    verdict = await _probe(endpoint)
+    if verdict == "live":
+        raise AlreadyRunningError(f"endpoint is already running at {target}")
+    if verdict == "unknown" and _owner_alive(endpoint):
+        raise UnsafeEndpointError(f"cannot verify the existing endpoint at {target}")
+    with contextlib.suppress(FileNotFoundError):
+        target.unlink()
+
+
+@contextlib.asynccontextmanager
+async def _start_lock(target: Path):
+    """Serialize reclaim-and-publish between servers starting at ``target``.
+
+    The lock file is never removed: deleting it would let a third starter lock
+    a fresh file while the second still holds the old one.
+    """
+    fd = files.open_nofollow(target.with_name(target.name + ".lock"),
+                             os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + _START_LOCK_TIMEOUT
+        while True:
+            try:
+                locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise AlreadyRunningError(
+                        f"another server is starting at {target}") from None
+                await asyncio.sleep(_START_LOCK_POLL)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+```
+
+说明（不要写进代码）：`_start_lock` 用非阻塞加锁 + 轮询而不是 `asyncio.to_thread(flock, LOCK_EX)`：
+线程里阻塞的 `LockFileEx` 无法被取消，任务被取消后它仍可能在已关闭的句柄上拿到锁。`_reclaim_windows`
+只在 `_start_lock` 内被调用（Task 5），所以"判定 → 删除"与随后的发布之间不会插进另一个启动者。
+
+- [ ] **Step 4: 运行，确认通过**
+
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
+Expected（Windows，未开开发者模式）：`46 passed, 4 skipped`（记录的进程仍在、端口关闭的用例约 2.5 s）。POSIX 上新增的
+8 个用例全部 skip。
+Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/ipc.py tests/test_platform_ipc.py`
+Expected: `All checks passed!`
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add cc_remote/platform/ipc.py tests/test_platform_ipc.py
+cat > /tmp/msg-p3a-4.txt <<'EOF'
+feat(platform): reclaim stale Windows endpoints safely
+
+- Treat only a completed handshake as a running server; reclaim refused or impostor ports
+- Refuse an inconclusive probe while the recorded owner is still alive
+- Serialize reclaim and publish between starters with an endpoint lock file
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+git commit -F /tmp/msg-p3a-4.txt
+```
+
+---
+
+### Task 5: `start_server` / `open_connection` / `connect_sync` 与 `IpcServer`
+
+**Files:**
+- Modify: `cc_remote/platform/ipc.py`
+- Modify: `tests/test_platform_ipc.py`
+
+**Interfaces:**
+- Consumes: Task 1–4 全部（Windows 后端用 Task 4 的 `_start_lock`、`_reclaim_windows`、`_require_live`、`_close_quietly`）。
+- Produces: `DEFAULT_LIMIT`、`IpcServer`、`start_server`、`open_connection`、`connect_sync`（签名见"接口总览"）。
+  POSIX 行为与原 broker 实现逐条一致：父目录私有检查 → 过期 socket 探测（拒绝/不存在 → unlink；能连上 →
+  `AlreadyRunningError`；非本人或非 socket → `UnsafeEndpointError`）→ `umask(0o177)` 绑定 → `chmod 0600` 复核 →
+  `start_unix_server(sock=...)`；客户端先查 socket 属主/类型/0600，连上后核对对端 uid。Windows 按"接口总览"的
+  发布与回收规则 1–5。
+
+- [ ] **Step 1: 写失败的测试**
+
+import 区再追加 `import dataclasses`（`import base64` 之后一行）。
+
+文件末尾追加：
+
+```python
 async def _ping(path: Path, payload: bytes = b"ping") -> bytes:
     reader, writer = await ipc.open_connection(path)
     try:
@@ -1349,10 +1777,7 @@ async def test_impostor_on_the_recorded_port_never_learns_the_token(endpoint_pat
 
     listener = await asyncio.start_server(impostor, "127.0.0.1", 0)
     token = os.urandom(32)
-    ipc.ensure_private_directory(endpoint_path.parent)
-    ipc.write_endpoint(endpoint_path, ipc.Endpoint(
-        port=listener.sockets[0].getsockname()[1], token=token,
-        pid=os.getpid(), start_time=_own_start_time()))
+    _record(endpoint_path, listener.sockets[0].getsockname()[1], token)
     try:
         with pytest.raises(ipc.AuthenticationError):
             await ipc.open_connection(endpoint_path)
@@ -1374,12 +1799,8 @@ async def test_dead_owner_is_refused_before_any_connection(endpoint_path):
         writer.close()
 
     listener = await asyncio.start_server(impostor, "127.0.0.1", 0)
-    finished = subprocess.Popen([sys.executable, "-c", "pass"])
-    finished.wait()
-    ipc.ensure_private_directory(endpoint_path.parent)
-    ipc.write_endpoint(endpoint_path, ipc.Endpoint(
-        port=listener.sockets[0].getsockname()[1], token=os.urandom(32),
-        pid=finished.pid, start_time=1))
+    _record(endpoint_path, listener.sockets[0].getsockname()[1], os.urandom(32),
+            pid=_dead_pid(), start_time=1)
     try:
         with pytest.raises(ConnectionRefusedError):
             await ipc.open_connection(endpoint_path)
@@ -1439,6 +1860,57 @@ async def test_listener_is_loopback_only_and_exclusive(endpoint_path):
                 intruder.bind(("127.0.0.1", record.port))
         finally:
             intruder.close()
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_simultaneous_starters_on_a_stale_endpoint_leave_exactly_one_server(
+        endpoint_path, monkeypatch):
+    _leave_stale_endpoint(endpoint_path)
+    real_probe = ipc._probe
+    calls = []
+
+    async def slow_second_probe(endpoint):
+        # Without the start lock the second starter would wake up after the
+        # first one published and delete that fresh record.
+        verdict = await real_probe(endpoint)
+        calls.append(verdict)
+        if len(calls) == 2:
+            await asyncio.sleep(0.5)
+        return verdict
+
+    monkeypatch.setattr(ipc, "_probe", slow_second_probe)
+    results = await asyncio.gather(
+        ipc.start_server(endpoint_path, _echo), ipc.start_server(endpoint_path, _echo),
+        return_exceptions=True)
+    servers = [item for item in results if isinstance(item, ipc.IpcServer)]
+    try:
+        assert len(servers) == 1
+        assert [type(item) for item in results if item not in servers] == [ipc.AlreadyRunningError]
+        assert calls == ["gone", "live"]
+        published = ipc.read_endpoint(endpoint_path).port
+        assert published == servers[0]._server.sockets[0].getsockname()[1]
+        assert await _ping(endpoint_path) == b"PING"
+    finally:
+        for server in servers:
+            server.close()
+            await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_close_withdraws_the_endpoint_before_the_listener_stops(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    stop_listening = server._server.close
+    seen = []
+
+    def close_listener():
+        seen.append(endpoint_path.exists())
+        stop_listening()
+
+    server._server.close = close_listener
+    server.close()
+    await server.wait_closed()
+    assert seen == [False]
 
 
 posix_endpoint = pytest.mark.posix_only(reason="AF_UNIX peer credentials are POSIX-only")
@@ -1502,8 +1974,7 @@ Expected: 新用例 FAIL，`AttributeError: module 'cc_remote.platform.ipc' has 
 
 - [ ] **Step 3: 实现**
 
-在 `ipc.py` 常量区 `HANDSHAKE_TIMEOUT` 上方加 `DEFAULT_LIMIT = 2 ** 16`，在 `_SHARING_VIOLATION` 下方加
-`_PROBE_TIMEOUT = 0.5`。文件末尾追加：
+在 `ipc.py` 常量区 `HANDSHAKE_TIMEOUT` 上方加 `DEFAULT_LIMIT = 2 ** 16`。文件末尾追加：
 
 ```python
 # --- server object ------------------------------------------------------------
@@ -1531,17 +2002,21 @@ class IpcServer:
         return self._server.is_serving()
 
     def close(self) -> None:
-        """Stop listening and remove the endpoint if it is still ours."""
+        """Withdraw the endpoint if it is still ours, then stop listening.
+
+        Withdrawing first means the recorded port is never released while the
+        record still names it and its owner is alive.
+        """
+        if not self._removed:
+            self._removed = True
+            try:
+                info = self._path.lstat()
+            except FileNotFoundError:
+                info = None
+            if info is not None and (info.st_dev, info.st_ino) == self._identity:
+                with contextlib.suppress(FileNotFoundError):
+                    self._path.unlink()
         self._server.close()
-        if self._removed:
-            return
-        self._removed = True
-        try:
-            info = self._path.lstat()
-        except FileNotFoundError:
-            return
-        if (info.st_dev, info.st_ino) == self._identity:
-            self._path.unlink()
 
     async def wait_closed(self) -> None:
         await self._server.wait_closed()
@@ -1589,12 +2064,6 @@ def connect_sync(path: StrPath, *, timeout: float = HANDSHAKE_TIMEOUT) -> socket
     if IS_WINDOWS:
         return _windows_connect_sync(target, timeout)
     return _posix_connect_sync(target, timeout)
-
-
-async def _close_quietly(writer: asyncio.StreamWriter) -> None:
-    writer.close()
-    with contextlib.suppress(OSError):
-        await writer.wait_closed()
 
 
 # --- POSIX backend ------------------------------------------------------------
@@ -1683,74 +2152,33 @@ def _posix_connect_sync(target: Path, timeout: float) -> socket.socket:
 
 # --- Windows backend ----------------------------------------------------------
 
-def _process_start_time(pid: int) -> int | None:
-    from cc_remote.platform import win32_process
-
-    return win32_process.creation_time(pid)
-
-
-def _require_live(endpoint: Endpoint) -> None:
-    if _process_start_time(endpoint.pid) != endpoint.start_time:
-        raise ConnectionRefusedError(errno.ECONNREFUSED, "endpoint owner is no longer running")
-
-
-async def _probe(endpoint: Endpoint) -> bool:
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", endpoint.port), _PROBE_TIMEOUT)
-    except (OSError, asyncio.TimeoutError):
-        return False
-    try:
-        await asyncio.wait_for(
-            _client_handshake(reader, writer, endpoint.token), _PROBE_TIMEOUT)
-        return True
-    except (OSError, EOFError, asyncio.TimeoutError):
-        return False
-    finally:
-        await _close_quietly(writer)
-
-
-async def _reclaim_windows(target: Path) -> None:
-    try:
-        endpoint = read_endpoint(target)
-    except FileNotFoundError:
-        return
-    except OSError as exc:  # unsafe, malformed, a directory, unreadable
-        raise UnsafeEndpointError(
-            "refusing to replace a non-owned or non-endpoint path") from exc
-    # A completed handshake is stronger evidence than pid liveness: it also
-    # covers an owner whose process cannot be inspected (e.g. elevated).
-    if await _probe(endpoint):
-        raise AlreadyRunningError(f"endpoint is already running at {target}")
-    target.unlink()
-
-
 async def _windows_start_server(target: Path, handler: Handler, limit: int) -> IpcServer:
-    await _reclaim_windows(target)
-    token = secrets.token_bytes(TOKEN_BYTES)
-    guard = _Guard(handler, target, token)
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        # Without exclusive use another process could bind the same port.
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(socket.SOMAXCONN)
-        listener.setblocking(False)
-        server = await asyncio.start_server(guard, sock=listener, limit=limit)
-    except BaseException:
-        listener.close()
-        raise
-    try:
-        start_time = _process_start_time(os.getpid())
-        if start_time is None:
-            raise OSError("cannot read this process's start time")
-        identity = write_endpoint(target, Endpoint(
-            port=listener.getsockname()[1], token=token,
-            pid=os.getpid(), start_time=start_time))
-    except BaseException:
-        server.close()
-        await server.wait_closed()
-        raise
+    async with _start_lock(target):
+        await _reclaim_windows(target)
+        token = secrets.token_bytes(TOKEN_BYTES)
+        guard = _Guard(handler, target, token)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # Without exclusive use another process could bind the same port.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(socket.SOMAXCONN)
+            listener.setblocking(False)
+            server = await asyncio.start_server(guard, sock=listener, limit=limit)
+        except BaseException:
+            listener.close()
+            raise
+        try:
+            start_time = _process_start_time(os.getpid())
+            if start_time is None:
+                raise OSError("cannot read this process's start time")
+            identity = write_endpoint(target, Endpoint(
+                port=listener.getsockname()[1], token=token,
+                pid=os.getpid(), start_time=start_time))
+        except BaseException:
+            server.close()
+            await server.wait_closed()
+            raise
     return IpcServer(server, target, identity, guard)
 
 
@@ -1758,8 +2186,13 @@ async def _windows_open(target: Path, limit: int, timeout: float,
                         ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     endpoint = read_endpoint(target)
     _require_live(endpoint)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection("127.0.0.1", endpoint.port, limit=limit), timeout)
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", endpoint.port, limit=limit), timeout)
+    except (OSError, asyncio.TimeoutError) as exc:
+        # Includes the ~2 s Windows takes to refuse a closed loopback port.
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, "endpoint is not accepting connections") from exc
     try:
         await asyncio.wait_for(_client_handshake(reader, writer, endpoint.token), timeout)
     except (EOFError, asyncio.TimeoutError) as exc:
@@ -1784,7 +2217,11 @@ def _recv_exactly(sock: socket.socket, size: int) -> bytes:
 def _windows_connect_sync(target: Path, timeout: float) -> socket.socket:
     endpoint = read_endpoint(target)
     _require_live(endpoint)
-    sock = socket.create_connection(("127.0.0.1", endpoint.port), timeout=timeout)
+    try:
+        sock = socket.create_connection(("127.0.0.1", endpoint.port), timeout=timeout)
+    except OSError as exc:  # refused, or timed out while Windows retried the SYN
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, "endpoint is not accepting connections") from exc
     try:
         client_nonce = secrets.token_bytes(NONCE_BYTES)
         sock.sendall(client_nonce)
@@ -1818,7 +2255,8 @@ __all__ = [
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
-Expected（Windows，未开开发者模式）：`50 passed, 8 skipped`（skip = 6 个 `posix_only` + 2 个 `requires_symlink`）。
+Expected（Windows，未开开发者模式）：`63 passed, 8 skipped`（skip = 6 个 `posix_only` + 2 个 `requires_symlink`）。
+POSIX：Task 4 的 8 个和本任务的 8 个 `windows_only` 用例 skip，其余（含 4 个 POSIX 专有用例）通过。
 连跑 3 次都通过（握手、超时类用例不得抖动）：
 
 ```bash
@@ -1832,22 +2270,22 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/platform/ipc.py tests/test_platform_ipc.py
-cat > /tmp/msg-p3a-4.txt <<'EOF'
+cat > /tmp/msg-p3a-5.txt <<'EOF'
 feat(platform): serve and connect same-user ipc endpoints
 
 - POSIX: move the broker's stale-socket probe, 0600 bind and peer uid checks behind ipc unchanged
 - Windows: listen on an exclusive 127.0.0.1 port, publish a private endpoint record, require the HMAC handshake
-- Refuse dead or reused owners before connecting and reclaim stale endpoints on start
-- Remove the endpoint on close only while it is still ours
+- Refuse dead or reused owners before connecting; reclaim stale endpoints under the start lock
+- Withdraw the endpoint on close (only while it is still ours) before releasing the port
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3a-4.txt
+git commit -F /tmp/msg-p3a-5.txt
 ```
 
 ---
 
-### Task 5: Claude service 迁到 `ipc`
+### Task 6: Claude service 迁到 `ipc`
 
 **Files:**
 - Modify: `cc_remote/claude_service/wire.py:1-56`（import 区、删除 `same_user`、重写 `private_directory`）
@@ -2013,7 +2451,9 @@ VERSION = 1
 MAX_FRAME = 32 * 1024 * 1024
 ```
 
-删除整个 `same_user` 函数，把 `private_directory` 替换为：
+删除整个 `same_user` 函数，把 `private_directory` 替换为（这一步同时处理 P2 规划者转交的 `wire.py:55`：原来用
+`st_uid`/`st_mode & 0o077` 判定，Windows 上恒为"本人且私有"；现在 Windows 走 `perms.owned_by_current_user` +
+`perms.is_private`，任何检查异常都按"不私有"处理，即 fail-closed；POSIX 仍是原来的属主 + 权限位判定）：
 
 ```python
 def private_directory(path: Path) -> None:
@@ -2089,7 +2529,7 @@ PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_se
 ```
 
 Expected: `only P2 root causes remain`（`TimeoutError`/`CancelledError`/`IndexError` 是这些 machine 用例在
-journal 失败后的连带症状；Step 7 的全量清单里逐条核对）。
+journal 失败后的连带症状；Task 8 Step 2 的全量清单里逐条核对）。
 
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/claude_service tests/test_claude_service.py`
 Expected: `All checks passed!`
@@ -2098,7 +2538,7 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/claude_service/wire.py cc_remote/claude_service/server.py cc_remote/claude_service/client.py tests/test_claude_service.py
-cat > /tmp/msg-p3a-5.txt <<'EOF'
+cat > /tmp/msg-p3a-6.txt <<'EOF'
 refactor(claude-service): serve controllers through platform ipc
 
 - Check the service directory with ipc private-directory rules
@@ -2108,12 +2548,12 @@ refactor(claude-service): serve controllers through platform ipc
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3a-5.txt
+git commit -F /tmp/msg-p3a-6.txt
 ```
 
 ---
 
-### Task 6: Claude service 进程入口（锁、监听、信号、注册文件）
+### Task 7: Claude service 进程入口（锁、监听、信号、注册文件）
 
 **Files:**
 - Modify: `cc_remote/claude_service/__main__.py`（整文件替换）
@@ -2316,7 +2756,7 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/claude_service/__main__.py tests/test_claude_service_main.py
-cat > /tmp/msg-p3a-6.txt <<'EOF'
+cat > /tmp/msg-p3a-7.txt <<'EOF'
 feat(claude-service): run the service process on every platform
 
 - Take the single-instance lock through a no-follow descriptor
@@ -2325,18 +2765,18 @@ feat(claude-service): run the service process on every platform
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3a-6.txt
+git commit -F /tmp/msg-p3a-7.txt
 ```
 
 ---
 
-### Task 7: 基线验收、本地门禁与 PR
+### Task 8: 基线验收、本地门禁与 PR
 
 **Files:**
 - 无代码改动（若验收发现 P3 自身问题，回到对应任务修复并另起提交）。
 
 **Interfaces:**
-- Consumes: Task 1–6。
+- Consumes: Task 1–7。
 - Produces: 推送的分支 `win/3-ipc` 与 fork 内 PR（目标 `windows-compat-v2`）。
 
 - [ ] **Step 1: Windows 上逐文件跑子项目 3a 范围**
@@ -2379,7 +2819,7 @@ EOF
 Expected：`baseline P3 service entries: 194`，`fixed` 至少 135、`left` 至多 59。写计划时用等价的临时补丁实测为
 134 / 60，残留按文件：`test_claude_background_completion` 20、`test_claude_steering` 15、
 `test_claude_native_task_merge` 9、`test_manual_compaction` 4、`test_claude_native_permissions` 4、
-`test_claude_service` 3（其中 `test_real_controller_process_exit_leaves_service_and_accepted_work_alive` 由 Task 5 修复）、
+`test_claude_service` 3（其中 `test_real_controller_process_exit_leaves_service_and_accepted_work_alive` 由 Task 6 修复）、
 `test_claude_service_recovery` 3、`test_claude_service_restart` 1、`test_claude_compaction_receipts` 1。
 `left` 里每一条，在对应 `.log` 中的第一个仓库内异常都属于下列
 子项目 2 根因之一（逐条核对，写进 PR 描述）：
@@ -2388,6 +2828,16 @@ Expected：`baseline P3 service entries: 194`，`fixed` 至少 135、`left` 至�
 `CodexControlStoreError: Codex control store is not a private bounded file`（`wrapper/codex_controls.py`）、
 `module 'os' has no attribute 'O_NOFOLLOW'`（`config.py:_claude_service_socket`）。
 出现其它根因 = P3 问题，回到对应任务修复。
+
+验收口径（写进 PR 描述）：
+
+| 时间点 | 194 条 P3 service 基线条目的预期 |
+|---|---|
+| 只合入 P3a（本 PR） | 至少 135 条通过；其余至多 59 条，首个仓库内异常全部属于上面 4 个 P2 根因 |
+| P2 的上述根因修复也合入 `windows-compat-v2` 之后 | 194 条全部通过（在合并后的 `windows-compat-v2` 上重跑 Step 1–2，`left` 必须为 0；剩下的任何一条都按 P3 回归处理） |
+
+POSIX 不变性另由本 PR 的 Linux CI 证明：`tests/test_claude_service*.py`、`tests/test_claude_broker*.py`（3a 不改 broker，
+仍走原代码）全部按原断言通过。
 
 - [ ] **Step 3: 本地门禁（CLAUDE.md "Commit and PR gate"）**
 
@@ -2413,11 +2863,11 @@ cat > /tmp/pr-p3a.md <<'EOF'
 - Move `claude_service` (directory checks, listener, client, journal permissions, lock, shutdown signals) onto platform APIs
 
 ## Validation
-- Windows: per-file pytest for the files listed in plan Task 7 (results and remaining P2-owned root causes below)
+- Windows: per-file pytest for the files listed in plan Task 8 (results and remaining P2-owned root causes below)
 - Linux: CI
 
 ## Remaining baseline entries (owned by P2)
-<paste Task 7 Step 2 LEFT list grouped by root cause>
+<paste Task 8 Step 2 LEFT list grouped by root cause>
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
@@ -2433,26 +2883,73 @@ Expected：PR 创建成功并输出 URL；之后等待 Linux CI 全绿（`gh pr 
 
 | 需要谁 | 什么 | 原因 |
 |---|---|---|
-| P2（阶段 A，已定签名） | `files.is_reparse_point`、`files.open_nofollow`、`requires_symlink` 标记 | Task 1、2、6 直接调用 |
+| P2（阶段 A，已定签名） | `files.is_reparse_point`、`files.open_nofollow`、`requires_symlink` 标记 | Task 1、2、4、7 直接调用 |
 | P2 | `cc_remote/config.py:_claude_service_socket` 改用 `files.open_nofollow` + `perms.is_private_fd`/`owned_by_current_user` | 基线 `test_claude_service.py::test_private_socket_registration_and_explicit_override`（root_cause `posix_open_flags`）归 P3 但代码在 P2 的 `config.py` |
-| P2 | `machine.py` 的 Claude profile 迁移、`wrapper/rollback_commands.py` 目录 fsync、`wrapper/codex_controls.py` 私有判定 | 约 60 条归 P3 的 service 用例经 `machine.py` 驱动，在这些 P2 根因修好前仍失败（Task 7 Step 2 逐条列出） |
+| P2 | `machine.py` 的 Claude profile 迁移、`wrapper/rollback_commands.py` 目录 fsync、`wrapper/codex_controls.py` 私有判定 | 约 60 条归 P3 的 service 用例经 `machine.py` 驱动，在这些 P2 根因修好前仍失败（Task 8 Step 2 逐条列出） |
 | P4 | `session_messages`（wrapper 与 CLI 两侧）与 TUI 客户端改用 `ipc.start_server` / `ipc.open_connection` / `ipc.connect_sync` | 规范 §4 范围内，但文件归 P4；签名见本计划"接口总览" |
 | P5 | `deploy/install_claude_service.py` 继续用 `wire.private_directory`（签名不变）；Windows 计划任务以 `pythonw -m cc_remote.claude_service --state-dir …` 启动 | `serve()` 已可在无控制台进程里运行（`install_shutdown_handler` 会退化为仅记录警告） |
 
-## 裁定记录（本计划作出的决定）
+## 裁定记录（本计划作出的决定；1、2、3、5 已由 controller 接受）
 
 1. **endpoint 发布用"不覆盖"的原子重命名**（`os.rename` → `MoveFileExW` 不带 `REPLACE_EXISTING`），而不是
    `files.replace`：这与 POSIX `bind()` 在路径已存在时 `EADDRINUSE` 的语义一致，两个同时启动的服务端里
    后到者失败退出，不会出现"被覆盖的旧服务端仍在运行但没人能连上"。同样是原子写；共享冲突（错误码 32）按
-   `files.replace` 的退避节奏有限重试。
+   `files.replace` 的退避节奏有限重试。过期记录在同一把启动锁里、发布之前删除（Task 4 规则 1–2）；两个启动者
+   同时回收同一过期记录的竞态由 Task 5 的 `test_simultaneous_starters_on_a_stale_endpoint_leave_exactly_one_server`
+   覆盖。
 2. **服务端回收旧 endpoint 时以"握手是否成功"判定在运行**（而不是先看 pid）：握手成功比 pid 存活更强，也覆盖
-   以管理员权限运行、无法 `OpenProcess` 的同用户服务端。客户端连接前仍严格按 `pid + start_time` 判定过期（§4），
-   防止旧端口被复用后的中继。
+   以管理员权限运行、无法 `OpenProcess` 的同用户服务端。连接被拒、对端证明不了 token → 过期；结论不确定（超时、
+   中断）时只有在记录的进程已不在时才按过期处理，否则报 `cannot verify`（对应 POSIX 探测里"其它 `OSError`"）。
+   客户端连接前仍严格按 `pid + start_time` 判定过期（§4），防止旧端口被复用后的中继。
 3. **profile 边界取进程令牌的真实 profile 目录**（`GetUserProfileDirectory`），不读 `USERPROFILE`/`HOME`：
    测试和用户都可能改这些环境变量。
 4. **POSIX 客户端统一做 broker 原有的检查**（socket 属主 + 0600 + 对端 uid）：service 客户端原来不检查，
    新增检查只会拒绝"不是本用户的服务端"，不改变任何原本能成功的连接。
 5. **监听 socket 设 `SO_EXCLUSIVEADDRUSE`**：Windows 上不设时，其它进程可用 `SO_REUSEADDR` 抢占同一端口。
 6. **握手失败计数暴露为 `IpcServer.auth_failures`**，日志每 60 s 至多一条，不含任何 token 或握手字节。
-7. 测试临时目录：POSIX 继续用 `/tmp`（macOS `sockaddr_un` 长度限制），Windows 用默认 `%TEMP%`（在 profile 内）。
+7. **启动锁 `<endpoint>.lock`**（评审新增）：没有它，"读记录 → 判定过期 → 删除 → 发布"会被另一个启动者插进来，
+   删掉对方刚发布的记录，留下一个没人能连上的服务端。broker 没有 service 那样的单实例锁，`claude-remote` 的
+   自动拉起又可能并发，所以锁放在 `ipc` 里。锁文件不删除。
+8. **`IpcServer.close()` 先撤记录、再停监听**（评审新增）：否则在 `close()` 与撤记录之间，记录仍指向一个已经空出的
+   端口而记录的进程仍活着，客户端的 `pid + start_time` 检查拦不住占用该端口的进程（虽然它拿不到 token，
+   但能拿到客户端 nonce 并让连接失败）。POSIX 上次序变化只影响关机瞬间的竞态：客户端看到 `FileNotFoundError`
+   而不是 `ConnectionRefusedError`，两者在 service 与 broker 的调用方里都映射为"不可用"。
+9. 测试临时目录：POSIX 继续用 `/tmp`（macOS `sockaddr_un` 长度限制），Windows 用默认 `%TEMP%`（在 profile 内）。
    `/tmp` 的取舍集中在 `tests/ipc_helpers.SHORT_TMP`。
+
+## POSIX 不变性清单（评审核对过；PR 描述照抄）
+
+完全不变：私有目录检查（属主 + 非链接 + `& 0o077 == 0`）、过期 socket 探测（属主 + `S_ISSOCK` → 0.2 s 连接探测 →
+拒绝/不存在则 unlink，能连上则 already running，其它错误则拒绝）、`umask(0o177)` 绑定 + `chmod 0600` 复核、
+服务端在交给处理函数之前按对端 uid 守门、broker 客户端的属主/类型/0600/对端 uid 检查、`DEFAULT_LIMIT`（64 KiB，
+与 asyncio 默认值相同）、`journal` 的 `chmod 0600`（`perms.make_private` 在 POSIX 上就是它）、service 锁的
+`O_NOFOLLOW` 打开（`files.open_nofollow` 在 POSIX 上就是它）、SIGTERM/SIGINT 处理（`signals.install_shutdown_handler`）。
+
+有意的、已论证的差异（都只会让原本就不该成功的情况失败，或只改变异常类型）：
+
+| 差异 | 影响 |
+|---|---|
+| service 客户端新增 broker 同款的 socket 属主/0600/对端 uid 检查（裁定 4） | 只拒绝非本人的服务端 |
+| service 服务端的对端 uid 改由 `ipc._peer_uid` 读（macOS 从 `LOCAL_PEERCRED` 改为 `getpeereid`，broker 早就这样用） | 同一个 uid，判定不变 |
+| service 启动时旧 socket 先探测再删除（原来无条件删除） | service 锁已排除活的同目录服务端，结果相同 |
+| `open_connection`/`connect_sync` 的连接有 `timeout`（默认 2 s；原 service 客户端没有） | 本地 Unix socket 连接立即完成或立即失败；只有 backlog 满 2 s 以上才会变成 `TimeoutError`（`OSError`，调用方按不可用处理） |
+| `IpcServer.close()` 先撤 socket 路径再停监听（裁定 8） | 关机瞬间的客户端看到 `FileNotFoundError` 而不是 `ConnectionRefusedError` |
+| `wire.private_directory` 在 `mkdir` 失败或路径是普通文件时抛 `PermissionError`（原来抛原始 `OSError`/`FileExistsError`） | 仍是 `OSError`；`deploy/install_claude_service.py` 不区分 |
+
+## spec 修订（供 controller 回写设计文档 §4）
+
+本计划相对 §4 原文的偏差，均已由 controller 接受或在评审中补充，建议回写：
+
+1. §4"endpoint 文件先写到临时文件，再原子替换到目标路径" → 改为"先写私有临时文件，再用**不覆盖**的原子重命名发布；
+   目标已存在即视为已在运行（同 POSIX `bind()` 的 `EADDRINUSE`）"。
+2. §4"过期清理" → 补充"回收与发布在 `<endpoint>.lock` 启动锁内串行；对旧记录做一次完整握手：成功 = 已在运行；
+   连接被拒或证明失败 = 过期；不确定（超时/中断）时，记录的进程仍在则拒绝（cannot verify），否则按过期删除"。
+   "已在运行"的服务端判据是握手成功，不是 pid 存活；客户端仍按 `pid + start_time` 判过期。
+3. §4 服务端"只绑 127.0.0.1 随机端口" → 补充"并设 `SO_EXCLUSIVEADDRUSE`"。
+4. §4"目录位于当前用户 profile 下" → 明确"profile 根目录取自进程令牌（`GetUserProfileDirectory`），不读环境变量"。
+5. §4 补充"服务端关闭时先撤 endpoint 记录（仅当仍是自己发布的），再释放端口"。
+6. §4 补充残留风险：握手后的帧不加密、不与 TCP 连接绑定；同一用户之外的进程只有在"记录仍在、记录的进程仍活、但
+   端口已被释放"时才可能中继，上面第 2、5 条消除了这个窗口；管理员仍可连接（与 §4 的 root 对照一致）。
+7. §5（由 3b 计划实现，列在这里便于一次回写）：ConPTY 子进程由 `pty.py` 在 pywinpty 启动后立即放进自己的 Job；
+   pywinpty 无法以 `CREATE_SUSPENDED` 启动，残留竞态由"子进程退出或会话关闭时释放伪控制台，结束仍挂在该控制台上的
+   进程"兜底；`claude-remote` 自动拉起的 broker 以 `DETACHED_PROCESS` 启动。

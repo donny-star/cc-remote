@@ -8,8 +8,9 @@ Claude TUI、`claude-remote` 能以原始模式附着。
 
 **Architecture:** `pty.py` 两部分：(1) 宿主侧 `PtyProcess`（`spawn`/`start`/`write`/`resize`/`wait`/`drain`/
 `kill_group`/`close`），POSIX 分支是从 `claude_broker/session.py` 原样搬来的代码，Windows 分支用 pywinpty
-`PTY(backend=ConPTY)`：后台线程阻塞读、`call_soon_threadsafe` 交回事件循环，退出后等 100 ms 让 ConPTY 渲染完
-最后一帧再 `cancel_io` 停止读线程，子进程启动后立即放进独立 Job 供 `kill_group` 整树终止，关闭伪控制台作为兜底；
+`PTY(backend=ConPTY)`：后台线程阻塞读、`call_soon_threadsafe` 交回事件循环，退出后等输出静默 100 ms（最多 1 s）
+让 ConPTY 渲染完最后一帧，再反复 `cancel_io` 直到读线程确认退出；子进程启动后立即放进独立 Job 供 `kill_group`
+整树终止，子进程一退出（或 `close()`）就在后台线程里释放伪控制台，结束漏在 Job 外、仍挂在该控制台上的后代；
 (2) 附着侧 `RawTerminal`（termios / `SetConsoleMode` VT 输入输出 + UTF-8 输出代码页，退出时恢复）、
 `terminal_size`、`watch_resize`（SIGWINCH / 250 ms 轮询）、`InputReader`（`add_reader` / 读线程 +
 `ReadConsoleW`）。broker 的 server/client 改用 3a 的 `ipc`，control store 改用 `perms`/`files`。
@@ -107,7 +108,8 @@ class PtyProcess:
     def start(self, on_output: Callable[[bytes], None]) -> None   # deliver output on the running loop
     def stop_reading(self) -> None
     def poll(self) -> int | None
-    async def wait(self) -> int        # exit status; Windows also waits for the last frame
+    async def wait(self) -> int        # exit status; Windows also waits for the last frame,
+                                       # then releases the pseudo console (close() is idempotent)
     def drain(self) -> list[bytes]     # bytes still buffered after wait() (always [] on Windows)
     async def write(self, data: bytes) -> None          # all bytes or OSError
     def resize(self, rows: int, cols: int, xpixel: int = 0, ypixel: int = 0) -> None   # OSError
@@ -124,6 +126,7 @@ def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]   
 class InputReader:
     def __init__(self, fd: int)
     async def read(self) -> bytes      # b"" at EOF
+DETACHED_CREATIONFLAGS: int   # Windows DETACHED_PROCESS, POSIX 0: auto-started servers leave the caller's console
 ```
 
 ---
@@ -160,7 +163,7 @@ def test_pywinpty_is_pinned_for_windows_wrappers_only():
     for name in ("requirements.lock", "requirements-wrapper.lock"):
         lock = (ROOT / name).read_text(encoding="utf-8")
         assert "pywinpty==3.1.0 ; sys_platform == 'win32'" in lock
-        assert "index-url" not in lock
+        assert "index-url" not in lock and "tuna" not in lock
     for name in ("requirements-relay.txt", "requirements-relay.lock"):
         assert "pywinpty" not in (ROOT / name).read_text(encoding="utf-8")
 
@@ -186,15 +189,18 @@ uv pip compile requirements.txt --universal --generate-hashes --python-version 3
 uv pip compile requirements-wrapper.txt --constraint requirements.lock --universal --generate-hashes --python-version 3.10 --output-file requirements-wrapper.lock
 uv pip compile requirements-relay.txt --constraint requirements.lock --universal --generate-hashes --python-version 3.10 --output-file requirements-relay.lock
 git diff --stat
+git diff --exit-code -- requirements-relay.txt requirements-relay.lock && echo "relay unchanged"
+grep -c -E "index-url|tuna|--find-links" requirements.lock requirements-wrapper.lock requirements-relay.lock
 uv pip install --python .venv/Scripts/python.exe "pywinpty==3.1.0"
 ```
 
 （pypi.org TLS 失败时三条 `compile` 都加 `--index-url https://pypi.tuna.tsinghua.edu.cn/simple`；
 uv 不会把它写进输出。）
 
-Expected：`git diff --stat` 只列出 4 个文件，`requirements.lock` +19 行、`requirements-wrapper.lock` +21 行，
-`requirements-relay.lock` 无变化（写计划时实测如此）。`pywinpty==3.1.0 ; sys_platform == 'win32'` 段落带 17 个
-`--hash=sha256:`。
+Expected：`git diff --stat` 只列出 4 个文件，`requirements.lock` +19 行、`requirements-wrapper.lock` +21 行
+（写计划时实测如此，评审时在副本里用同样三条命令复现过）；打印 `relay unchanged`；`grep -c` 三个文件都是 `0`（命令
+退出码 1 是 grep 的"没有匹配"，属预期）。`pywinpty==3.1.0 ; sys_platform == 'win32'` 段落带 17 个 `--hash=sha256:`。
+锁文件头里的命令行必须与上面三条逐字相同（uv 不把 `--index-url` 写进文件头）。
 
 - [ ] **Step 4: 运行，确认通过**
 
@@ -219,7 +225,7 @@ git commit -F /tmp/msg-p3b-1.txt
 
 ---
 
-### Task 2: `pty` 宿主侧 —— `PtyProcess` 与 `spawn`
+### Task 2: `pty` 宿主侧 —— `PtyProcess`、`spawn` 与 ConPTY 基本生命周期
 
 **Files:**
 - Create: `cc_remote/platform/pty.py`
@@ -230,6 +236,10 @@ git commit -F /tmp/msg-p3b-1.txt
   `win32_process.creation_time(pid) -> int | None`；`_win32err.translated()`；pywinpty。
 - Produces: `READ_CHUNK_BYTES`、`PtyProcess`、`spawn(...)`（见接口总览）。POSIX 后端的语义与原
   `PTYSession.spawn/_on_readable/_wait_for_exit/_write_bytes/_wait_writable/resize/stop/close` 逐行一致。
+  本任务的 Windows `kill_group` 只结束被托管的子进程本身；整棵进程树（per-child Job）与"子进程退出即释放伪控制台"
+  在 Task 3 补上。pywinpty 的四个坑在这里处理并各有用例：阻塞读在子进程退出后不返回（`_stop_reader`/`_dispose`
+  反复 `cancel_io` 直到读线程确认退出）、`write()` 恒返回 0（不看返回值，100 KB 用例证明完整送达）、只收发 `str`
+  （输入按 UTF-8 增量解码、输出按 UTF-8 编码，拆开的多字节字符用例）、ConPTY 吞掉焦点报告（专门用例记录该行为）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -244,11 +254,12 @@ import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from cc_remote.platform import procs, pty
+from cc_remote.platform import IS_WINDOWS, procs, pty
 from cc_remote.wrapper.process_scan import process_identity
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -336,6 +347,34 @@ def _echoed(output: bytes) -> bytes:
     return b"".join(bytes.fromhex(part.decode()) for part in re.findall(rb"OUT<([0-9a-f]*)>", output))
 
 
+BULK_CHILD = r'''
+import os
+import sys
+''' + RAW_TERMINAL + r'''
+read = raw_terminal()
+os.write(1, b"READY\n")
+total = 0
+while total < int(sys.argv[1]):
+    data = read()
+    if not data:
+        break
+    total += len(data)
+os.write(1, b"TOTAL=%d\n" % total)
+'''
+
+
+async def _conpty_threads_gone(pid: int, timeout: float = 5.0) -> bool:
+    """The reader (conpty-<pid>) and releaser (conpty-close-<pid>) threads ended."""
+    names = {f"conpty-{pid}", f"conpty-close-{pid}"}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while any(thread.name in names for thread in threading.enumerate()):
+        if loop.time() > deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 def _spawn(tmp_path: Path, *args: str) -> pty.PtyProcess:
     script = tmp_path / "child.py"
     script.write_text(CHILD, encoding="utf-8")
@@ -420,23 +459,6 @@ async def test_exit_status_and_trailing_output_are_delivered(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_kill_group_ends_the_tree_and_then_reports_it_gone(tmp_path):
-    output = _Collector()
-    terminal = _spawn(tmp_path)
-    terminal.start(output)
-    await output.until(lambda data: b"READY" in data)
-    await terminal.write(b"SPAWN")
-    data = await output.until(lambda data: re.search(rb"GRANDCHILD=(\d+)\r?\n", data))
-    grandchild = int(re.search(rb"GRANDCHILD=(\d+)", data).group(1))
-    terminal.kill_group(procs.SIGKILL)
-    await asyncio.wait_for(terminal.wait(), 10)
-    assert await _gone(grandchild)
-    with pytest.raises(ProcessLookupError):
-        terminal.kill_group(procs.SIGKILL)
-    terminal.close()
-
-
-@pytest.mark.asyncio
 async def test_close_ends_a_running_child_without_blocking(tmp_path):
     output = _Collector()
     terminal = _spawn(tmp_path)
@@ -450,6 +472,42 @@ async def test_close_ends_a_running_child_without_blocking(tmp_path):
     # released pseudo console ends it.
     await asyncio.wait_for(terminal.wait(), 10)
     assert await _gone(terminal.pid)
+    if IS_WINDOWS:
+        # The reader left its blocking read() and the console was released.
+        assert await _conpty_threads_gone(terminal.pid)
+    terminal.close()  # idempotent
+
+
+@pytest.mark.asyncio
+async def test_bulk_input_arrives_complete(tmp_path):
+    # pywinpty's write() always returns 0: the payload must still arrive whole.
+    script = tmp_path / "bulk.py"
+    script.write_text(BULK_CHILD, encoding="utf-8")
+    output = _Collector()
+    terminal = pty.spawn([sys.executable, str(script), "100000"], cwd=str(tmp_path),
+                         env=dict(os.environ))
+    try:
+        terminal.start(output)
+        await output.until(lambda data: b"READY" in data)
+        await terminal.write(b"x" * 100_000)
+        await output.until(lambda data: b"TOTAL=100000" in data, timeout=30)
+    finally:
+        await _finish(terminal)
+
+
+@pytest.mark.windows_only(reason="ConPTY consumes the focus reports it requests itself")
+@pytest.mark.asyncio
+async def test_conpty_consumes_focus_reports(tmp_path):
+    output = _Collector()
+    terminal = _spawn(tmp_path)
+    try:
+        terminal.start(output)
+        await output.until(lambda data: b"READY" in data)
+        await terminal.write(b"\x1b[I\x1b[Ofocus")
+        await output.until(lambda data: _echoed(data).endswith(b"focus"))
+        assert _echoed(bytes(output.data)) == b"focus"
+    finally:
+        await _finish(terminal)
 
 
 @pytest.mark.windows_only(reason="npm .cmd shims only exist on Windows")
@@ -504,8 +562,10 @@ from cc_remote.platform import IS_WINDOWS, procs
 
 READ_CHUNK_BYTES = 64 * 1024
 _EXIT_POLL_SECONDS = 0.05
-# ConPTY renders the child's last frame asynchronously after it exits.
+# ConPTY renders the child's last frame asynchronously after it exits: wait
+# for this much output silence (bounded) before stopping the reader.
 _EXIT_SETTLE_SECONDS = 0.1
+_EXIT_SETTLE_MAX_SECONDS = 1.0
 _READER_STOP_SECONDS = 2.0
 
 if not IS_WINDOWS:
@@ -718,38 +778,6 @@ class _PosixPty(PtyProcess):
 
 # --- Windows ConPTY -----------------------------------------------------------
 
-_PROCESS_TERMINATE_AND_QUOTA = 0x0001 | 0x0100 | 0x1000  # TERMINATE|SET_QUOTA|QUERY_LIMITED
-
-
-def _windows_job(pid: int) -> Any | None:
-    """Put the running child in its own Job so ``kill_group`` reaches its tree.
-
-    pywinpty cannot start the child suspended, so a descendant spawned before
-    this assignment could escape the Job; closing the pseudo console still
-    ends every process attached to it.
-    """
-    import win32api
-    import win32job
-
-    from cc_remote.platform._win32err import translated
-
-    try:
-        with translated():
-            process = win32api.OpenProcess(_PROCESS_TERMINATE_AND_QUOTA, False, pid)
-            try:
-                job = win32job.CreateJobObject(None, "")
-                try:
-                    win32job.AssignProcessToJobObject(job, process)
-                except BaseException:
-                    job.Close()
-                    raise
-                return job
-            finally:
-                process.Close()
-    except OSError:
-        return None  # kill_group falls back to terminating the process itself
-
-
 def _terminate_process(pid: int) -> None:
     import win32api
 
@@ -768,11 +796,14 @@ def _environment_block(env: dict[str, str]) -> str:
 
 
 class _WindowsPty(PtyProcess):
-    def __init__(self, terminal: Any, job: Any | None):
+    def __init__(self, terminal: Any, job: Any | None = None):
         from cc_remote.platform import win32_process
 
         self._terminal = terminal
         self._job = job
+        self._reader: threading.Thread | None = None
+        self._closed = False
+        self._last_output = 0.0
         self.pid = int(terminal.pid)
         self.start_ticks = win32_process.creation_time(self.pid) or time.monotonic_ns()
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -800,14 +831,15 @@ class _WindowsPty(PtyProcess):
             terminal.spawn(program, cmdline=arguments, cwd=cwd, env=_environment_block(env))
         except winpty.WinptyError as exc:
             raise OSError(f"ConPTY spawn failed: {exc}") from exc
-        return cls(terminal, _windows_job(int(terminal.pid)))
+        return cls(terminal)
 
     def start(self, on_output: OutputCallback) -> None:
         self._loop = asyncio.get_running_loop()
         self._on_output = on_output
         self._reading = True
         self._reader_done = self._loop.create_future()
-        threading.Thread(target=self._pump, name=f"conpty-{self.pid}", daemon=True).start()
+        self._reader = threading.Thread(target=self._pump, name=f"conpty-{self.pid}", daemon=True)
+        self._reader.start()
 
     def _pump(self) -> None:
         try:
@@ -817,6 +849,7 @@ class _WindowsPty(PtyProcess):
                 except Exception:  # WinptyError: cancelled or closed pseudo console
                     return
                 if text:
+                    self._last_output = time.monotonic()
                     self._post(self._deliver, text.encode("utf-8", "replace"))
                 else:
                     time.sleep(0.01)
@@ -850,10 +883,19 @@ class _WindowsPty(PtyProcess):
     async def wait(self) -> int:
         while self.poll() is None:
             await asyncio.sleep(_EXIT_POLL_SECONDS)
-        await asyncio.sleep(_EXIT_SETTLE_SECONDS)
+        await self._settle()
         await self._stop_reader()
         assert self._returncode is not None
         return self._returncode
+
+    async def _settle(self) -> None:
+        exited = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if (now - max(exited, self._last_output) >= _EXIT_SETTLE_SECONDS
+                    or now - exited >= _EXIT_SETTLE_MAX_SECONDS):
+                return
+            await asyncio.sleep(0.02)
 
     async def _stop_reader(self) -> None:
         self._stop.set()
@@ -888,33 +930,24 @@ class _WindowsPty(PtyProcess):
 
     def kill_group(self, sig: int) -> None:
         del sig  # Windows has no graceful signal for a console-less tree
-        import win32job
-
-        from cc_remote.platform._win32err import translated
-
-        if self._job is None:
-            if self.poll() is not None:
-                raise ProcessLookupError(self.pid)
-            # pywinpty keeps the process handle open, so the pid is not reused.
-            _terminate_process(self.pid)
-            return
-        with translated():
-            accounting = win32job.QueryInformationJobObject(
-                self._job, win32job.JobObjectBasicAccountingInformation)
-            if int(accounting["ActiveProcesses"]) == 0:
-                raise ProcessLookupError(self.pid)
-            win32job.TerminateJobObject(self._job, 1)
+        if self.poll() is not None:
+            raise ProcessLookupError(self.pid)
+        # pywinpty keeps the process handle open, so the pid is not reused.
+        _terminate_process(self.pid)
 
     def close(self) -> None:
         self._reading = False
         self._stop.set()
+        if self._closed:
+            return
+        self._closed = True
         terminal, self._terminal = self._terminal, _ClosedTerminal()
         job, self._job = self._job, None
         # Releasing the pseudo console ends every attached process; on Windows
         # 10 that can wait for its output pipe, so never block the event loop.
         threading.Thread(
-            target=_dispose, args=(terminal, job), name=f"conpty-close-{self.pid}",
-            daemon=True).start()
+            target=_dispose, args=(terminal, job, self._reader),
+            name=f"conpty-close-{self.pid}", daemon=True).start()
 
 
 class _ClosedTerminal:
@@ -939,11 +972,22 @@ class _ClosedTerminal:
         raise OSError("pseudo console is closed")
 
 
-def _dispose(terminal: Any, job: Any | None) -> None:
-    try:
-        terminal.cancel_io()
-    except Exception:  # WinptyError: nothing in flight
-        pass
+def _dispose(terminal: Any, job: Any | None, reader: threading.Thread | None) -> None:
+    """Release a pseudo console off the event loop.
+
+    ``cancel_io`` only cancels a read already in flight, and the reader may be
+    between two reads; repeat it until the reader has left ``read()``. Only
+    then is this the last reference, so pywinpty closes the pseudo console.
+    """
+    deadline = time.monotonic() + _READER_STOP_SECONDS
+    while True:
+        try:
+            terminal.cancel_io()
+        except Exception:  # WinptyError: nothing in flight
+            pass
+        if reader is None or not reader.is_alive() or time.monotonic() >= deadline:
+            break
+        reader.join(0.05)
     del terminal  # the last reference: pywinpty closes the pseudo console
     if job is not None:
         job.Close()
@@ -952,7 +996,7 @@ def _dispose(terminal: Any, job: Any | None) -> None:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_pty.py -p no:xdist -o addopts="" -q`
-Expected（Windows）：`9 passed`。连跑 3 次都通过：
+Expected（Windows）：`10 passed`；POSIX：`7 passed, 3 skipped`。连跑 3 次都通过：
 
 ```bash
 for i in 1 2 3; do PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_pty.py -p no:xdist -o addopts="" -q | tail -1; done
@@ -969,8 +1013,8 @@ cat > /tmp/msg-p3b-2.txt <<'EOF'
 feat(platform): add portable pseudo-terminal processes
 
 - POSIX: move the broker's openpty/setsid/TIOCSCTTY lifecycle behind pty unchanged
-- Windows: host children in ConPTY with a reader thread, an exit settle window and a per-child Job
-- Never block the event loop when a pseudo console is released
+- Windows: host children in ConPTY with a reader thread and an exit settle window
+- Release a pseudo console off the event loop, cancelling the reader until it really left read()
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -979,14 +1023,191 @@ git commit -F /tmp/msg-p3b-2.txt
 
 ---
 
-### Task 3: `pty` 附着侧 —— 原始终端、尺寸、resize、输入
+### Task 3: ConPTY 进程树 —— per-child Job 与"退出即释放伪控制台"
 
 **Files:**
 - Modify: `cc_remote/platform/pty.py`
 - Modify: `tests/test_platform_pty.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `spawn`（Windows 上用 ConPTY 充当"用户的控制台"来测附着侧）。
+- Consumes: Task 2；pywin32 `win32job`、`win32api`；`_win32err.translated()`。
+- Produces: `_windows_job(pid) -> Any | None`（模块内）；Windows `kill_group` 改为 `TerminateJobObject` 整树终止，
+  树已空时抛 `ProcessLookupError`；Windows `wait()` 在子进程退出、读线程停下之后释放伪控制台（等同 `close()`，
+  `close()` 幂等）。POSIX 不变。
+
+残留竞态（必须写进 PR 描述）：pywinpty 在内部 `CreateProcess`，不能以 `CREATE_SUSPENDED` 启动，所以子进程在
+`spawn()` 返回和 `AssignProcessToJobObject` 之间（微秒级）派生的后代不在 Job 里，`kill_group` 够不到它们。兜底：
+(1) 挂在伪控制台上的进程会在伪控制台释放时结束（实测含孙进程），而 `wait()` 在被托管的子进程一退出就释放它，
+`close()` 也会释放——效果对应 POSIX 上会话首进程退出时终端挂断；(2) 在那个窗口里派生、并且又主动脱离控制台
+（`DETACHED_PROCESS`/`CREATE_NEW_CONSOLE`）的后代不在兜底范围内，这和 POSIX 上子进程自行 `setsid()` 逃出进程组
+属于同一类，记录为已知残留。实测 venv `python.exe` 启动器立即拉起的真实解释器 10/10 次都在 Job 内。用例
+`test_descendants_outside_the_job_end_with_the_pseudo_console` 关掉 Job 来模拟这个窗口，证明兜底生效。
+
+- [ ] **Step 1: 写失败的测试**
+
+`tests/test_platform_pty.py` 末尾追加：
+
+```python
+@pytest.mark.asyncio
+async def test_kill_group_ends_the_tree_and_then_reports_it_gone(tmp_path):
+    output = _Collector()
+    terminal = _spawn(tmp_path)
+    terminal.start(output)
+    await output.until(lambda data: b"READY" in data)
+    await terminal.write(b"SPAWN")
+    data = await output.until(lambda data: re.search(rb"GRANDCHILD=(\d+)\r?\n", data))
+    grandchild = int(re.search(rb"GRANDCHILD=(\d+)", data).group(1))
+    terminal.kill_group(procs.SIGKILL)
+    await asyncio.wait_for(terminal.wait(), 10)
+    assert await _gone(grandchild)
+    with pytest.raises(ProcessLookupError):
+        terminal.kill_group(procs.SIGKILL)
+    terminal.close()
+
+
+@pytest.mark.windows_only(reason="pywinpty starts the child before it can join a Job")
+@pytest.mark.asyncio
+async def test_descendants_outside_the_job_end_with_the_pseudo_console(tmp_path, monkeypatch):
+    # Simulate the residual race: a descendant that escaped the Job assignment.
+    monkeypatch.setattr(pty, "_windows_job", lambda _pid: None)
+    script = tmp_path / "child.py"
+    script.write_text(CHILD, encoding="utf-8")
+    # The base interpreter, like node.exe: a venv python.exe launcher holds its
+    # child in the launcher's own kill-on-close Job, which would mask the escape.
+    interpreter = getattr(sys, "_base_executable", sys.executable)
+    output = _Collector()
+    terminal = pty.spawn([interpreter, str(script)], cwd=str(tmp_path), env=dict(os.environ))
+    terminal.start(output)
+    await output.until(lambda data: b"READY" in data)
+    await terminal.write(b"SPAWN")
+    data = await output.until(lambda data: re.search(rb"GRANDCHILD=(\d+)\r?\n", data))
+    grandchild = int(re.search(rb"GRANDCHILD=(\d+)", data).group(1))
+    terminal.kill_group(procs.SIGKILL)  # without a Job this ends only the child
+    await asyncio.wait_for(terminal.wait(), 10)  # ...and wait() releases the console
+    assert await _gone(grandchild)
+    terminal.close()
+```
+
+- [ ] **Step 2: 运行，确认失败**
+
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_pty.py -p no:xdist -o addopts="" -q -k "kill_group or outside_the_job"`
+Expected（Windows）：2 FAIL——`test_kill_group_ends_the_tree...` 在 `assert await _gone(grandchild)` 失败（只结束了子进程）；
+另一个在 `monkeypatch.setattr` 处 `AttributeError: ... has no attribute '_windows_job'`。POSIX：`kill_group` 用例通过、
+另一个 skip。
+
+- [ ] **Step 3: 实现**
+
+在 `_terminate_process` 之前加：
+
+```python
+_PROCESS_TERMINATE_AND_QUOTA = 0x0001 | 0x0100 | 0x1000  # TERMINATE|SET_QUOTA|QUERY_LIMITED
+
+
+def _windows_job(pid: int) -> Any | None:
+    """Put the running child in its own Job so ``kill_group`` reaches its tree.
+
+    pywinpty cannot start the child suspended, so a descendant spawned before
+    this assignment can escape the Job. Releasing the pseudo console (on exit
+    in ``wait()``, or in ``close()``) still ends every process attached to it.
+    """
+    import win32api
+    import win32job
+
+    from cc_remote.platform._win32err import translated
+
+    try:
+        with translated():
+            process = win32api.OpenProcess(_PROCESS_TERMINATE_AND_QUOTA, False, pid)
+            try:
+                job = win32job.CreateJobObject(None, "")
+                try:
+                    win32job.AssignProcessToJobObject(job, process)
+                except BaseException:
+                    job.Close()
+                    raise
+                return job
+            finally:
+                process.Close()
+    except OSError:
+        return None  # kill_group falls back to terminating the process itself
+```
+
+`_WindowsPty.spawn` 的 `return cls(terminal)` 改为 `return cls(terminal, _windows_job(int(terminal.pid)))`。
+
+`_WindowsPty.wait` 改为：
+
+```python
+    async def wait(self) -> int:
+        while self.poll() is None:
+            await asyncio.sleep(_EXIT_POLL_SECONDS)
+        await self._settle()
+        await self._stop_reader()
+        # Like a POSIX hangup when the session leader exits: release the
+        # pseudo console so descendants that escaped the Job end with it.
+        self.close()
+        assert self._returncode is not None
+        return self._returncode
+```
+
+`_WindowsPty.kill_group` 整个替换为：
+
+```python
+    def kill_group(self, sig: int) -> None:
+        del sig  # Windows has no graceful signal for a console-less tree
+        import win32job
+
+        from cc_remote.platform._win32err import translated
+
+        if self._job is None:
+            if self.poll() is not None:
+                raise ProcessLookupError(self.pid)
+            # pywinpty keeps the process handle open, so the pid is not reused.
+            _terminate_process(self.pid)
+            return
+        with translated():
+            accounting = win32job.QueryInformationJobObject(
+                self._job, win32job.JobObjectBasicAccountingInformation)
+            if int(accounting["ActiveProcesses"]) == 0:
+                raise ProcessLookupError(self.pid)
+            win32job.TerminateJobObject(self._job, 1)
+```
+
+（`close()` 已经把 `_job` 置为 `None` 并在释放线程里关闭 Job 句柄；Job 不设 `KILL_ON_JOB_CLOSE`，关句柄本身不杀进程。
+`wait()` 之后再 `kill_group` 走 `_job is None` 分支，`poll()` 已有退出码 → `ProcessLookupError`，与 POSIX 的
+`killpg` 对已回收进程组的行为一致。）
+
+- [ ] **Step 4: 运行，确认通过**
+
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_pty.py -p no:xdist -o addopts="" -q`
+Expected（Windows）：`12 passed`；POSIX：`8 passed, 4 skipped`。连跑 3 次都通过。
+Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/pty.py tests/test_platform_pty.py`
+Expected: `All checks passed!`
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add cc_remote/platform/pty.py tests/test_platform_pty.py
+cat > /tmp/msg-p3b-3.txt <<'EOF'
+feat(platform): end whole ConPTY process trees
+
+- Put each ConPTY child in its own Job right after spawn; kill_group terminates the Job
+- Release the pseudo console once the child exits so descendants that escaped the Job end too
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+git commit -F /tmp/msg-p3b-3.txt
+```
+
+---
+
+### Task 4: `pty` 附着侧 —— 原始终端、尺寸、resize、输入
+
+**Files:**
+- Modify: `cc_remote/platform/pty.py`
+- Modify: `tests/test_platform_pty.py`
+
+**Interfaces:**
+- Consumes: Task 2–3 的 `spawn`（Windows 上用 ConPTY 充当"用户的控制台"来测附着侧）。
 - Produces: `RawTerminal`、`terminal_size`、`watch_resize`、`InputReader`（签名见接口总览）。POSIX 语义与原
   `cli._interactive_attach`（`tty.setraw` + `TCSAFLUSH` 恢复）、`cli._terminal_size`、SIGWINCH、`cli._read_fd` 一致。
 
@@ -1089,6 +1310,13 @@ def test_terminal_size_honours_columns_and_lines(monkeypatch):
     monkeypatch.setenv("COLUMNS", "91")
     monkeypatch.setenv("LINES", "33")
     assert pty.terminal_size(0) == (33, 91, 0, 0)
+
+
+def test_detached_servers_leave_the_launching_console():
+    import subprocess
+
+    expected = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+    assert pty.DETACHED_CREATIONFLAGS == expected
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -1099,7 +1327,8 @@ Expected: 新用例 FAIL，`AttributeError: module 'cc_remote.platform.pty' has 
 
 - [ ] **Step 3: 实现**
 
-`pty.py` 的 import 区改为（新增 `stat`；Windows 追加 `ctypes`/`msvcrt`，POSIX 追加 `tty`）：
+`pty.py` 的 import 区与常量区改为（新增 `stat`、`_RESIZE_POLL_SECONDS`、`DETACHED_CREATIONFLAGS`；Windows 追加
+`ctypes`/`msvcrt`，POSIX 追加 `tty`；Task 2 的常量原样保留）：
 
 ```python
 from __future__ import annotations
@@ -1121,10 +1350,15 @@ from cc_remote.platform import IS_WINDOWS, procs
 
 READ_CHUNK_BYTES = 64 * 1024
 _EXIT_POLL_SECONDS = 0.05
-# ConPTY renders the child's last frame asynchronously after it exits.
+# ConPTY renders the child's last frame asynchronously after it exits: wait
+# for this much output silence (bounded) before stopping the reader.
 _EXIT_SETTLE_SECONDS = 0.1
+_EXIT_SETTLE_MAX_SECONDS = 1.0
 _READER_STOP_SECONDS = 2.0
 _RESIZE_POLL_SECONDS = 0.25
+# An auto-started server must not die with the console that launched it.
+# POSIX needs nothing here: start_new_session already leaves the terminal.
+DETACHED_CREATIONFLAGS = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
 
 if IS_WINDOWS:
     import ctypes
@@ -1339,15 +1573,15 @@ class InputReader:
 
 
 __all__ = [
-    "InputReader", "PtyProcess", "READ_CHUNK_BYTES", "RawTerminal", "spawn",
-    "terminal_size", "watch_resize",
+    "DETACHED_CREATIONFLAGS", "InputReader", "PtyProcess", "READ_CHUNK_BYTES", "RawTerminal",
+    "spawn", "terminal_size", "watch_resize",
 ]
 ```
 
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_platform_pty.py -p no:xdist -o addopts="" -q`
-Expected（Windows）：`12 passed, 1 skipped`。连跑 3 次都通过。
+Expected（Windows）：`16 passed, 1 skipped`；POSIX：`12 passed, 5 skipped`。连跑 3 次都通过。
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/platform/pty.py tests/test_platform_pty.py`
 Expected: `All checks passed!`
 
@@ -1355,20 +1589,21 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/platform/pty.py tests/test_platform_pty.py
-cat > /tmp/msg-p3b-3.txt <<'EOF'
+cat > /tmp/msg-p3b-4.txt <<'EOF'
 feat(platform): add raw terminal attachment helpers
 
 - RawTerminal: termios raw mode on POSIX; VT console modes and UTF-8 output on Windows, restored on exit
 - terminal_size, watch_resize (SIGWINCH or a 250 ms poll) and a thread-backed Windows InputReader
+- DETACHED_CREATIONFLAGS for servers that must outlive the launching console
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3b-3.txt
+git commit -F /tmp/msg-p3b-4.txt
 ```
 
 ---
 
-### Task 4: broker 会话迁到 `pty`；control store 改用平台权限
+### Task 5: broker 会话迁到 `pty`；control store 改用平台权限
 
 **Files:**
 - Modify: `cc_remote/claude_broker/session.py`（import 区 1–31、常量 36、删除 365–385、`PTYSession` 387–530、
@@ -1548,6 +1783,14 @@ async def test_session_manager_hosts_the_tui_in_a_portable_pty(tmp_path: Path, f
         assert session.returncode is not None
     finally:
         await manager.close()
+
+
+@pytest.mark.windows_only(reason="the explicit claude-remote launcher is a .cmd file on Windows (P5)")
+def test_resolve_executable_refuses_the_claude_remote_launcher(tmp_path: Path):
+    launcher = tmp_path / "claude-remote.cmd"
+    launcher.write_text("@echo off\r\n", encoding="utf-8")
+    with pytest.raises(broker_session_module.SessionError, match="refusing to launch claude-remote"):
+        broker_session_module.resolve_executable(str(launcher))
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -1705,6 +1948,22 @@ from .control_store import ControlStore, ControlStoreError
 
 替换为 `self.terminal.close()`。
 
+`resolve_executable` 里防自递归的判断（`if os.path.basename(candidate) == "claude-remote":`）改为：
+
+```python
+    # The public wrapper must never recurse into itself.  A real official binary
+    # may be a native executable or a script named `claude`; only our distinct
+    # wrapper name is forbidden here (Windows launchers carry an extension).
+    name = os.path.basename(candidate)
+    stem, extension = os.path.splitext(name)
+    if name == "claude-remote" or (
+            stem.lower() == "claude-remote" and extension.lower() in {".bat", ".cmd", ".exe"}):
+```
+
+（原有的三行注释被这四行替换，`raise SessionError(...)` 不变。POSIX 上 `claude-remote` 的判定不变；新增拒绝的
+`claude-remote.cmd/.bat/.exe` 在 POSIX 上本来就不可能是官方 Claude。P5 会把 `claude-remote.cmd` 放进 `bin\`，
+用户若把它配成 Claude 可执行文件，broker 会无限自我拉起。）
+
 - [ ] **Step 4: 改 `control_store.py`**
 
 import 区：
@@ -1760,8 +2019,8 @@ from cc_remote.platform import files, perms
 
 - [ ] **Step 5: 运行，确认通过**
 
-Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_broker.py -p no:xdist -o addopts="" -q -k "portable_pty or launch_controls or native_context or explicit_cli or transcript or frame_header or stale_broker"`
-Expected: 全部通过（使用 `broker`/`control_broker` fixture 的用例要等 Task 5 的 server 迁移，这里不选）。
+Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_broker.py -p no:xdist -o addopts="" -q -k "portable_pty or claude_remote_launcher or launch_controls or native_context or explicit_cli or transcript or frame_header or stale_broker"`
+Expected: 全部通过（使用 `broker`/`control_broker` fixture 的用例要等 Task 6 的 server 迁移，这里不选）。
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_broker_handle.py tests/test_claude_broker_history.py -p no:xdist -o addopts="" -q`
 Expected: 全部通过（基线里无失败）。
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/claude_broker tests/test_claude_broker.py`
@@ -1771,7 +2030,7 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/claude_broker/session.py cc_remote/claude_broker/control_store.py tests/test_claude_broker.py
-cat > /tmp/msg-p3b-4.txt <<'EOF'
+cat > /tmp/msg-p3b-5.txt <<'EOF'
 refactor(claude-broker): host Claude TUIs through platform pty
 
 - Spawn, read, write, resize, stop and close sessions through pty.PtyProcess
@@ -1780,12 +2039,12 @@ refactor(claude-broker): host Claude TUIs through platform pty
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3b-4.txt
+git commit -F /tmp/msg-p3b-5.txt
 ```
 
 ---
 
-### Task 5: broker server/client 迁到 `ipc`
+### Task 6: broker server/client 迁到 `ipc`
 
 **Files:**
 - Modify: `cc_remote/claude_broker/server.py:1-133, 136-190, 211-225, 446-463`
@@ -1804,7 +2063,7 @@ git commit -F /tmp/msg-p3b-4.txt
 
 - `short_socket_dir`：`Path(tempfile.mkdtemp(prefix="ccrb-", dir="/tmp"))` → `dir=SHORT_TMP`；
 - import 区 `from cc_remote.claude_broker.server import (BrokerConfig, BrokerSecurityError, BrokerServer, _peer_uid,)`
-  去掉 `_peer_uid`，并加 `from cc_remote.platform import ipc`（与 Task 4 加的 `IS_WINDOWS, perms` 合并为一行
+  去掉 `_peer_uid`，并加 `from cc_remote.platform import ipc`（与 Task 5 加的 `IS_WINDOWS, perms` 合并为一行
   `from cc_remote.platform import IS_WINDOWS, ipc, perms`）；
 - `test_status_list_limits_and_forbidden_claude_flags`：
   `mode = stat.S_IMODE(socket_path.stat().st_mode)\n        assert mode == 0o600` → `assert perms.is_private(socket_path)`；
@@ -1981,7 +2240,7 @@ Expected（Windows，未开开发者模式）：除下列两类外全部通过�
 (b) 仍失败且首个仓库内异常是子项目 2 根因（`Claude profile state migration is incomplete` /
 `rollback journal could not be persisted`）的经 `machine._process_command` 的用例
 （`test_machine_broker_controls_reach_native_tui_and_use_footer_confirmation[*]` 若出现）。
-`test_cli_attachment_treats_control_input_busy_as_recoverable` 此时仍可能因 `cli` 尚未迁移而失败，由 Task 6 修复。
+`test_cli_attachment_treats_control_input_busy_as_recoverable` 此时仍可能因 `cli` 尚未迁移而失败，由 Task 7 修复。
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_broker_handle.py tests/test_claude_broker_history.py tests/test_platform_ipc.py -p no:xdist -o addopts="" -q`
 Expected: 全部通过（ipc 的 skip 数与 3a 相同）。
@@ -1992,7 +2251,7 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/claude_broker/server.py cc_remote/claude_broker/client.py tests/test_claude_broker.py
-cat > /tmp/msg-p3b-5.txt <<'EOF'
+cat > /tmp/msg-p3b-6.txt <<'EOF'
 refactor(claude-broker): serve and connect through platform ipc
 
 - Prepare the private endpoint directory, reclaim stale endpoints and authenticate peers in ipc
@@ -2001,12 +2260,12 @@ refactor(claude-broker): serve and connect through platform ipc
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3b-5.txt
+git commit -F /tmp/msg-p3b-6.txt
 ```
 
 ---
 
-### Task 6: `claude-remote` CLI —— 附着、前台服务、自动拉起
+### Task 7: `claude-remote` CLI —— 附着、前台服务、自动拉起
 
 **Files:**
 - Modify: `cc_remote/claude_broker/cli.py:1-30, 132-249, 252-276, 279-337`
@@ -2109,7 +2368,7 @@ async def test_ensure_broker_starts_one_detached_private_broker(
     args, kwargs = started[0]
     assert args[1:] == ["-m", "cc_remote.claude_remote", "--socket", str(socket_path), "serve"]
     assert kwargs["stdin"] is subprocess.DEVNULL
-    assert kwargs["creationflags"] == getattr(subprocess, "DETACHED_PROCESS", 0)
+    assert kwargs["creationflags"] == broker_cli.pty.DETACHED_CREATIONFLAGS
     assert (socket_path.parent / "claude-broker.log").exists()
 ```
 
@@ -2268,7 +2527,7 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
             close_fds=True,
             # Windows: no console, so closing the launching terminal cannot end
             # the broker. POSIX gets 0, which subprocess accepts unchanged.
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+            creationflags=pty.DETACHED_CREATIONFLAGS,
         )
     finally:
         os.close(log_fd)
@@ -2279,7 +2538,7 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `PYTHONUTF8=1 timeout 240 .venv/Scripts/python.exe -m pytest tests/test_claude_broker.py -p no:xdist -o addopts="" -q`
-Expected：Task 5 Step 5 的结论成立，且所有 `test_cli_*` 通过（`test_cli_resume_normalizes...` 在未开开发者模式时 skip）。
+Expected：Task 6 Step 5 的结论成立，且所有 `test_cli_*` 通过（`test_cli_resume_normalizes...` 在未开开发者模式时 skip）。
 Run: `.venv/Scripts/python.exe -m cc_remote.claude_remote --help`
 Expected: 打印 `usage: claude-remote ...`，退出码 0（证明 Windows 上 CLI 可导入）。
 Run: `uvx --from ruff==0.15.13 ruff check cc_remote/claude_broker tests/test_claude_broker.py`
@@ -2289,7 +2548,7 @@ Expected: `All checks passed!`
 
 ```bash
 git add cc_remote/claude_broker/cli.py tests/test_claude_broker.py
-cat > /tmp/msg-p3b-6.txt <<'EOF'
+cat > /tmp/msg-p3b-7.txt <<'EOF'
 feat(claude-remote): attach and launch the broker on every platform
 
 - Attach through pty RawTerminal, terminal_size, watch_resize and InputReader
@@ -2298,18 +2557,18 @@ feat(claude-remote): attach and launch the broker on every platform
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
-git commit -F /tmp/msg-p3b-6.txt
+git commit -F /tmp/msg-p3b-7.txt
 ```
 
 ---
 
-### Task 7: 基线验收、真机冒烟、门禁与 PR
+### Task 8: 基线验收、真机冒烟、门禁与 PR
 
 **Files:**
 - 无代码改动（发现 P3 问题时回到对应任务修复）。
 
 **Interfaces:**
-- Consumes: Task 1–6。
+- Consumes: Task 1–7。
 - Produces: 分支 `win/3b-broker` 与 fork 内 PR（目标 `windows-compat-v2`）。
 
 - [ ] **Step 1: 逐文件跑并对照基线**
@@ -2345,6 +2604,14 @@ Expected：`baseline P3 broker entries: 31`。`LEFT` 只允许：
 - `test_claude_broker_machine.py` 的条目及任何经 `machine.py` 的条目，且其 `.log` 中首个仓库内异常属于子项目 2 根因
   （`Claude profile state migration is incomplete`、`rollback journal could not be persisted`）。
 其它任何 `LEFT` = P3 问题。
+
+验收口径（写进 PR 描述；基线里 31 条归 P3 的 broker 条目 = `test_claude_broker.py` 17 条 + `test_claude_broker_machine.py`
+14 条）：
+
+| 时间点 | 预期 |
+|---|---|
+| 只合入 P3（3a + 本 PR） | `test_claude_broker.py` 的 17 条：15 条通过；`test_peer_uid_and_default_socket_path` 拆分改名（新节点一过一 skip）；`test_cli_resume_normalizes_an_explicit_cwd_before_broker_request` 在没有符号链接权限时 skip（`requires_symlink`），否则通过。`test_claude_broker_machine.py` 的 14 条仍失败，首个仓库内异常全是 P2 根因（7 条 `profile_state_migration`，其余 7 条日志里先出现 `rollback journal could not be persisted` / `Claude profile state migration is incomplete`，评审时抽查过两条） |
+| P2 的这两个根因也合入 `windows-compat-v2` 之后 | 31 条全部通过（符号链接那条按环境 skip）；在合并后的分支上重跑 Step 1，`LEFT` 只允许上面两个改名/skip 的节点 |
 
 - [ ] **Step 2: 真机冒烟（Windows，需要已登录的官方 Claude Code）**
 
@@ -2386,11 +2653,11 @@ cat > /tmp/pr-p3b.md <<'EOF'
 - Pin `pywinpty==3.1.0 ; sys_platform == "win32"` for full and wrapper installs
 
 ## Validation
-- Windows per-file pytest (plan Task 7) and a manual claude-remote smoke test (notes below)
+- Windows per-file pytest (plan Task 8) and a manual claude-remote smoke test (notes below)
 - Linux: CI
 
 ## Remaining baseline entries (owned by P2)
-<paste Task 7 Step 1 LEFT list>
+<paste Task 8 Step 1 LEFT list>
 
 ## Smoke notes
 <paste Step 2 observations>
@@ -2409,7 +2676,7 @@ Expected：PR 创建成功；`gh pr checks --repo donny-star/cc-remote <number> 
 
 | 需要谁 | 什么 | 原因 |
 |---|---|---|
-| P3a | `ipc` 已合入 | Task 5、6 直接使用 |
+| P3a | `ipc` 已合入 | Task 6、7 直接使用 |
 | P2 | `machine.py` profile 迁移、`rollback_commands.py` 目录 fsync | `test_claude_broker_machine.py` 14 条基线（归 P3）都经 `machine.py`，首个异常是这两个 P2 根因 |
 | P2 / controller | 依赖文件与锁文件的修改权 | 协作约定没列出 `requirements*.txt/.lock` 的归属；本计划按用户指示加 pywinpty。若 P2 同期也改锁文件，后合入的一方需按文件头命令重新生成 |
 | P5 | 安装器把 `claude-remote.cmd` 放进 `bin\`，并保证 wrapper 的 Windows 安装带上 pywinpty（来自 `requirements-wrapper.lock`） | 规范 §6 |
@@ -2417,18 +2684,33 @@ Expected：PR 创建成功；`gh pr checks --repo donny-star/cc-remote <number> 
 
 ## 裁定记录
 
-1. **ConPTY 子进程的 Job 由 `pty.py` 自己创建**（`OpenProcess` + `AssignProcessToJobObject`，紧接 `spawn` 之后），
-   不经 `procs`：pywinpty 内部调用 `CreateProcess`，无法以 `CREATE_SUSPENDED` 启动，`procs` 也没有"收养已运行进程"的
-   公开 API（`procs.py` 归 P2）。实测 venv 启动器拉起的真实解释器 10/10 次都在 Job 内；残留竞态由"关闭伪控制台会结束
-   所有挂在该控制台上的进程"兜底。Job 分配失败时 `kill_group` 直接 `TerminateProcess`（pywinpty 持有进程句柄，pid 不会被复用）。
+1. **ConPTY 子进程的 Job 由 `pty.py` 自己创建**（`OpenProcess` + `AssignProcessToJobObject`，紧接 `spawn` 之后；
+   controller 已接受），不经 `procs`：pywinpty 内部调用 `CreateProcess`，无法以 `CREATE_SUSPENDED` 启动，`procs` 也没有
+   "收养已运行进程"的公开 API（`procs.py` 归 P2）。残留竞态与兜底见 Task 3 开头（伪控制台在子进程退出或 `close()` 时
+   释放，结束漏在 Job 外、仍挂在控制台上的后代；主动脱离控制台的后代是已知残留），用例
+   `test_descendants_outside_the_job_end_with_the_pseudo_console` 证明兜底。Job 分配失败时 `kill_group` 直接
+   `TerminateProcess`（pywinpty 持有进程句柄，pid 不会被复用）。
 2. **`start_ticks` 放进 `PtyProcess`**：POSIX 保留原 `/proc` 起始 tick / `monotonic_ns` 实现（行为不变），Windows 用
    `win32_process.creation_time`。没有改成 `process_scan` 的 start_time，以免 macOS 上的数值语义变化（规范 §5 的
    目的——防 pid 复用——同样满足）。
-3. **Windows 读取用"阻塞读线程 + 退出后 100 ms 再 `cancel_io`"**，不用 10 ms 轮询：32 个会话时轮询每秒 3200 次唤醒；
-   `cancel_io` 只取消在途读，因此循环调用直到读线程确认退出（最多 2 s）。
-4. **写入按 UTF-8 增量解码后再交给 pywinpty**（它只收 `str`）：被拆开的多字节字符等齐后再写；非法字节替换为 U+FFFD。
+3. **Windows 读取用"阻塞读线程 + 退出后等输出静默再 `cancel_io`"**，不用 10 ms 轮询：32 个会话时轮询每秒 3200 次唤醒。
+   静默窗口 100 ms、上限 1 s（评审改：原来是固定 100 ms，ConPTY 渲染慢时会丢最后一帧）。`cancel_io` 只取消在途读，
+   所以 `_stop_reader` 和释放线程 `_dispose` 都循环调用，直到读线程确认退出（最多 2 s）——评审发现原 `_dispose` 只调
+   一次，读线程恰好在两次读之间时会永远卡在下一次读里，伪控制台和子进程都不会被释放。
+4. **写入按 UTF-8 增量解码后再交给 pywinpty**（它只收 `str`，且 `write()` 恒返回 0，不看返回值）：被拆开的多字节字符
+   等齐后再写；非法字节替换为 U+FFFD。100 KB 用例证明完整送达。
 5. **终端尺寸在 Windows 上用 `shutil.get_terminal_size()`**（规范 §5 原文）：控制台输入句柄没有几何信息。
-6. **broker 自动拉起时加 `DETACHED_PROCESS`**（POSIX 上为 0）：否则关闭发起 `claude-remote` 的终端窗口会连带结束 broker，
-   与 POSIX `start_new_session` 语义不符。
+6. **broker 自动拉起时加 `DETACHED_PROCESS`**（controller 已接受）：否则关闭发起 `claude-remote` 的终端窗口会连带结束
+   broker，与 POSIX `start_new_session` 语义不符。评审改为由 `pty.DETACHED_CREATIONFLAGS` 提供（POSIX 为 0），
+   不在 `cli.py` 里写 `getattr(subprocess, "DETACHED_PROCESS", 0)` 这种隐式平台分支。评审实测 `DETACHED_PROCESS`
+   进程里能正常创建 ConPTY。
 7. **测试里的假 Claude 改为转义回显**（`OUT<` + `unicode_escape` + `>`），并用 `_echoed` 拼接：ConPTY 会把一次写入拆成
-   多次读，也会吞掉它自己请求的焦点报告（`ESC[O`/`ESC[I`），焦点用例改为在报告后附带普通字节来证明帧被串行处理。
+   多次读，也会吞掉它自己请求的焦点报告（`ESC[O`/`ESC[I`，评审复测属实，`test_conpty_consumes_focus_reports` 记录该
+   行为），焦点用例改为在报告后附带普通字节来证明帧被串行处理。已知影响：Windows 上被托管的 Claude TUI 收不到焦点事件。
+   ConPTY 启动时输出的 `ESC[1t ESC[c ESC[?1004h ESC[?9001h` 会进入 broker 历史并重放给附着端，冒烟时重点看
+   Windows Terminal 与 Web 端是否因此回送多余输入（规范 §9 风险项），结果写进 PR 描述。
+8. **Windows 释放伪控制台的时机提前到子进程退出时**（评审新增，`wait()` 内）：已退出会话会保留到被淘汰，原来要等那时才
+   释放，期间 conhost 与漏网后代一直存活。之后的 `write`/`resize` 抛 `OSError`，`PTYSession` 原本就对已退出会话把它们
+   视为 `pty_closed` 或忽略。
+9. **`resolve_executable` 也拒绝 `claude-remote.cmd/.bat/.exe`**（评审新增，Task 5）：P5 的启动器带扩展名，原来只比对
+   裸名 `claude-remote`。
