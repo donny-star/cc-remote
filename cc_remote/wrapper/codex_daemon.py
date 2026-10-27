@@ -13,7 +13,10 @@ import hashlib
 import json
 import os
 import re
-import resource
+try:
+    import resource
+except ImportError:  # Windows has no RLIMIT_NOFILE; daemons are not rlimit-raised there
+    resource = None  # type: ignore[assignment]
 import signal
 import shutil
 import stat
@@ -25,6 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
@@ -201,9 +205,9 @@ def _prepare_profile_standalone(
     if (
         source_binary != binary
         or not stat.S_ISDIR(source_stat.st_mode)
-        or source_stat.st_uid != os.getuid()
+        or source_stat.st_uid != current_uid()
         or not stat.S_ISDIR(home_stat.st_mode)
-        or home_stat.st_uid != os.getuid()
+        or home_stat.st_uid != current_uid()
     ):
         return None
 
@@ -228,9 +232,9 @@ def _prepare_profile_standalone(
             existing_release = existing.parent.parent
             safely_replaceable = bool(
                 stat.S_ISLNK(destination_stat.st_mode)
-                and destination_stat.st_uid == os.getuid()
+                and destination_stat.st_uid == current_uid()
                 and stat.S_ISREG(existing_stat.st_mode)
-                and existing_stat.st_uid == os.getuid()
+                and existing_stat.st_uid == current_uid()
                 and os.access(existing, os.X_OK)
                 and existing.parent.name == "bin"
                 and existing_release.parent.name == "releases"
@@ -299,7 +303,7 @@ def _prepare_profile_standalone(
             directory_stat = directory.lstat()
             if (
                 not stat.S_ISDIR(directory_stat.st_mode)
-                or directory_stat.st_uid != os.getuid()
+                or directory_stat.st_uid != current_uid()
             ):
                 return False
         os.symlink(source_current, destination, target_is_directory=True)
@@ -344,7 +348,7 @@ def _managed_pid(path: Path) -> Optional[int]:
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != os.getuid()
+                or file_stat.st_uid != current_uid()
                 or file_stat.st_size > _PID_RECORD_MAX):
             return None
         data = os.read(descriptor, _PID_RECORD_MAX + 1)
@@ -373,7 +377,7 @@ def _managed_daemon_process_identity(
     """
     home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
     pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
-    if pid is None or process_owner_uid(pid) != os.getuid():
+    if pid is None or process_owner_uid(pid) != current_uid():
         return None
     return process_identity(pid)
 
@@ -390,7 +394,7 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
     Accept only that exact mapping, never an arbitrary or cross-account link.
     The physical listener's identity fences replacement behind an unchanged alias.
     """
-    uid = os.getuid() if owner_uid is None else owner_uid
+    uid = current_uid() if owner_uid is None else owner_uid
     address = Path(path)
     parent = address.parent
     parent_info = parent.lstat()
@@ -485,7 +489,7 @@ def _ensure_managed_daemon_nofile(
         "app-server-daemon"
     )
     pid = _managed_pid(daemon_root / "app-server.pid")
-    if pid is None or process_owner_uid(pid) != os.getuid():
+    if pid is None or process_owner_uid(pid) != current_uid():
         return False
     proc_root = _PROC_ROOT / str(pid)
     before = _linux_process_start_ticks(pid)
@@ -513,6 +517,8 @@ def _ensure_managed_daemon_nofile(
         or b"app-server" not in argv
         or (b"--remote-control" not in argv and not local_listener)
     ):
+        return False
+    if resource is None:
         return False
     try:
         soft, hard = prlimit(pid, resource.RLIMIT_NOFILE)
@@ -592,8 +598,8 @@ def _terminate_stale_darwin_daemon_updater(
         return False
     if updater_bin != os.path.realpath(codex_bin):
         return False
-    if (process_owner_uid(updater_pid) != os.getuid()
-            or process_owner_uid(app_server_pid) != os.getuid()
+    if (process_owner_uid(updater_pid) != current_uid()
+            or process_owner_uid(app_server_pid) != current_uid()
             or not (_darwin_process_state(app_server_pid) or "").startswith("Z")):
         return False
     # Close the PID-reuse window immediately before signalling both identities.

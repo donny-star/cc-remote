@@ -19,6 +19,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_daemon import socket_identity
 from cc_remote.wrapper.process_scan import (
     ProcessIdentity,
@@ -76,7 +77,7 @@ def app_paths(app: Path) -> tuple[Path, Path, Path, str]:
 def _private_socket(path: Path) -> os.stat_result:
     info = path.lstat()
     if (
-        not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
+        not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid()
         or info.st_mode & 0o077
     ):
         raise ValueError("socket is not private to this login user")
@@ -89,7 +90,7 @@ def _matching_app_pids(executable: Path) -> list[int]:
         fields = line.strip().split(None, 2)
         if (
             len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit()
-            and int(fields[1]) == os.getuid() and fields[2] == str(executable)
+            and int(fields[1]) == current_uid() and fields[2] == str(executable)
         ):
             found.append(int(fields[0]))
     return found
@@ -108,12 +109,12 @@ def _shared_bridge(profile: Path, port: int) -> ProcessIdentity | None:
             pid, uid = int(line[1:]), None
         elif line.startswith("u"):
             uid = int(line[1:])
-        elif line == f"n127.0.0.1:{port}" and uid == os.getuid() and pid is not None:
+        elif line == f"n127.0.0.1:{port}" and uid == current_uid() and pid is not None:
             pids.add(pid)
     if len(pids) != 1:
         return None
     identity = process_identity(pids.pop())
-    if identity is None or process_owner_uid(identity.pid) != os.getuid():
+    if identity is None or process_owner_uid(identity.pid) != current_uid():
         return None
     argv = process_command(identity)
     if not argv:
@@ -180,7 +181,7 @@ def _shared_app(identity, profile: Path) -> bool:
                 for peer in peers)
             and process_identity(bridge.pid) == bridge
             and process_identity(identity.pid) == identity
-            and process_owner_uid(identity.pid) == os.getuid()
+            and process_owner_uid(identity.pid) == current_uid()
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
@@ -214,7 +215,7 @@ def _pipe_from_open_logs(pid: int, bundle_id: str) -> Path | None:
         try:
             info = os.fstat(fd)
             if (
-                not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_mode & 0o022
             ):
                 continue
@@ -268,7 +269,7 @@ def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> 
             if _runtime_fingerprint(node) != runtime:
                 continue  # An updater replaced the runtime during validation.
             socket = _private_socket(pipe)
-            if process_owner_uid(pid) != os.getuid() or process_identity(pid) != identity:
+            if process_owner_uid(pid) != current_uid() or process_identity(pid) != identity:
                 continue
             matches.append({
                 "state": "ready", "pid": pid,

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import os
-import resource
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None  # type: ignore[assignment]
 import sys
 
 
@@ -10,6 +13,10 @@ _MAX_NOFILE_SOFT = 65_536
 
 
 def main(argv: list[str] | None = None) -> None:
+    if resource is None:
+        # os.exec* on Windows spawns a new PID and exits this one, which would
+        # break the caller's process tracking. Callers must not wrap on Windows.
+        raise SystemExit("rlimit_exec is POSIX-only")
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) < 2:
         raise SystemExit("usage: rlimit_exec NOFILE_SOFT PROGRAM [ARG ...]")

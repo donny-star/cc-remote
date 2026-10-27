@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic import field_validator, model_validator
 
+from cc_remote.platform.identity import current_uid
 from cc_remote.viewer import (
     SCRIPT_ORIGINS, ViewerSite, clean_path, edit_sites, load_sites,
 )
@@ -28,13 +29,13 @@ def open_home_directory(home: Path, directory: Path, identity=None) -> int:
     fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
-        if info.st_uid != os.getuid() or identity and (info.st_dev, info.st_ino) != identity:
+        if info.st_uid != current_uid() or identity and (info.st_dev, info.st_ino) != identity:
             raise PermissionError("home directory changed")
         for part in relative.parts:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
-            if os.fstat(fd).st_uid != os.getuid():
+            if os.fstat(fd).st_uid != current_uid():
                 raise PermissionError("directory belongs to another user")
         result, fd = fd, -1
         return result

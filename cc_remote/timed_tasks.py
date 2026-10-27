@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import contextmanager
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,9 @@ import time
 from uuid import UUID, uuid4
 
 from websockets.asyncio.client import unix_connect
+
+from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 
 MAX_TASKS = 32
 MAX_SENDS = 1000
@@ -37,7 +39,7 @@ class TimedTaskStore:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.exists() or self.path.is_symlink():
             info = self.path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid():
                 raise ValueError("Invalid task store")
         elif not write:
             yield None
@@ -196,7 +198,7 @@ async def deliver(task: dict, delivery_id: str, on_accepted) -> None:
     """Queue on the existing account daemon, without resuming or creating a thread."""
     socket = Path(task["home"]) / "app-server-control/app-server-control.sock"
     info = socket.lstat()
-    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid():
         raise NativeQueueError("Shared daemon unavailable")
     async with asyncio.timeout(30), unix_connect(
         str(socket), uri="ws://localhost/rpc", compression=None,
@@ -249,7 +251,7 @@ async def run_task(store: TimedTaskStore, task_id: str) -> None:
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
         except BlockingIOError:
             return
         await _run_task(store, task_id)

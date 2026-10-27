@@ -16,6 +16,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+from cc_remote.platform.identity import current_uid
 from cc_remote.viewer import clean_path
 
 
@@ -104,7 +105,7 @@ def mac_argv(pid: int) -> list[str]:
 def process(pid: int) -> tuple[list[str], Path]:
     if sys.platform == "linux":
         root = Path("/proc") / str(pid)
-        if root.stat().st_uid != os.getuid():
+        if root.stat().st_uid != current_uid():
             raise PermissionError("listener belongs to another user")
         with (root / "cmdline").open("rb") as stream:
             raw = stream.read(128 * 1024 + 1)
@@ -112,7 +113,7 @@ def process(pid: int) -> tuple[list[str], Path]:
             raise ValueError("invalid process arguments")
         return [arg.decode("utf-8") for arg in raw[:-1].split(b"\0")], Path(os.readlink(root / "cwd"))
     if sys.platform == "darwin":
-        if int(command(["/bin/ps", "-p", str(pid), "-o", "uid="]).strip()) != os.getuid():
+        if int(command(["/bin/ps", "-p", str(pid), "-o", "uid="]).strip()) != current_uid():
             raise PermissionError("listener belongs to another user")
         paths = [line[1:] for line in command([
             "/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn",

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import mimetypes
@@ -19,6 +18,9 @@ import tempfile
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 
 CHUNK_SIZE = 64 * 1024
 PULL_WINDOW = 8
@@ -155,7 +157,7 @@ def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
         return {}
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > max_bytes):
             raise ValueError("Viewer registry must be a private, bounded regular file")
         raw = source.read(max_bytes + 1)
@@ -176,10 +178,10 @@ def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 
     lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(lock_fd, "r+b") as lock:
         info = os.fstat(lock.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_mode & 0o077 or info.st_nlink != 1):
             raise ValueError("invalid Viewer registry lock")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        locks.flock(lock, locks.LOCK_EX)
         sites = load_sites(path, model=model, limit=limit, max_bytes=max_bytes)
         before = {key: site.model_dump() for key, site in sites.items()}
         yield sites
@@ -213,7 +215,7 @@ def open_resource(site: ViewerSite, raw_path: str):
     try:
         root = os.fstat(fd)
         if (root.st_dev != site.root_device or root.st_ino != site.root_inode
-                or root.st_uid != os.getuid()):
+                or root.st_uid != current_uid()):
             raise PermissionError("publication root changed")
         parts = path.lstrip("/").split("/")
         for index, part in enumerate(parts):
@@ -224,7 +226,7 @@ def open_resource(site: ViewerSite, raw_path: str):
             os.close(fd)
             fd = child
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_size > MAX_FILE_BYTES or info.st_nlink != 1):
             raise PermissionError("resource is not a bounded, privately owned regular file")
         stream = os.fdopen(fd, "rb")

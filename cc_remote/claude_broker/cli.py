@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
@@ -12,15 +11,21 @@ import stat
 import struct
 import subprocess
 import sys
-import termios
-import tty
 from typing import Any
+
+from cc_remote.platform import IS_WINDOWS
+from cc_remote.platform.identity import current_uid
 
 from .client import BrokerClient, BrokerClientError
 from .paths import default_socket_path
 from .protocol import FrameType
 from .server import BrokerConfig, BrokerSecurityError, BrokerServer
 from .session import DEFAULT_HISTORY_BYTES, DEFAULT_MAX_SESSIONS, SessionError
+
+if not IS_WINDOWS:  # PTY broker is POSIX-only until sub-project 3 ports it to ConPTY
+    import fcntl
+    import termios
+    import tty
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -289,7 +294,7 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
     parent = os.path.dirname(target)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     parent_info = os.lstat(parent)
-    if (parent_info.st_uid != os.getuid()
+    if (parent_info.st_uid != current_uid()
             or not stat.S_ISDIR(parent_info.st_mode)
             or stat.S_IMODE(parent_info.st_mode) & 0o077):
         raise BrokerSecurityError(

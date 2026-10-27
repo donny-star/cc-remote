@@ -13,6 +13,8 @@ import struct
 from typing import Any
 import uuid
 
+from cc_remote.platform.identity import current_uid
+
 from .paths import default_socket_path
 from .protocol import (
     BROKER_PROTOCOL_VERSION,
@@ -98,7 +100,7 @@ def _prepare_parent(path: str) -> Path:
         raise BrokerSecurityError(f"cannot prepare broker socket directory: {exc}") from exc
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
         raise BrokerSecurityError("broker socket parent must be a real directory")
-    if info.st_uid != os.getuid():
+    if info.st_uid != current_uid():
         raise BrokerSecurityError("broker socket directory must be owned by the current uid")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise BrokerSecurityError("broker socket directory must not be accessible by other users")
@@ -110,7 +112,7 @@ def _remove_stale_socket(path: Path) -> None:
         info = path.lstat()
     except FileNotFoundError:
         return
-    if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+    if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
         raise BrokerSecurityError("refusing to replace a non-owned or non-socket path")
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -166,7 +168,7 @@ class BrokerServer:
         try:
             os.chmod(target, 0o600)
             info = target.lstat()
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            if info.st_uid != current_uid() or stat.S_IMODE(info.st_mode) != 0o600:
                 raise BrokerSecurityError("broker socket permissions are not 0600")
             self._socket_identity = (info.st_dev, info.st_ino)
             listener.listen(socket.SOMAXCONN)
@@ -212,7 +214,7 @@ class BrokerServer:
     ) -> None:
         peer_socket = writer.get_extra_info("socket")
         try:
-            if peer_socket is None or _peer_uid(peer_socket) != os.getuid():
+            if peer_socket is None or _peer_uid(peer_socket) != current_uid():
                 writer.close()
                 await writer.wait_closed()
                 return

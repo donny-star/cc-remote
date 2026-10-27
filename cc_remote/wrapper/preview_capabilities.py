@@ -11,12 +11,16 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from cc_remote.log import logger
+from cc_remote.platform import IS_WINDOWS, locks, perms
+from cc_remote.platform.files import (
+    fchmod, fsync_directory, open_with_share_delete, pread, replace,
+)
+from cc_remote.platform.identity import current_euid
 
 log = logger("cc_remote.wrapper.preview_capabilities")
 
@@ -63,7 +67,7 @@ class PreviewCapability:
             and file_stat.st_ino == self.inode
             and getattr(file_stat, "st_uid", -1) == self.uid
             and (not require_write or (
-                self.mode == "read_write" and self.uid == os.geteuid()))
+                self.mode == "read_write" and self.uid == current_euid()))
         )
 
 
@@ -124,15 +128,15 @@ class PreviewCapabilityStore:
         try:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
-                    or getattr(info, "st_uid", -1) != os.geteuid()
+                    or getattr(info, "st_uid", -1) != current_euid()
                     or info.st_nlink != 1):
                 raise OSError("preview capability lock file is unsafe")
-            os.fchmod(descriptor, 0o600)
+            fchmod(descriptor, self._lock_path, 0o600)
             deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
             while True:
                 try:
-                    fcntl.flock(
-                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locks.flock(
+                        descriptor, locks.LOCK_EX | locks.LOCK_NB)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
@@ -142,26 +146,19 @@ class PreviewCapabilityStore:
             yield
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 
     def _fsync_parent(self) -> None:
-        descriptor = os.open(
-            self._path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_directory(self._path.parent)
 
     @staticmethod
     def _lock_descriptor(descriptor: int) -> None:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locks.flock(descriptor, locks.LOCK_EX | locks.LOCK_NB)
                 return
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -180,14 +177,15 @@ class PreviewCapabilityStore:
         if (
             not stat.S_ISREG(path_info.st_mode)
             or stat.S_ISLNK(path_info.st_mode)
-            or path_info.st_uid != os.geteuid()
-            or stat.S_IMODE(path_info.st_mode) & 0o077
+            or path_info.st_uid != current_euid()
+            or (stat.S_IMODE(path_info.st_mode) & 0o077 if not IS_WINDOWS
+                else not perms.is_private(self._invalidation_path))
             or path_info.st_size > _INVALIDATION_FILE_MAX_BYTES
             or path_info.st_dev != descriptor_info.st_dev
             or path_info.st_ino != descriptor_info.st_ino
         ):
             raise OSError("preview invalidation marker is unsafe")
-        raw = os.pread(descriptor, _INVALIDATION_FILE_MAX_BYTES + 1, 0)
+        raw = pread(descriptor, _INVALIDATION_FILE_MAX_BYTES + 1, 0)
         if len(raw) > _INVALIDATION_FILE_MAX_BYTES:
             raise OSError("preview invalidation marker is oversized")
         try:
@@ -207,7 +205,7 @@ class PreviewCapabilityStore:
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(self._invalidation_path, flags)
+            descriptor = open_with_share_delete(self._invalidation_path, flags)
         except FileNotFoundError:
             return
         try:
@@ -218,7 +216,7 @@ class PreviewCapabilityStore:
                 self._recover_invalidation_locked(descriptor)
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 
@@ -232,7 +230,7 @@ class PreviewCapabilityStore:
             temporary = self._invalidation_path.with_name(
                 f".{self._invalidation_path.name}.{os.getpid()}.{token}.tmp"
             )
-            descriptor = os.open(
+            descriptor = open_with_share_delete(
                 temporary,
                 os.O_RDWR | os.O_CREAT | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
@@ -248,7 +246,7 @@ class PreviewCapabilityStore:
                 os.fsync(descriptor)
                 # The inode is locked before the public link exists, so another
                 # process can never mistake this live intent for crash residue.
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locks.flock(descriptor, locks.LOCK_EX)
                 try:
                     os.link(temporary, self._invalidation_path)
                     linked = True
@@ -262,7 +260,7 @@ class PreviewCapabilityStore:
             finally:
                 if not returned:
                     try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        locks.flock(descriptor, locks.LOCK_UN)
                     finally:
                         os.close(descriptor)
                     try:
@@ -278,7 +276,7 @@ class PreviewCapabilityStore:
             yield descriptor, token
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 
@@ -306,7 +304,7 @@ class PreviewCapabilityStore:
                 stream.write((value + "\n").encode("ascii"))
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._epoch_path)
+            replace(temporary, self._epoch_path)
             os.chmod(self._epoch_path, 0o600)
             self._fsync_parent()
             self._epoch = value
@@ -328,7 +326,7 @@ class PreviewCapabilityStore:
         try:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
-                    or getattr(info, "st_uid", -1) != os.geteuid()
+                    or getattr(info, "st_uid", -1) != current_euid()
                     or info.st_nlink != 1
                     or info.st_size > _EPOCH_FILE_MAX_BYTES):
                 raise ValueError("preview capability epoch file is unsafe")
@@ -747,7 +745,7 @@ class PreviewCapabilityStore:
             raise PreviewCapabilityError("预览权限来源无效")
         canonical = self._canonical_path(path)
         file_stat = self._inspect_regular_file(canonical)
-        if mode == "read_write" and file_stat.st_uid != os.geteuid():
+        if mode == "read_write" and file_stat.st_uid != current_euid():
             raise PreviewCapabilityError("只允许编辑当前用户拥有的文件")
         return PreviewCapability(
             engine=engine,

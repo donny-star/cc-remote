@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 from pathlib import Path
 import stat
@@ -21,6 +20,8 @@ def verify_install_lock(root: Path, descriptor: int) -> None:
     the inherited open file description, so a child can verify it without
     deadlocking against its updater parent or releasing that parent's lock.
     """
+    import fcntl  # installs are POSIX-only; cc_remote.update imports this module
+
     if descriptor < 3:
         raise InstallLockError("invalid inherited install lock descriptor")
     opened = os.fstat(descriptor)

@@ -220,6 +220,7 @@ from cc_remote.wrapper.codex_daemon import (
 )
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
+from cc_remote.platform.identity import current_euid, current_uid
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
@@ -12836,7 +12837,7 @@ class WrapperMachine:
                 if process_identity(identity.pid) == identity:
                     remaining.add(identity)
                 continue
-            if owner_uid != os.getuid():
+            if owner_uid != current_uid():
                 log.warning(
                     "refusing to migrate Claude process owned by another uid",
                     pid=identity.pid,
@@ -38412,7 +38413,7 @@ class WrapperMachine:
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.geteuid()
+                or info.st_uid != current_euid()
                 or info.st_nlink != 1
             ):
                 raise RuntimeError("attachment target is not a private file")
@@ -38442,7 +38443,7 @@ class WrapperMachine:
                 workspace_info = os.fstat(workspace_fd)
                 if (
                     not stat.S_ISDIR(workspace_info.st_mode)
-                    or workspace_info.st_uid != os.geteuid()
+                    or workspace_info.st_uid != current_euid()
                 ):
                     raise RuntimeError(
                         "Work workspace is not a private directory")
@@ -38457,7 +38458,7 @@ class WrapperMachine:
                 uploads_info = os.fstat(uploads_fd)
                 if (
                     not stat.S_ISDIR(uploads_info.st_mode)
-                    or uploads_info.st_uid != os.geteuid()
+                    or uploads_info.st_uid != current_euid()
                 ):
                     raise RuntimeError(
                         "Work uploads path is not a private directory")
@@ -38496,7 +38497,7 @@ class WrapperMachine:
                             len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
                     if (
                         not stat.S_ISREG(marker_info.st_mode)
-                        or marker_info.st_uid != os.geteuid()
+                        or marker_info.st_uid != current_euid()
                         or marker_info.st_nlink != 1
                         or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
                     ):
@@ -38511,7 +38512,7 @@ class WrapperMachine:
                 message_info = os.fstat(message_fd)
                 if (
                     not stat.S_ISDIR(message_info.st_mode)
-                    or message_info.st_uid != os.geteuid()
+                    or message_info.st_uid != current_euid()
                 ):
                     raise RuntimeError("Work message upload path is unsafe")
                 os.fchmod(message_fd, 0o700)
@@ -38609,7 +38610,7 @@ class WrapperMachine:
                         if entry.is_symlink():
                             continue
                         info = entry.stat(follow_symlinks=False)
-                        if info.st_uid != os.getuid() or info.st_mtime >= cutoff:
+                        if info.st_uid != current_uid() or info.st_mtime >= cutoff:
                             continue
                         if turn_dir.fullmatch(entry.name) and entry.is_dir(
                                 follow_symlinks=False):

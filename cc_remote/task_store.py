@@ -11,6 +11,8 @@ import stat
 import time
 from uuid import UUID, uuid4
 
+from cc_remote.platform.identity import current_uid
+
 OUTPUT_BYTES = 64 * 1024
 MAX_ACTIVE = 8
 MAX_RECORDS = 200
@@ -65,7 +67,7 @@ def request_thread(meta):
 class TaskStore:
     def __init__(self, home: Path):
         self.home = home.expanduser().resolve(strict=True)
-        if not self.home.is_dir() or self.home.stat().st_uid != os.getuid():
+        if not self.home.is_dir() or self.home.stat().st_uid != current_uid():
             raise ValueError("Codex home must be an existing directory owned by this user")
         self.root = self.home / "cc-remote-async-tasks"
         self.path = self.root / "tasks.sqlite3"
@@ -74,11 +76,11 @@ class TaskStore:
     def db(self):
         self.root.mkdir(mode=0o700, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or info.st_mode & 0o077:
             raise ValueError("Task state directory must be private and owned by this user")
         if self.path.exists() or self.path.is_symlink():
             info = self.path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid():
                 raise ValueError("Invalid task database")
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         os.fchmod(fd, 0o600)
@@ -182,14 +184,14 @@ class TaskStore:
             root = self.root.lstat()
         except FileNotFoundError:
             return []
-        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid()
+        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != current_uid()
                 or root.st_mode & 0o077):
             raise ValueError("Invalid task state directory")
         try:
             info = self.path.lstat()
         except FileNotFoundError:
             return []
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_mode & 0o077):
             raise ValueError("Invalid task database")
         db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)

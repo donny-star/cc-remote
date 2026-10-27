@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
 import stat
 from pathlib import Path
 
+from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.process_scan import process_identity
 
 from .server import Service
@@ -21,11 +22,11 @@ async def serve(directory: Path) -> None:
     private_directory(directory)
     lock_fd = os.open(directory / "service.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locks.flock(lock_fd, locks.LOCK_EX | locks.LOCK_NB)
         path = directory / "service.sock"
         if path.exists() or path.is_symlink():
             info = path.lstat()
-            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
                 raise PermissionError("unsafe Claude service socket")
             path.unlink()
         service = Service(directory)

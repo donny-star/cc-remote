@@ -12,6 +12,8 @@ import threading
 from typing import Callable
 from uuid import uuid4
 
+from cc_remote.platform.identity import current_uid
+
 
 CODEX_APPROVAL_POLICIES = frozenset({"untrusted", "on-request", "never"})
 CODEX_WEB_SEARCH_MODES = frozenset({"cached", "live"})
@@ -466,7 +468,7 @@ class CodexControlStore:
         except FileNotFoundError:
             return {}
         if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.getuid()
+                or info.st_uid != current_uid()
                 or stat.S_IMODE(info.st_mode) & 0o077
                 or info.st_size > _MAX_FILE_BYTES):
             raise CodexControlStoreError(

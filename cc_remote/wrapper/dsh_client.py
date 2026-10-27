@@ -25,6 +25,7 @@ import httpx
 from websockets.asyncio.client import connect
 
 from cc_remote.log import logger
+from cc_remote.platform.identity import current_uid
 
 TESTED_DSH_VERSION = "0.2.1-rc.2"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -122,7 +123,7 @@ class DshConnection:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as stream:
                 info = os.fstat(stream.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                         or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 8192):
                     raise ValueError
                 data = json.loads(stream.read(8193))

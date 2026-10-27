@@ -19,7 +19,6 @@ checkpoint boundary.  Empty directories are not representable in Git trees.
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
+from cc_remote.platform import locks
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 
@@ -243,7 +243,7 @@ def cleanup_codex_checkpoint_session(
             lock_flags = os.O_RDWR | os.O_CREAT
             lock_flags |= getattr(os, "O_NOFOLLOW", 0)
             lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locks.flock(lock_fd, locks.LOCK_EX)
             tombstone = candidate.with_name(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
             )
@@ -258,7 +258,7 @@ def cleanup_codex_checkpoint_session(
             ) from exc
         finally:
             if lock_fd is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                locks.flock(lock_fd, locks.LOCK_UN)
                 os.close(lock_fd)
         if tombstone is not None:
             try:
@@ -487,10 +487,10 @@ class CodexCheckpointJournal:
         self.session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            locks.flock(fd, locks.LOCK_EX)
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            locks.flock(fd, locks.LOCK_UN)
             os.close(fd)
 
     def _load_manifest(self) -> dict[str, Any]:

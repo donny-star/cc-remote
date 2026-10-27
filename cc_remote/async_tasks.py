@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import base64
 from contextlib import suppress
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,7 @@ import sys
 import time
 
 from cc_remote import task_rpc
+from cc_remote.platform import locks
 from cc_remote.task_store import (
     DELIVERY_TRACK_SECONDS, OUTPUT_BYTES, TERMINAL, TaskStore, public_task, request_thread,
 )
@@ -42,7 +42,7 @@ def lock_worker(store):
         pass
     fd = os.open(store.root / "worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
         return None
