@@ -273,6 +273,36 @@ CLAUDE_BIN=
 先确认设备在线，再选择引擎和会话。此地址用于本机访问；手机接入请使用下方的
 公网部署，或配置受限的 LAN/Tailscale 入口。
 
+### Windows 上运行 Wrapper
+
+Windows（10/11，x64）以源码方式运行 Wrapper，Relay 仍建议部署在 Linux VPS。
+Release 安装包与一键更新只支持 macOS/Linux。依赖同样从带哈希的 `requirements.lock`
+安装；`claude-agent-sdk` 没有 Windows wheel，会从经哈希校验的源码包构建（Wrapper
+始终使用 `CLAUDE_BIN` 指向的 CLI，不依赖其内置 CLI），因此不加 `--only-binary`。
+在 PowerShell 中：
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install --require-hashes -r requirements.lock
+.venv\Scripts\python -m cc_remote.device pair https://<你的域名> <PAIR-CODE>
+.venv\Scripts\python -m cc_remote.wrapper
+```
+
+- `CLAUDE_BIN` 留空时默认 `%USERPROFILE%\.local\bin\claude.exe`（官方原生安装位置）；
+  npm 安装的 Claude Code 请填写 `claude.cmd` 的完整路径。`CC_CWD` 使用 `C:\...` 绝对路径。
+- Codex 使用每个会话私有的 `app-server --stdio` 进程；Windows 没有共享 daemon，
+  因此不会与本机 Codex CLI/App 共用同一个 app-server。
+- 本机 `claude` / `codex` 进程的接管检测基于进程快照（命令行、工作目录与
+  进程树），无需管理员权限。命令行中不含会话 id 的普通 `codex` TUI 不会被归属。
+- 文件浏览、预览、Viewer 发布与 Work 上传按路径逐级校验，拒绝符号链接、
+  目录联接（junction）与 NTFS 备用数据流。
+- 附件副本文件名会按 260 字符的 `MAX_PATH` 截断；但工作目录很深时，Claude 自身写入的
+  transcript 路径可能超过该上限，Python 默认无法读取。遇到这种情况请开启系统的
+  `LongPathsEnabled` 策略（组策略或注册表 `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`）。
+- 以下功能仅支持 macOS/Linux：`claude-remote` 终端代理（PTY broker）、
+  Office 文档预览（依赖 bubblewrap 沙箱）、Release 安装与一键更新、
+  systemd/launchd 服务安装。
+
 <a id="github-release-一键安装生产推荐"></a>
 <a id="生产部署公网-vps-中继--你机器上的-wrapper"></a>
 

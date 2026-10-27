@@ -330,6 +330,42 @@ password. Check that the device is online, then select an engine and session.
 This address is local to the computer. For phone access, use the public deployment
 below or configure a restricted LAN/Tailscale entry point.
 
+### Running the Wrapper on Windows
+
+On Windows (10/11, x64) the Wrapper runs from source; keep the Relay on a Linux
+VPS. Release bundles and one-command updates are macOS/Linux only. Install the
+same hashed `requirements.lock`: `claude-agent-sdk` has no Windows wheel and is
+built from its hash-verified source archive (the Wrapper always runs the CLI at
+`CLAUDE_BIN`, never the bundled one), so omit `--only-binary`. In PowerShell:
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install --require-hashes -r requirements.lock
+.venv\Scripts\python -m cc_remote.device pair https://<your-domain> <PAIR-CODE>
+.venv\Scripts\python -m cc_remote.wrapper
+```
+
+- An empty `CLAUDE_BIN` defaults to `%USERPROFILE%\.local\bin\claude.exe` (the
+  official native install location); for an npm install, set the full path to
+  `claude.cmd`. Use a `C:\...` absolute path for `CC_CWD`.
+- Codex uses a private `app-server --stdio` process per session. There is no
+  shared daemon on Windows, so the Wrapper does not share an app-server with the
+  local Codex CLI/App.
+- Ownership detection for local `claude` / `codex` processes uses a process
+  snapshot (command line, working directory and process tree) and needs no
+  administrator rights. A plain `codex` TUI whose command line carries no session
+  id cannot be attributed.
+- File browsing, previews, Viewer publications and Work uploads validate every
+  path component and reject symlinks, directory junctions and NTFS alternate
+  data streams.
+- Attachment copy names are truncated to fit the 260-character `MAX_PATH`, but
+  for a very deep working directory the transcript path Claude itself writes can
+  exceed it, which Python cannot read by default. Enable the system
+  `LongPathsEnabled` policy (Group Policy or
+  `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`) if that happens.
+- macOS/Linux only: the `claude-remote` terminal broker (PTY), Office document
+  previews (bubblewrap sandbox), Release install and one-command updates, and
+  systemd/launchd service installation.
 <a id="one-command-github-release-install-recommended-for-production"></a>
 <a id="production-deploy-public-vps-relay--wrapper-on-your-machine"></a>
 
