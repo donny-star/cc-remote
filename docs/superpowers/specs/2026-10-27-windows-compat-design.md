@@ -62,6 +62,55 @@ App 接入（`codex_desktop`、`desktop_remote_ui`）、多用户和 supervisor 
   管道句柄，把句柄值通过参数传给子进程。
 - 发信号前先校验 `ProcessIdentity`：拿 pid 加 start_time 比对，不一致就拒绝操作。
 
+### 3.1 实施前验证带来的修订（2026-10-27）
+
+下面几条是写计划时在本机实测后的修订，与上表冲突的，以这里为准：
+
+- **锁**：不用旧分支的 `msvcrt.locking`（锁第 0 字节）。Windows 的字节锁是强制锁，
+  会让其他句柄读不到被锁的数据。改用 `win32file.LockFileEx` 锁定偏移量
+  `0x7FFFFFFF_FFFFFFFE` 处的 1 个字节。实测：冲突时报 `ERROR_LOCK_VIOLATION`
+  （33）；锁住期间其他句柄仍能正常读数据；阻塞等待由系统原生支持，关闭句柄即
+  释放锁。只提供 `LOCK_EX`、`LOCK_UN`、`LOCK_NB`，因为上游没用到 `LOCK_SH`。
+- **二进制 fd**：Windows 上 `os.open` 默认以文本模式打开，实测 `\n` 会被改写成
+  `\r\n`，读到 `\x1a` 就截断。上游有 138 处 `os.open` 都会受影响。处理办法：
+  `cc_remote.platform` 被导入时调用 `ucrtbase._set_fmode(_O_BINARY)`（实测有效），
+  把整个进程的默认模式改成二进制，不再逐个修改调用点。
+- **UTF-8 模式**：Windows 进程一律以 `PYTHONUTF8=1` 运行，包括启动器、计划任务和
+  测试。conftest 在 Windows 上检测到不是 UTF-8 模式时会直接报错退出。
+- **Job Object**：先启动子进程再加入 Job 存在竞态。实测 venv 的 `python.exe` 会
+  立刻拉起真正的解释器，这个子进程会漏到 Job 外面。改为以 `CREATE_SUSPENDED` 启动，
+  加入 Job 后再调用 `NtResumeProcess` 恢复运行。实测这样能把整棵进程树（4 个进程）
+  全部纳入 Job，并一次终止干净。
+- **不设置 `KILL_ON_JOB_CLOSE`**：上游部分子进程本来就要比父进程活得久
+  （`start_new_session` 的语义），所以 Job 只用来终止整棵进程树。Job 句柄在进程
+  树全部退出后自动回收。
+- **Windows 上 `SIGTERM` 和 `SIGKILL` 都映射为 `TerminateJobObject`**：服务模式下
+  没有控制台，`CTRL_BREAK_EVENT` 发不到子进程。不由 `popen_group` 启动的进程，
+  退回用 `taskkill /T /F` 终止。
+- **wrapper 本身已经在某个 Job 里**（实测当前环境就是这样）：Windows 8 以后支持
+  嵌套 Job，不需要 `CREATE_BREAKAWAY_FROM_JOB`。§9 的对应风险作废。
+- **进程扫描**：底层的 Win32 原语放在 `cc_remote/platform/win32_process.py`，由
+  现有的 `cc_remote/wrapper/process_scan.py` 按平台分派调用，沿用它现有的 Darwin
+  后端模式。`ProcessIdentity.start_ticks` 在 Windows 上取进程创建时间（FILETIME，
+  单位 100ns）。命令行通过 `NtQueryInformationProcess(ProcessCommandLineInformation)`
+  读取，实测 Unicode 参数无误。
+- **进程属主**：Windows 上 `current_uid()` 返回 0，和 `os.stat().st_uid` 的占位值
+  一致。`process_owner_uid()` 在属主 SID 与当前用户相同时返回 0，不同时返回
+  `FOREIGN_UID`。
+- **私有权限判定**：所有生效的 ACCESS_ALLOWED ACE 的 SID 都必须属于
+  {当前用户、SYSTEM、Administrators、OWNER RIGHTS}，并且属主是当前用户或
+  Administrators。`%LOCALAPPDATA%`、`~/.claude` 的默认 ACL 实测都满足；`%TEMP%`
+  下 `mkdtemp` 建出的目录只带 OWNER RIGHTS，按上面的规则也判定为私有。
+- **替换文件**：实测表明，只要目标文件还有句柄开着（即使带了 FILE_SHARE_DELETE），
+  `os.replace`（MoveFileEx）就会返回拒绝访问，只有 unlink 能成功。因此
+  `files.replace` 在 Windows 上改用 `SetFileInformationByHandle(FileRenameInfoEx,
+  REPLACE_IF_EXISTS | POSIX_SEMANTICS)`。实测可以替换以 share-delete 打开着的目标，
+  旧句柄读到的仍是旧内容，与 POSIX 的 inode 语义一致。如果占用方没给 share-delete，
+  会报错误码 32，此时退避重试。文件系统不支持 POSIX 重命名时（FAT），退回
+  `os.replace`。
+- **依赖**：`pywin32==312; sys_platform == "win32"` 显式加入
+  `requirements-common.txt`。它原本是通过 mcp 间接引入的。
+
 ## 4. 本地 IPC `cc_remote/platform/ipc.py`
 
 涉及的组件：claude_service、claude_broker、session_messages（包括 wrapper 和
@@ -202,10 +251,10 @@ systemd、launchd、cgroup、launch barrier）可以用 `@pytest.mark.posix_only
 
 ## 9. 风险
 
-- Job Object 嵌套：如果 wrapper 本身已经在某个 Job 里（例如由某些终端或计划任务
-  启动），子进程可能无法加入新的 Job。处理办法：创建子进程时带
-  `CREATE_BREAKAWAY_FROM_JOB`，失败时退回到只用 `CREATE_NEW_PROCESS_GROUP` 加
-  `taskkill /T`，并写日志。
+- （已作废，见 §3.1）Job Object 嵌套问题实测不存在。
+- 计划任务以 Job 方式管理 wrapper：如果任务结束时连同子进程一起杀掉，需要长期
+  存活的子进程（timed、async tasks）会受影响。由子项目 5 实测确认，必要时为这类
+  子进程加 `CREATE_BREAKAWAY_FROM_JOB`。
 - 防病毒软件或索引服务短暂占用文件，导致 `replace` 失败：用 `files.replace` 的
   退避重试兜底。
 - `.cmd` shim 的解析依赖 npm shim 的固定格式：解析失败就退回到通过 `cmd.exe /c`
