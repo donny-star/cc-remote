@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from cc_remote.platform import IS_WINDOWS
+from cc_remote.platform.identity import FOREIGN_UID, current_sid, current_uid
 
 MAX_PROC_SCAN = 8192
 MAX_CMDLINE_BYTES = 64 * 1024
@@ -317,6 +319,17 @@ def darwin_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
 
 def process_identity(pid: int, *, proc_root: str = "/proc",
                      parent_pid: int | None = None) -> ProcessIdentity | None:
+    if IS_WINDOWS and proc_root == "/proc":
+        from cc_remote.platform import win32_process
+
+        ticks = win32_process.creation_time(pid)
+        if ticks is None:
+            return None
+        if parent_pid is not None:
+            parents = win32_process.parent_map()
+            if parents is None or parents.get(pid) != parent_pid:
+                return None
+        return ProcessIdentity(pid, ticks)
     stat = _process_stat(Path(proc_root) / str(pid))
     if stat is not None:
         if parent_pid is not None and stat[0] != parent_pid:
@@ -336,6 +349,15 @@ def process_command(
     proc_root: str = "/proc",
 ) -> tuple[bytes, ...] | None:
     """Read argv only while the exact cross-platform process identity lives."""
+    if IS_WINDOWS and proc_root == "/proc":
+        from cc_remote.platform import win32_process
+
+        if win32_process.creation_time(identity.pid) != identity.start_ticks:
+            return None
+        args = win32_process.argv(identity.pid)
+        if win32_process.creation_time(identity.pid) != identity.start_ticks:
+            return None
+        return args
     proc_dir = Path(proc_root) / str(identity.pid)
     stat = _process_stat(proc_dir)
     if stat is not None:
@@ -438,6 +460,13 @@ def process_environment_value(
 
 def process_owner_uid(pid: int, *, proc_root: str = "/proc") -> int | None:
     """Return the process owner without weakening the caller's identity check."""
+    if IS_WINDOWS and proc_root == "/proc":
+        from cc_remote.platform import win32_process
+
+        sid = win32_process.owner_sid(pid)
+        if sid is None:
+            return None
+        return current_uid() if sid == current_sid() else FOREIGN_UID
     try:
         return os.stat(str(Path(proc_root) / str(pid))).st_uid
     except OSError:
