@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import xmlrpc.client
 
 import pytest
 
-from deploy import linux_service as service
+if sys.platform != "win32":  # pwd at import time; the whole module is skipped on Windows
+    from deploy import linux_service as service
 from deploy import install_cli
 from cc_remote import update, update_relay
+
+pytestmark = pytest.mark.posix_only(reason="systemd/supervisor service management is Linux-only")
 
 
 @pytest.fixture

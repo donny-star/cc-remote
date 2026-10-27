@@ -5,7 +5,6 @@ import importlib
 import os
 import pkgutil
 import sys
-import traceback
 
 import pytest
 
@@ -43,22 +42,10 @@ def test_os_open_is_binary_after_importing_package(tmp_path) -> None:
         os.close(fd)
 
 
-# Modules owned by later sub-projects that still import POSIX-only APIs.
-_PENDING_PORTS = {
-    "cc_remote.claude_broker.cli",      # termios/tty: sub-project 3
-    "cc_remote.claude_broker.session",  # pty/termios: sub-project 3
-    # Import the broker client/handle (-> session.py): unblocked by sub-project 3.
-    "cc_remote.claude_remote",               # sub-project 3
-    "cc_remote.wrapper.claude_broker_handle",  # sub-project 3
-    "cc_remote.wrapper.machine",             # sub-project 2, after sub-project 3
-}
-
-
-def _raised_by_pending_port(exc: BaseException) -> bool:
-    return any(
-        frame.f_globals.get("__name__") in _PENDING_PORTS
-        for frame, _lineno in traceback.walk_tb(exc.__traceback__)
-    )
+# Modules owned by later sub-projects that still fail to import on this
+# platform (name -> owning sub-project in a comment). The PTY broker guards its
+# POSIX-only imports, so nothing is pending today.
+_PENDING_PORTS: set[str] = set()
 
 
 def test_every_module_imports_on_this_platform() -> None:
@@ -78,7 +65,5 @@ def test_every_module_imports_on_this_platform() -> None:
             for partial in set(sys.modules) - loaded:
                 if partial.startswith("cc_remote."):
                     del sys.modules[partial]
-            if name.startswith("cc_remote.claude_broker.") and _raised_by_pending_port(exc):
-                continue  # broker internals that import the pending PTY session
             failures[name] = repr(exc)
     assert failures == {}

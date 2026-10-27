@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 import errno
-import fcntl
 import json
 import logging
 import os
@@ -17,14 +16,18 @@ import signal
 import stat
 import struct
 import subprocess
-import termios
 import time
 from typing import Callable, Literal
 import uuid
 
 from cc_remote.claude_paths import claude_projects_dir
+from cc_remote.platform import IS_WINDOWS
 
 from .control_store import ControlStore, ControlStoreError
+
+if not IS_WINDOWS:  # PTY broker is POSIX-only until sub-project 3 ports it to ConPTY
+    import fcntl
+    import termios
 
 
 log = logging.getLogger(__name__)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
@@ -12,15 +11,20 @@ import stat
 import struct
 import subprocess
 import sys
-import termios
-import tty
 from typing import Any
+
+from cc_remote.platform import IS_WINDOWS
 
 from .client import BrokerClient, BrokerClientError
 from .paths import default_socket_path
 from .protocol import FrameType
 from .server import BrokerConfig, BrokerSecurityError, BrokerServer
 from .session import DEFAULT_HISTORY_BYTES, DEFAULT_MAX_SESSIONS, SessionError
+
+if not IS_WINDOWS:  # PTY broker is POSIX-only until sub-project 3 ports it to ConPTY
+    import fcntl
+    import termios
+    import tty
 
 
 def _parser() -> argparse.ArgumentParser:
