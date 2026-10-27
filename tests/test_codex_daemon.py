@@ -414,7 +414,7 @@ def test_standalone_generation_rejects_unsafe_or_cross_profile_socket(
         path.parent.chmod(0o770)
     elif unsafe == "owner":
         uid = os.getuid()
-        monkeypatch.setattr(daemon_module.os, "getuid", lambda: uid + 1)
+        monkeypatch.setattr(daemon_module, "current_uid", lambda: uid + 1)
     elif unsafe in {"regular_file", "symlink"}:
         renamed = path.with_name("original.sock")
         path.rename(renamed)

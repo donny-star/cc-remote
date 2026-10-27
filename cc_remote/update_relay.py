@@ -17,6 +17,7 @@ import uuid
 
 from dotenv import dotenv_values
 
+from cc_remote.platform.identity import current_euid
 from cc_remote.update import Installation, UpdateError, version_tuple
 from cc_remote.update_errors import endpoint, network_reason, ssh_reason
 from deploy.install_cli import _atomic_file
@@ -138,7 +139,7 @@ class RelayUpdate:
         args = ["/usr/bin/ssh", "-oBatchMode=yes", "-oConnectTimeout=10",
                 "-oServerAliveInterval=10", "-oServerAliveCountMax=2", "--", self.target,
                 shlex.join(command)]
-        if self.installation.manifest["os"] == "linux" and os.geteuid() == 0:
+        if self.installation.manifest["os"] == "linux" and current_euid() == 0:
             # Local activation runs as root, SSH remains the original user's
             # identity. Do not copy private keys or use root's unrelated config.
             user = self.installation.metadata["user"]

@@ -27,6 +27,7 @@ from websockets.asyncio.client import connect
 
 from cc_remote import codex_app_tools as desktop
 from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_daemon import socket_identity
 from cc_remote.wrapper.process_scan import (
     ProcessIdentity,
@@ -53,7 +54,7 @@ def state_root() -> Path:
 def private_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or info.st_mode & 0o077:
         raise LaunchError("共享入口的状态目录不是当前用户的私有目录。")
 
 
@@ -85,7 +86,7 @@ def matches_launch(identity: ProcessIdentity, profile: Path, endpoint: str) -> b
     return bool(
         home_ok and home and Path(home).resolve() == profile
         and url_ok and url == endpoint and process_identity(identity.pid) == identity
-        and process_owner_uid(identity.pid) == os.getuid()
+        and process_owner_uid(identity.pid) == current_uid()
     )
 
 
@@ -138,7 +139,7 @@ async def launch_lock(app: Path, root: Path):
     acquired = False
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise LaunchError("共享启动锁不安全；未启动 App。")
         try:
             locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
@@ -201,7 +202,7 @@ class Bridge:
                 pid, uid = int(line[1:]), None
             elif line.startswith("u"):
                 uid = int(line[1:])
-            elif line == expected and uid == os.getuid() and pid is not None:
+            elif line == expected and uid == current_uid() and pid is not None:
                 identity = process_identity(pid)
                 if identity is None:
                     return None

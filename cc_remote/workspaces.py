@@ -22,6 +22,7 @@ from typing import Iterable, Literal, cast
 from uuid import uuid4
 
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.platform.identity import current_euid
 
 
 Engine = Literal["claude", "codex"]
@@ -2058,7 +2059,7 @@ class WorkRegistry:
                     os.close(descriptor)
         return (stat.S_ISDIR(directory.st_mode)
                 and stat.S_ISREG(marker.st_mode)
-                and marker.st_uid == os.geteuid()
+                and marker.st_uid == current_euid()
                 and marker.st_nlink == 1
                 and payload == WORK_UPLOADS_MARKER_PAYLOAD)
 

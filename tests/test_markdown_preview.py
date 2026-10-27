@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import stat
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -1193,7 +1194,12 @@ def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     target.write_text("do not touch", encoding="utf-8")
     target.chmod(0o640)
     before = target.stat().st_mode & 0o777
-    (state / ".preview-capabilities.lock").symlink_to(target)
+    try:
+        (state / ".preview-capabilities.lock").symlink_to(target)
+    except OSError as exc:
+        if sys.platform == "win32":
+            pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
+        raise
 
     store = PreviewCapabilityStore(state)
 
@@ -1218,6 +1224,45 @@ def test_preview_lock_wait_is_bounded(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         with store._exclusive_lock():
             raise AssertionError("busy lock must not be entered")
+
+
+def test_preview_invalidation_marker_unlinks_while_owner_descriptor_is_open(
+    tmp_path,
+):
+    state = tmp_path / "state"
+    store = PreviewCapabilityStore(state)
+    marker = state / ".preview-capabilities.invalidated"
+
+    with store._invalidation_intent() as (descriptor, token):
+        assert marker.exists()
+        assert not list(state.glob(".*.tmp"))
+        with store._exclusive_lock():
+            store._clear_invalidation_locked(descriptor, token)
+        assert not marker.exists()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        assert os.read(descriptor, 64).decode("ascii").strip() == token
+
+
+def test_preview_epoch_replace_succeeds_while_reader_holds_it_open(tmp_path):
+    state = tmp_path / "state"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("artifact", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(artifact),
+        mode="read", source="user_approved")
+    epoch = state / ".preview-capabilities.epoch"
+    before = epoch.read_text(encoding="ascii")
+    reader = preview_capabilities.open_with_share_delete(epoch, os.O_RDONLY)
+    try:
+        store.revoke("claude", "code", "session-1", str(artifact))
+
+        assert store._persistent is True
+        assert epoch.read_text(encoding="ascii") != before
+        assert os.read(reader, 64).decode("ascii") == before
+    finally:
+        os.close(reader)
+    assert not (state / ".preview-capabilities.invalidated").exists()
 
 
 def test_preview_revoke_lock_timeout_leaves_restart_deny_marker(
@@ -1570,7 +1615,16 @@ def test_external_diff_never_reopens_capability_checked_path(
         nonlocal replaced
         if replaced:
             return
-        os.replace(replacement, outside)
+        try:
+            os.replace(replacement, outside)
+        except OSError:
+            # Windows denies replacing a path while another descriptor holds
+            # it open without share-delete, so the race this test injects
+            # cannot land there at all. That is consistent with (and even
+            # stronger than) the invariant under test: the read snapshot is
+            # never affected by a racing replace.
+            if sys.platform != "win32":
+                raise
         replaced = True
 
     def racing_lstat(path, *args, **kwargs):

@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import os
 import socket
 import struct
 import sys
 from pathlib import Path
+
+from cc_remote.platform.identity import current_uid
 
 VERSION = 1
 MAX_FRAME = 32 * 1024 * 1024
@@ -42,15 +43,15 @@ def same_user(writer: asyncio.StreamWriter) -> bool:
     if sys.platform == "darwin":
         # SOL_LOCAL / LOCAL_PEERCRED: xucred = version, uid, ngroups, groups.
         cred = sock.getsockopt(0, 1, 80)
-        return struct.unpack_from("=I", cred, 4)[0] == os.getuid()
+        return struct.unpack_from("=I", cred, 4)[0] == current_uid()
     cred = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-    return struct.unpack("3i", cred)[1] == os.getuid()
+    return struct.unpack("3i", cred)[1] == current_uid()
 
 
 def private_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
-    if path.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if path.is_symlink() or info.st_uid != current_uid() or info.st_mode & 0o077:
         raise PermissionError("Claude service directory must be private and owned by this user")
 
 

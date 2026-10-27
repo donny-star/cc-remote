@@ -23,6 +23,8 @@ import threading
 import time
 from uuid import uuid4
 
+from cc_remote.platform.identity import current_uid
+
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _STORE_VERSION = 1
@@ -158,7 +160,7 @@ class CodexClientMessageStore:
         if (
             not stat.S_ISREG(info.st_mode)
             or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()
+            or info.st_uid != current_uid()
             or stat.S_IMODE(info.st_mode) & 0o077
             or info.st_size > _MAX_FILE_BYTES
         ):

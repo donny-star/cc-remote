@@ -304,7 +304,7 @@ def test_parse_darwin_procargs_preserves_spaces_unicode_and_equals():
 def test_darwin_argv_scan_ignores_other_user_node_processes(monkeypatch):
     identity = ProcessIdentity(78, 457)
     monkeypatch.setattr(
-        "cc_remote.wrapper.process_scan.os.getuid", lambda: 501)
+        "cc_remote.wrapper.process_scan.current_uid", lambda: 501)
 
     assert _darwin_needs_engine_argv(
         (identity, 1, 0, 501, b"node", b"node")) is True

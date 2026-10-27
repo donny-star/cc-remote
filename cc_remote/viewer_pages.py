@@ -17,6 +17,7 @@ from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 from cc_remote.viewer import ViewerSite, clean_path, load_sites, open_resource
 
 MAX_PAGES = 32
@@ -123,7 +124,7 @@ class ViewerPageStore:
             return {}
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                     or info.st_mode & 0o077 or info.st_nlink != 1
                     or info.st_size > MAX_STORE_BYTES):
                 raise ValueError("invalid page store")
@@ -151,7 +152,7 @@ class ViewerPageStore:
         fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         with os.fdopen(fd, "rb") as lock:
             info = os.fstat(lock.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                     or info.st_mode & 0o077 or info.st_nlink != 1):
                 raise ValueError("invalid page store lock")
             locks.flock(lock, locks.LOCK_EX)

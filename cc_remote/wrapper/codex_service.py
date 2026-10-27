@@ -16,6 +16,8 @@ import sys
 import uuid
 from typing import Mapping
 
+from cc_remote.platform.identity import current_euid
+
 
 class DaemonIsolationError(RuntimeError):
     """Never fall back to starting a shared daemon inside the Wrapper."""
@@ -57,11 +59,11 @@ def needs_isolation() -> bool:
 
 
 def user_manager_environment() -> dict[str, str]:
-    runtime = Path("/run/user") / str(os.geteuid())
+    runtime = Path("/run/user") / str(current_euid())
     try:
         directory, bus = runtime.lstat(), (runtime / "bus").lstat()
-        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
-                or not stat.S_ISSOCK(bus.st_mode) or bus.st_uid != os.geteuid()):
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != current_euid()
+                or not stat.S_ISSOCK(bus.st_mode) or bus.st_uid != current_euid()):
             raise ValueError("invalid user manager endpoint")
     except (OSError, ValueError) as exc:
         raise DaemonIsolationError(

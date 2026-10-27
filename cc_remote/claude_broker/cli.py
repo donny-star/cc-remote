@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from cc_remote.platform import IS_WINDOWS
+from cc_remote.platform.identity import current_uid
 
 from .client import BrokerClient, BrokerClientError
 from .paths import default_socket_path
@@ -293,7 +294,7 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
     parent = os.path.dirname(target)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     parent_info = os.lstat(parent)
-    if (parent_info.st_uid != os.getuid()
+    if (parent_info.st_uid != current_uid()
             or not stat.S_ISDIR(parent_info.st_mode)
             or stat.S_IMODE(parent_info.st_mode) & 0o077):
         raise BrokerSecurityError(

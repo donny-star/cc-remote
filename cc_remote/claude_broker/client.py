@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 import stat
 from typing import Any
+
+from cc_remote.platform.identity import current_uid
 
 from .paths import default_socket_path
 from .protocol import (
@@ -127,7 +128,7 @@ class BrokerClient:
                 "broker_unavailable", f"broker is not running at {target}",
             ) from exc
         if (
-            info.st_uid != os.getuid()
+            info.st_uid != current_uid()
             or not stat.S_ISSOCK(info.st_mode)
             or stat.S_IMODE(info.st_mode) != 0o600
         ):
@@ -140,7 +141,7 @@ class BrokerClient:
             raise BrokerClientError("broker_unavailable", f"cannot connect to broker: {exc}") from exc
         peer_socket = writer.get_extra_info("socket")
         try:
-            if peer_socket is None or _peer_uid(peer_socket) != os.getuid():
+            if peer_socket is None or _peer_uid(peer_socket) != current_uid():
                 raise BrokerClientError("unsafe_socket", "broker peer uid does not match")
         except (BrokerSecurityError, BrokerClientError) as exc:
             writer.close()

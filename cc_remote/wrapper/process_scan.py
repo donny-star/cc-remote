@@ -279,7 +279,7 @@ def _darwin_needs_engine_argv(metadata: DarwinBsdSnapshot) -> bool:
     # turning an unreadable root/other-user Node process into a permanent
     # fail-closed state for every local Codex profile; exact rollout writers
     # remain covered independently by the inode/lsof scan below.
-    if metadata[3] != os.getuid():
+    if metadata[3] != current_uid():
         return False
     names = {metadata[4].lower(), metadata[5].lower()}
     return any(

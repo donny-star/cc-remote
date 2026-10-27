@@ -11,6 +11,7 @@ import socket
 import struct
 import threading
 
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_service import DaemonIsolationError, needs_isolation
 from cc_remote.wrapper.process_scan import ProcessIdentity, process_identity
 
@@ -100,7 +101,7 @@ def serve():
                 with connection:
                     try:
                         connection.settimeout(2)
-                        if peer(connection)[1] not in {0, os.getuid()}:
+                        if peer(connection)[1] not in {0, current_uid()}:
                             continue
                         command = connection.recv(32)
                         connection.sendall(barrier.request(command))

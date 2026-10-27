@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from cc_remote.claude_broker.paths import default_socket_path
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
+from cc_remote.platform.identity import current_uid
 
 try:
     from dotenv import load_dotenv
@@ -163,7 +164,7 @@ def _claude_service_socket(key: str = "socket") -> str:
         return ""
     with os.fdopen(fd, "r") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_mode & 0o077 or info.st_size > 4096):
             raise ValueError("Claude service registration must be a private user-owned file")
         payload = json.loads(source.read(4097))

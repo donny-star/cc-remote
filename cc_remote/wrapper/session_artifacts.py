@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
 
 from cc_remote.attachments import MAX_IMAGE_PIXELS, decode_attachment, validate_attachments
+from cc_remote.platform.identity import current_euid
 
 
 # Extra durable copies, not the user's working files or native transcripts.
@@ -256,7 +257,7 @@ class SessionArtifactStore:
         self.root = Path(state_dir) / "session-artifacts"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_euid():
             raise OSError("unsafe artifact directory")
         os.chmod(self.root, 0o700)
         self.path = self.root / "index.sqlite3"
@@ -389,7 +390,7 @@ class SessionArtifactStore:
                     with os.fdopen(fd, "rb") as existing:
                         info = os.fstat(existing.fileno())
                         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                                or info.st_uid != os.geteuid()):
+                                or info.st_uid != current_euid()):
                             raise OSError("unsafe artifact upload")
                         if existing.read(len(data) + 1) != data:
                             raise OSError("artifact upload content changed")

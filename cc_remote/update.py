@@ -23,6 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from cc_remote.platform.identity import current_euid
 from cc_remote.update_errors import download_reason, endpoint, network_reason
 from deploy.release_manifest import ReleaseManifestError, load_manifest
 from deploy.install_lock import LOCK_FD_ENV, InstallLockError, acquire_install_lock
@@ -343,9 +344,9 @@ def update(*, role: str | None, target_version: str | None, check: bool,
     repository = release_repository()
     version = target_version or latest_version(repository)
     selected = version_tuple(version)
-    if not check and system == "linux" and os.geteuid() != 0:
+    if not check and system == "linux" and current_euid() != 0:
         raise UpdateError("Linux activation needs root; run sudo cc-remote update")
-    if not check and system == "darwin" and os.geteuid() == 0:
+    if not check and system == "darwin" and current_euid() == 0:
         raise UpdateError("run macOS updates as the desktop user, without sudo")
     with (nullcontext() if check else update_lock(installation.root)) as lock_descriptor:
         if not check:

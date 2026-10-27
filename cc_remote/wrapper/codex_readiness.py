@@ -24,6 +24,7 @@ from websockets.http11 import Response
 from websockets.uri import parse_uri
 
 from cc_remote import __version__
+from cc_remote.platform.identity import current_euid
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, socket_identity
 from cc_remote.wrapper.codex_service import DaemonIsolationError
 from cc_remote.wrapper.process_scan import process_identity
@@ -40,7 +41,7 @@ async def probe_config(socket_path: str) -> None:
     alone doesn't exercise the config loader used to start the next turn. Never
     expose the config or raw native errors in this acceptance check.
     """
-    before = socket_identity(socket_path, owner_uid=os.geteuid())
+    before = socket_identity(socket_path, owner_uid=current_euid())
     async with asyncio.timeout(_TIMEOUT):
         async with unix_connect(
             socket_path, uri="ws://localhost/", proxy=None,
@@ -66,7 +67,7 @@ async def probe_config(socket_path: str) -> None:
             result = await request(2, "config/read", {"includeLayers": False})
             if not isinstance(result.get("config"), dict):
                 raise RuntimeError("Codex live configuration response is invalid")
-    if socket_identity(socket_path, owner_uid=os.geteuid()) != before:
+    if socket_identity(socket_path, owner_uid=current_euid()) != before:
         raise RuntimeError("Codex daemon changed during configuration check")
 
 

@@ -9,6 +9,8 @@ import stat
 import tempfile
 import uuid
 
+from cc_remote.platform.identity import current_uid
+
 
 MAX_STORE_BYTES = 256 * 1024
 MAX_STORED_SESSIONS = 1024
@@ -46,7 +48,7 @@ class ControlStore:
         except FileNotFoundError:
             return
         if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.getuid()
+                or info.st_uid != current_uid()
                 or stat.S_IMODE(info.st_mode) & 0o077
                 or info.st_size > MAX_STORE_BYTES):
             raise ControlStoreError("Claude control store is not a private regular file")
@@ -108,7 +110,7 @@ class ControlStore:
         parent = self.path.parent
         info = parent.lstat()
         if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.getuid()
+                or info.st_uid != current_uid()
                 or stat.S_IMODE(info.st_mode) & 0o077):
             raise ControlStoreError("Claude control store directory is unsafe")
         payload = json.dumps(

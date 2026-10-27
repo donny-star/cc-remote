@@ -53,7 +53,7 @@ def _installation(tmp_path, monkeypatch, *, role="wrapper", system="darwin", roo
     (root / "native-service-alive").write_text("still running\n")
     monkeypatch.setattr(updater, "installation_roots", lambda _: {role: root})
     monkeypatch.setattr(updater, "host_platform", lambda: (system, "arm64"))
-    monkeypatch.setattr(updater.os, "geteuid", lambda: 0 if system == "linux" else 501)
+    monkeypatch.setattr(updater, "current_euid", lambda: 0 if system == "linux" else 501)
     # The fixture models activation privileges; its real files still belong to
     # this test process. Exercise native locking with that actual OS identity.
     def native_lock(path):

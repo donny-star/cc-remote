@@ -11,6 +11,7 @@ import stat
 from pathlib import Path
 
 from cc_remote.platform import locks
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.process_scan import process_identity
 
 from .server import Service
@@ -25,7 +26,7 @@ async def serve(directory: Path) -> None:
         path = directory / "service.sock"
         if path.exists() or path.is_symlink():
             info = path.lstat()
-            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
                 raise PermissionError("unsafe Claude service socket")
             path.unlink()
         service = Service(directory)
