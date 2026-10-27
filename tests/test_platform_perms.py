@@ -58,3 +58,61 @@ def test_everyone_readable_file_is_not_private(tmp_path) -> None:
 def test_current_sid_is_a_user_sid() -> None:
     sid = identity.current_sid()
     assert sid is not None and sid.startswith("S-1-5-")
+
+
+class _FakeDacl:
+    def __init__(self, aces) -> None:
+        self._aces = aces
+
+    def GetAceCount(self) -> int:
+        return len(self._aces)
+
+    def GetAce(self, index):
+        return self._aces[index]
+
+
+class _FakeDescriptor:
+    def __init__(self, owner, dacl) -> None:
+        self._owner = owner
+        self._dacl = dacl
+
+    def GetSecurityDescriptorOwner(self):
+        return self._owner
+
+    def GetSecurityDescriptorDacl(self):
+        return self._dacl
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_object_ace_fails_closed(tmp_path, monkeypatch) -> None:
+    import win32security
+
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    user = win32security.ConvertStringSidToSid(identity.current_sid())
+    object_ace = ((5, 0), 0x1F01FF, b"guid", b"guid", user)
+    descriptor = _FakeDescriptor(user, _FakeDacl([object_ace]))
+    monkeypatch.setattr(
+        win32security, "GetNamedSecurityInfo", lambda *args: descriptor)
+    assert perms.is_private(path) is False
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_unreadable_security_info_fails_closed(tmp_path, monkeypatch) -> None:
+    import pywintypes
+    import win32security
+
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+
+    def denied(*args):
+        raise pywintypes.error(5, "GetNamedSecurityInfo", "Access is denied.")
+
+    monkeypatch.setattr(win32security, "GetNamedSecurityInfo", denied)
+    assert perms.is_private(path) is False
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_missing_path_raises_file_not_found(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        perms.is_private(tmp_path / "missing")

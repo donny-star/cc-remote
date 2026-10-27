@@ -1,6 +1,7 @@
 """Owner-only files and directories: POSIX mode bits or a Windows DACL."""
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from os import PathLike
@@ -40,6 +41,7 @@ def is_private(path: StrPath) -> bool:
     if not IS_WINDOWS:
         info = os.stat(path)
         return info.st_uid == current_uid() and not stat.S_IMODE(info.st_mode) & 0o077
+    import pywintypes
     import win32security
 
     user = win32security.ConvertStringSidToSid(current_sid())
@@ -50,10 +52,17 @@ def is_private(path: StrPath) -> bool:
         admins,
         win32security.ConvertStringSidToSid("S-1-3-4"),  # OWNER RIGHTS
     )
-    descriptor = win32security.GetNamedSecurityInfo(
-        os.fspath(path), win32security.SE_FILE_OBJECT,
-        win32security.OWNER_SECURITY_INFORMATION
-        | win32security.DACL_SECURITY_INFORMATION)
+    try:
+        descriptor = win32security.GetNamedSecurityInfo(
+            os.fspath(path), win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION)
+    except pywintypes.error as exc:
+        # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND; anything else is
+        # unverifiable and therefore not private.
+        if exc.winerror in (2, 3):
+            raise FileNotFoundError(errno.ENOENT, exc.strerror, os.fspath(path)) from exc
+        return False
     owner = descriptor.GetSecurityDescriptorOwner()
     if not (owner == user or owner == admins):
         return False
@@ -61,13 +70,20 @@ def is_private(path: StrPath) -> bool:
     if dacl is None:  # a NULL DACL grants everyone full access
         return False
     for index in range(dacl.GetAceCount()):
-        (ace_type, ace_flags), _mask, sid = dacl.GetAce(index)
+        ace = dacl.GetAce(index)
+        # Only plain allowed/denied ACEs have the ((type, flags), mask, sid)
+        # shape; object, callback, audit or unknown ACEs fail closed.
+        if not (isinstance(ace, tuple) and len(ace) == 3
+                and isinstance(ace[0], tuple) and len(ace[0]) == 2):
+            return False
+        (ace_type, ace_flags), _mask, sid = ace
+        if ace_type not in (win32security.ACCESS_ALLOWED_ACE_TYPE,
+                            win32security.ACCESS_DENIED_ACE_TYPE):
+            return False
         if ace_flags & win32security.INHERIT_ONLY_ACE:
             continue
         if ace_type == win32security.ACCESS_DENIED_ACE_TYPE:
             continue
-        if ace_type != win32security.ACCESS_ALLOWED_ACE_TYPE:
-            return False
         if not any(sid == candidate for candidate in trusted):
             return False
     return True
