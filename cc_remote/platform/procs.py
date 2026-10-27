@@ -24,10 +24,13 @@ SIGKILL = int(getattr(signal, "SIGKILL", 9))
 if IS_WINDOWS:
     import ctypes
 
-    import pywintypes
     import win32api
     import win32con
     import win32job
+
+    from cc_remote.log import logger
+
+    _log = logger("cc_remote.platform.procs")
 
     _CREATE_SUSPENDED = 0x00000004
     _CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -49,13 +52,37 @@ if IS_WINDOWS:
         flags = kwargs.pop("creationflags", 0)
         return {**kwargs, "creationflags": flags | _CREATE_SUSPENDED | _CREATE_NEW_PROCESS_GROUP}
 
-    def _prune_locked() -> None:
+    def _active_processes(job: Any) -> int:
+        accounting = win32job.QueryInformationJobObject(
+            job, win32job.JobObjectBasicAccountingInformation)
+        return int(accounting["ActiveProcesses"])
+
+    def _prune_locked(keep: int) -> None:
         for pid, job in list(_jobs.items()):
-            accounting = win32job.QueryInformationJobObject(
-                job, win32job.JobObjectBasicAccountingInformation)
-            if accounting["ActiveProcesses"] == 0:
+            if pid != keep and _active_processes(job) == 0:
                 job.Close()
                 del _jobs[pid]
+
+    def _register(pid: int, job: Any) -> None:
+        """Own ``job`` in the table first; pruning is housekeeping only."""
+        with _jobs_lock:
+            stale = _jobs.get(pid)
+            _jobs[pid] = job
+            if stale is not None:
+                stale.Close()  # the pid was reused after an unpruned tree
+            try:
+                _prune_locked(pid)
+            except Exception:  # never fail a spawn on cleanup
+                _log.exception("job_prune_failed")
+
+    def _discard(pid: int, job: Any) -> None:
+        with _jobs_lock:
+            if _jobs.get(pid) is job:
+                del _jobs[pid]
+        try:
+            win32job.TerminateJobObject(job, 1)
+        finally:
+            job.Close()
 
     def _adopt(pid: int) -> None:
         """Place the suspended ``pid`` in a fresh Job, then resume it."""
@@ -64,16 +91,17 @@ if IS_WINDOWS:
             job = win32job.CreateJobObject(None, "")
             try:
                 win32job.AssignProcessToJobObject(job, process)
-            except pywintypes.error:
+            except BaseException:
                 job.Close()
                 win32api.TerminateProcess(process, 1)
                 raise
-            with _jobs_lock:
-                _prune_locked()
-                _jobs[pid] = job
-            if _ntdll.NtResumeProcess(int(process)) != 0:
-                win32job.TerminateJobObject(job, 1)
-                raise OSError("cannot resume the suspended child process")
+            try:
+                _register(pid, job)
+                if _ntdll.NtResumeProcess(int(process)) != 0:
+                    raise OSError("cannot resume the suspended child process")
+            except BaseException:
+                _discard(pid, job)
+                raise
         finally:
             process.Close()
 
@@ -104,6 +132,8 @@ if IS_WINDOWS:
             job = _jobs.pop(pid, None)
         if job is not None:
             try:
+                if _active_processes(job) == 0:
+                    raise ProcessLookupError(pid)
                 win32job.TerminateJobObject(job, 1)
             finally:
                 job.Close()

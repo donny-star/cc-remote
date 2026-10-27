@@ -72,3 +72,24 @@ def test_killpg_of_unknown_pid_raises_process_lookup_error() -> None:
     child.wait()
     with pytest.raises(ProcessLookupError):
         procs.killpg(child.pid, procs.SIGKILL)
+
+
+def test_killpg_of_exited_group_raises_process_lookup_error() -> None:
+    child = procs.popen_group([sys.executable, "-c", "pass"])
+    child.wait(timeout=15)
+    with pytest.raises(ProcessLookupError):
+        procs.killpg(child.pid, procs.SIGKILL)
+
+
+@pytest.mark.windows_only(reason="Job Object pruning only exists on Windows")
+def test_spawn_survives_job_pruning_failure(tmp_path, monkeypatch) -> None:
+    def broken_prune(keep: int) -> None:
+        raise OSError("pruning failed")
+
+    monkeypatch.setattr(procs, "_prune_locked", broken_prune)
+    pid_file = tmp_path / "grandchild"
+    child = procs.popen_group([sys.executable, "-c", SPAWN_GRANDCHILD, str(pid_file)])
+    grandchild = _wait_for_pid(pid_file)
+    procs.killpg(child.pid, procs.SIGKILL)
+    child.wait(timeout=10)
+    assert _wait_gone(grandchild)
