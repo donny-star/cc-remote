@@ -63,6 +63,16 @@ def is_private(path: StrPath) -> bool:
         if exc.winerror in (2, 3):
             raise FileNotFoundError(errno.ENOENT, exc.strerror, os.fspath(path)) from exc
         return False
+    try:
+        return _dacl_is_private(descriptor, trusted, user, admins)
+    except (pywintypes.error, TypeError, ValueError):
+        # An owner or DACL that cannot be inspected is not verifiably private.
+        return False
+
+
+def _dacl_is_private(descriptor, trusted, user, admins) -> bool:
+    import win32security
+
     owner = descriptor.GetSecurityDescriptorOwner()
     if not (owner == user or owner == admins):
         return False
