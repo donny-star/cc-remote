@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 import errno
-import fcntl
 import json
 import logging
 import os
@@ -17,10 +16,16 @@ import signal
 import stat
 import struct
 import subprocess
-import termios
+import sys
 import time
 from typing import Callable, Literal
 import uuid
+
+if sys.platform != "win32":
+    # PTYs are POSIX-only; on Windows the module stays importable for the
+    # shared error types, while starting a session fails at runtime.
+    import fcntl
+    import termios
 
 from cc_remote.claude_paths import claude_projects_dir
 

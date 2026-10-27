@@ -17,11 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from cc_remote.claude_broker.paths import default_socket_path
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
-
-if sys.platform != "win32":
-    from cc_remote.claude_broker.paths import default_socket_path
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 try:
     from dotenv import load_dotenv
@@ -38,7 +37,9 @@ def _env(key: str, default: str = "") -> str:
 def _claude_bin() -> str:
     """Use the user's normal Claude Code install unless explicitly overridden."""
     configured = _env("CLAUDE_BIN", "").strip()
-    return configured or str(Path.home() / ".local/bin/claude")
+    # The native Windows installer uses the same directory with an .exe image.
+    name = "claude.exe" if sys.platform == "win32" else "claude"
+    return configured or str(Path.home() / ".local/bin" / name)
 
 
 def _int(key: str, default: int) -> int:
@@ -160,13 +161,13 @@ def _claude_service_socket(key: str = "socket") -> str:
     directory = Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))).expanduser()
     path = directory / "claude-service.json"
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return ""
     with os.fdopen(fd, "r") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_size > 4096):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or mode_exposed(info.st_mode) or info.st_size > 4096):
             raise ValueError("Claude service registration must be a private user-owned file")
         payload = json.loads(source.read(4097))
     if not isinstance(payload, dict) or not isinstance(payload.get("socket"), str):
@@ -320,11 +321,7 @@ class WrapperConfig:
     # experiment. It is intentionally disabled in the supported product path:
     # direct native Claude owners are mirrored read-only and explicitly taken
     # over by the SDK instead of sharing a PTY input state machine.
-    claude_broker_socket: str = field(
-        default_factory=(
-            default_socket_path if sys.platform != "win32" else lambda: ""
-        )
-    )
+    claude_broker_socket: str = field(default_factory=default_socket_path)
     # Installed separately from the Wrapper's service/cgroup. An empty value
     # retains the in-process SDK for unmanaged development installations.
     claude_service_socket: str = field(
@@ -708,14 +705,23 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
         elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
             errors.append(
                 "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
-    if cfg.claude_service_socket:
+    if sys.platform == "win32":
+        # Both features listen on Unix-domain sockets, which Python's Windows
+        # runtime does not expose. Reject the opt-in instead of failing later.
+        if cfg.session_messages_enabled:
+            errors.append(
+                "CC_REMOTE_SESSION_MESSAGES is not supported on Windows")
+        if cfg.claude_service_socket or cfg.claude_service_drain_socket:
+            errors.append(
+                "CC_REMOTE_CLAUDE_SERVICE_SOCKET is not supported on Windows")
+    elif cfg.claude_service_socket:
         service_socket = os.path.expanduser(cfg.claude_service_socket)
         if (not os.path.isabs(service_socket) or "\x00" in service_socket
                 or len(os.fsencode(service_socket)) > 103):
             errors.append("CC_REMOTE_CLAUDE_SERVICE_SOCKET must be an absolute Unix socket path of at most 103 bytes")
         if cfg.experimental_claude_broker:
             errors.append("Claude SDK service and experimental PTY broker cannot be enabled together")
-    if cfg.claude_service_drain_socket:
+    if cfg.claude_service_drain_socket and sys.platform != "win32":
         drain_socket = os.path.expanduser(cfg.claude_service_drain_socket)
         if (not cfg.claude_service_socket or not os.path.isabs(drain_socket)
                 or "\x00" in drain_socket or len(os.fsencode(drain_socket)) > 103

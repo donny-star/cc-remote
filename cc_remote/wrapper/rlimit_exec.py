@@ -1,4 +1,7 @@
-"""Raise one child-only resource limit before replacing this process."""
+"""Raise one child-only resource limit before replacing this process.
+
+POSIX only: callers never route a Windows child through this launcher.
+"""
 from __future__ import annotations
 
 import os

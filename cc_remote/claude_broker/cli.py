@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
@@ -12,9 +11,12 @@ import stat
 import struct
 import subprocess
 import sys
-import termios
-import tty
 from typing import Any
+
+if sys.platform != "win32":
+    import fcntl
+    import termios
+    import tty
 
 from .client import BrokerClient, BrokerClientError
 from .paths import default_socket_path
