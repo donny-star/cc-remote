@@ -23,6 +23,8 @@
   `cc_remote/tui*|viewer*|session_messages|timed_tasks|async_tasks|task_*` → 4），
   仍无法判断的（失败只在测试代码里的断言）默认归子项目 2（这类测试都在驱动 Wrapper）。
 - 测试 ID 超过 150 字符的参数化用例做了截断（以 `…]` 结尾）。异常文本里的临时目录替换成 `<tmp>`。
+- 本地 `.venv` 不是按 `requirements*.lock` 建的：`mcp` 为 2.2.0（lock 为 1.28.1，Linux CI 用 lock）。
+  因此 `Server.list_tools` 相关的 62 条失败是本地环境偏差，留在基线里仅作记录。
 - 一个用例同时有 call 失败和 teardown 错误时，两条都列出（标 `[error]` 的是 error）。
 
 ## 共性根因（跨子项目）
@@ -37,7 +39,7 @@
 | 测试数据用 POSIX 绝对路径，Windows 上 `Path.is_absolute()` 为假 | 156 | 2 |
 | 创建符号链接需要特权（WinError 1314，未开开发者模式） | 297 | 2, 3, 4, 5 |
 | `socket.AF_UNIX` / `asyncio.start_unix_server` 不可用 | 75 | 2, 4 |
-| MCP `Server.list_tools` 不存在（venv 中为 mcp 2.2.0，与平台无关的依赖漂移） | 62 | 2, 4 |
+| MCP `Server.list_tools` 不存在（本地 venv 装的是 mcp 2.2.0，`requirements*.lock` 锁定 1.28.1；本地环境偏差，与平台无关，按 lock 重建 venv 后应消失） | 62 | 2, 4 |
 | 参数化测试 ID 超过 Windows 环境变量 32767 上限（PYTEST_CURRENT_TEST） | 8 | 2, 4 |
 | 超时（`TimeoutError`） | 57 | 2, 3, 4 |
 | 其余（断言差异、路径分隔符、子进程/可执行文件等，见明细） | 592 | 2, 3, 4, 5 |
