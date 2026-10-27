@@ -64,23 +64,67 @@ def test_venv_python_layout(tmp_path) -> None:
 def test_shutdown_handler_runs_callback_on_sigint() -> None:
     import signal as stdlib_signal
 
-    saved = {s: stdlib_signal.getsignal(s) for s in (stdlib_signal.SIGINT, stdlib_signal.SIGTERM)}
+    original = stdlib_signal.getsignal(stdlib_signal.SIGINT)
 
     async def scenario() -> bool:
         loop = asyncio.get_running_loop()
         fired = asyncio.Event()
-        signals.install_shutdown_handler(loop, fired.set)
+        uninstall = signals.install_shutdown_handler(loop, fired.set)
         try:
             stdlib_signal.raise_signal(stdlib_signal.SIGINT)
             await asyncio.wait_for(fired.wait(), 5)
             return fired.is_set()
         finally:
-            if sys.platform != "win32":
-                for signum in saved:
-                    loop.remove_signal_handler(signum)
+            uninstall()
 
-    try:
-        assert asyncio.run(scenario())
-    finally:
-        for signum, handler in saved.items():
-            stdlib_signal.signal(signum, handler)
+    assert asyncio.run(scenario())
+    assert stdlib_signal.getsignal(stdlib_signal.SIGINT) is original
+
+
+@pytest.mark.windows_only(reason="console control events exist only on Windows")
+def test_console_close_waits_for_callback_and_uninstalls(monkeypatch) -> None:
+    import threading
+
+    import win32api
+
+    calls: list[tuple[object, bool]] = []
+    monkeypatch.setattr(win32api, "SetConsoleCtrlHandler", lambda h, add: calls.append((h, add)))
+
+    async def scenario() -> tuple[bool, bool]:
+        loop = asyncio.get_running_loop()
+        ran = threading.Event()
+        uninstall = signals.install_shutdown_handler(loop, ran.set)
+        try:
+            handler = calls[0][0]
+            # The handler blocks its OS thread until the loop has run the callback.
+            result = await loop.run_in_executor(None, lambda: (handler(2), ran.is_set()))
+            assert handler(0) is False  # Ctrl+C is left to the SIGINT handler
+            return result
+        finally:
+            uninstall()
+
+    assert asyncio.run(scenario()) == (True, True)
+    assert calls == [(calls[0][0], True), (calls[0][0], False)]
+
+
+@pytest.mark.windows_only(reason="console control events exist only on Windows")
+def test_missing_console_logs_and_skips_unregister(monkeypatch) -> None:
+    import pywintypes
+    import win32api
+
+    calls: list[bool] = []
+
+    def fake_set(_handler: object, add: bool) -> None:
+        calls.append(add)
+        raise pywintypes.error(6, "SetConsoleCtrlHandler", "The handle is invalid.")
+
+    warnings: list[tuple[str, dict]] = []
+    monkeypatch.setattr(win32api, "SetConsoleCtrlHandler", fake_set)
+    monkeypatch.setattr(signals.log, "warning", lambda msg, **kw: warnings.append((msg, kw)))
+
+    async def scenario() -> None:
+        signals.install_shutdown_handler(asyncio.get_running_loop(), lambda: None)()
+
+    asyncio.run(scenario())
+    assert calls == [True]
+    assert warnings and warnings[0][0] == "console control handler unavailable"
