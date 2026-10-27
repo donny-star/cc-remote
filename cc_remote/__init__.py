@@ -6,3 +6,5 @@ Two independent links:
 """
 
 __version__ = "5.3.0"
+
+import cc_remote.platform  # noqa: E402,F401  (process-wide platform setup)

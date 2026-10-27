@@ -544,6 +544,7 @@ pywin32==312 ; sys_platform == 'win32' \
     --hash=sha256:dc90147579a905b8635e1b0ec6514967dcb07e6e0d9c42f1477feef14cac23bb
     # via
     #   -c requirements.lock
+    #   -r requirements-common.txt
     #   mcp
 referencing==0.37.0 \
     --hash=sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231 \
