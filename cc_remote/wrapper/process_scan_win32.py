@@ -291,6 +291,28 @@ def _token_user_sid(api: dict[str, Any], process: Any) -> bytes | None:
 _own_sid: bytes | None = None
 
 
+_ERROR_INVALID_PARAMETER = 87
+
+
+def exists(pid: int) -> bool | None:
+    """Probe liveness without ``os.kill``, which terminates the process on Windows.
+
+    ``None`` means the process could not be opened for another reason (for
+    example access denied), which is not proof that it exited.
+    """
+    api = _load()
+    if api is None or pid <= 0:
+        return None
+    with _open_process(pid, _PROCESS_QUERY_LIMITED_INFORMATION) as handle:
+        if handle is None:
+            error = ctypes.get_last_error()
+            return False if error == _ERROR_INVALID_PARAMETER else None
+        code = wintypes.DWORD()
+        if not api["kernel32"].GetExitCodeProcess(handle, ctypes.byref(code)):
+            return None
+        return code.value == _STILL_ACTIVE
+
+
 def identity(pid: int) -> tuple[int, int] | None:
     """Return ``(creation FILETIME, parent pid)`` for one live process."""
     api = _load()

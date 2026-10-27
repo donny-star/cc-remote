@@ -7,6 +7,7 @@ import contextlib
 import contextvars
 import dataclasses
 import os
+import sys
 from uuid import uuid4
 
 from cc_remote.claude_steering import ClaudeSteerRejected
@@ -32,6 +33,11 @@ def service_owner_exited(identity) -> bool:
     current = process_identity(identity.pid)
     if current is not None:
         return current != identity
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is TerminateProcess on Windows, not a probe.
+        from cc_remote.wrapper import process_scan_win32
+
+        return process_scan_win32.exists(identity.pid) is False
     try:
         os.kill(identity.pid, 0)
     except ProcessLookupError:

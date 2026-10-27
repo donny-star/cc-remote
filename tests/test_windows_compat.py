@@ -130,3 +130,28 @@ def test_relay_routes_windows_page_references_to_devices():
                 r"\\server\share\index.html", r"C:site\index.html", "C:/site/../index.html",
                 r"site\index.html"):
         assert not _device_checked(raw)
+
+
+@windows_only
+def test_liveness_probe_never_terminates_the_process():
+    # os.kill(pid, 0) is TerminateProcess on Windows; the probe must only observe.
+    import subprocess
+
+    from cc_remote.wrapper import process_scan_win32
+
+    assert process_scan_win32.exists(os.getpid()) is True
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert process_scan_win32.exists(child.pid) is not True
+    assert process_scan_win32.exists(0) is None
+
+
+@windows_only
+def test_service_owner_exit_proof_uses_the_non_destructive_probe(monkeypatch):
+    from cc_remote.claude_service import client as client_module
+    from cc_remote.wrapper import process_scan
+    from cc_remote.wrapper.process_scan import ProcessIdentity
+
+    monkeypatch.setattr(process_scan, "process_identity", lambda _pid: None)
+    monkeypatch.setattr(client_module.os, "kill", lambda *_: pytest.fail("os.kill"))
+    assert client_module.service_owner_exited(ProcessIdentity(os.getpid(), 1)) is False
