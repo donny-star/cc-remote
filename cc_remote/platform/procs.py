@@ -29,6 +29,7 @@ if IS_WINDOWS:
     import win32job
 
     from cc_remote.log import logger
+    from cc_remote.platform._win32err import translated
 
     _log = logger("cc_remote.platform.procs")
 
@@ -86,24 +87,25 @@ if IS_WINDOWS:
 
     def _adopt(pid: int) -> None:
         """Place the suspended ``pid`` in a fresh Job, then resume it."""
-        process = win32api.OpenProcess(_PROCESS_ACCESS, False, pid)
-        try:
-            job = win32job.CreateJobObject(None, "")
+        with translated():
+            process = win32api.OpenProcess(_PROCESS_ACCESS, False, pid)
             try:
-                win32job.AssignProcessToJobObject(job, process)
-            except BaseException:
-                job.Close()
-                win32api.TerminateProcess(process, 1)
-                raise
-            try:
-                _register(pid, job)
-                if _ntdll.NtResumeProcess(int(process)) != 0:
-                    raise OSError("cannot resume the suspended child process")
-            except BaseException:
-                _discard(pid, job)
-                raise
-        finally:
-            process.Close()
+                job = win32job.CreateJobObject(None, "")
+                try:
+                    win32job.AssignProcessToJobObject(job, process)
+                except BaseException:
+                    job.Close()
+                    win32api.TerminateProcess(process, 1)
+                    raise
+                try:
+                    _register(pid, job)
+                    if _ntdll.NtResumeProcess(int(process)) != 0:
+                        raise OSError("cannot resume the suspended child process")
+                except BaseException:
+                    _discard(pid, job)
+                    raise
+            finally:
+                process.Close()
 
     def popen_group(args: Any, **kwargs: Any) -> subprocess.Popen:
         child = subprocess.Popen(args, **_spawn_flags(kwargs))
@@ -127,17 +129,23 @@ if IS_WINDOWS:
         return child
 
     def killpg(pid: int, sig: int) -> None:
+        """Terminate the Job for ``pid``; the Job stays tracked until it is empty.
+
+        A SIGTERM-then-SIGKILL escalation therefore reaches the same Job (or
+        ProcessLookupError once it drained) and never ``taskkill``s a pid the
+        tree no longer owns.
+        """
         del sig  # Windows has no deliverable graceful signal for console-less trees
         with _jobs_lock:
-            job = _jobs.pop(pid, None)
-        if job is not None:
-            try:
-                if _active_processes(job) == 0:
-                    raise ProcessLookupError(pid)
-                win32job.TerminateJobObject(job, 1)
-            finally:
-                job.Close()
-            return
+            job = _jobs.get(pid)
+            if job is not None:
+                with translated():
+                    if _active_processes(job) == 0:
+                        del _jobs[pid]
+                        job.Close()
+                        raise ProcessLookupError(pid)
+                    win32job.TerminateJobObject(job, 1)
+                return
         result = subprocess.run(
             ["taskkill", "/T", "/F", "/PID", str(pid)],
             capture_output=True, check=False)
