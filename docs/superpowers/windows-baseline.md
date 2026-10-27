@@ -1,31 +1,36 @@
-# Windows 测试基线（windows-compat-v2 @ 8fe5746）
+# Windows 测试基线（windows-compat-v2 @ 232f19e）
 
-运行：逐个测试文件执行 `python -X utf8 -m pytest -o addopts="" -p no:cacheprovider -q tests/<file>.py`（每个文件 240 s 超时），Windows 10 19044，Python 3.13.15
+运行：逐个测试文件执行 `python -X utf8 -m pytest -o addopts="" -p no:cacheprovider -q tests/<file>.py`（每个文件 240 s 超时，`PYTHONUTF8=1`），Windows 10 19044，Python 3.13.15，mcp 1.28.1，claude-agent-sdk 0.2.157，pywin32 312
 
-汇总：4205 passed / 2181 failed / 155 errors / 64 skipped；另有 3 个测试文件整体超时；web 测试（`npm run test:reliability` 的 42 个文件）：1 failed
+汇总：4286 passed / 2115 failed / 155 errors / 65 skipped；另有 3 个测试文件整体超时；web 测试（`npm run test:reliability` 的 42 个文件）：1 failed
 
 ## 运行方式说明
 
-- 基线所在提交：`win/1-platform` @ `8fe5746`（基于 `windows-compat-v2`）。
-- 没有用一个 pytest 进程跑全量：在 Windows 上并行全量会在约 69% 处挂住
-  （`test_claude_autocompact`、`test_codex_controls`、`test_codex_session_delete` 三个文件，
-  在改动前的基线上同样挂住）。因此每个 `tests/test_*.py` 单独起一个 pytest 进程，240 s 超时，
-  再从各自的 junit xml 聚合。超时的 3 个文件整体记为子项目 2 的基线条目。
-- 收集错误只剩 2 个，都是 `deploy/` 模块的 POSIX 导入：`tests/test_relay_update_job.py`
-  （`deploy/relay_update_job.py` 导入 `fcntl`）和 `tests/test_release_retention.py`
-  （`deploy/release_retention.py` 导入 `pwd`），归子项目 5。
-- 失败的 154 个文件又用 `--tb=native` 重跑了一遍取完整调用栈：没有任何失败的调用栈经过
-  `cc_remote/platform/`，所以“子项目 1 遗留”为 0。两次运行之间只有
-  `tests/test_codex_profiles.py` 的失败数不同（62 / 63），记为不稳定。
-- 归属规则：先按测试文件名匹配计划中的表（`test_adopt_wrapper`、`test_prepare_wrapper_stage`、
-  `test_relay_update_job`、`test_desktop_remote_ui` 直接测 `deploy/` 脚本，按“deploy 相关”归子项目 5）；文件名没有命中的，按调用栈里最深的仓库内模块归属
+- 基线所在提交：`windows-compat-v2` @ `232f19e`（P1 合并 `51bcda9` 及其最终修复波次之后）。上一版基线在 `win/1-platform` @ `8fe5746`。
+- 本地 `.venv` 已按 `requirements*.lock` 重建：mcp 1.28.1、claude-agent-sdk 0.2.157、pywin32 312，与 Linux CI 用的 lock 一致。
+  上一版记的 mcp 漂移（本地装的是 mcp 2.2.0，导致 `Server.list_tools` 相关的 62 条和 `RequestContext` 导入失败的 6 条）已经解决，这些 mcp 相关异常本版不再出现
+  （其中 `tests/test_async_tasks.py` 的 3 条越过导入后仍因符号链接特权失败，见“与上一版对比”）。
+- 没有用一个 pytest 进程跑全量：在 Windows 上并行全量会在约 69% 处挂住。每个 `tests/test_*.py`（共 278 个）单独起一个 pytest 进程
+  （4 路并行，240 s 超时），再从各自的 junit xml 聚合。整体超时的仍是同样 3 个文件（`test_claude_autocompact`、`test_codex_controls`、
+  `test_codex_session_delete`），整体各记一条，归子项目 2。
+- 收集错误仍只有 2 个，都是 `deploy/` 模块的 POSIX 导入：`tests/test_relay_update_job.py`（`fcntl`）和
+  `tests/test_release_retention.py`（`pwd`），归子项目 5。
+- 失败的 153 个文件用 `--tb=native` 重跑了一遍取完整调用栈：没有任何失败的调用栈经过 `cc_remote/platform/`，所以“子项目 1 遗留”为 0。
+- 两次运行之间失败数不同的文件（记为不稳定，明细以第一次运行为准）：`tests/test_codex_rich_stream.py`（1 / 0，
+  `test_codex_delta_bursts_coalesce_before_structural_boundaries` 是时序相关的合并断言）、`tests/test_codex_runtime_events.py`（3 / 4）、
+  `tests/test_dsh_client.py`（1 / 2）。
+- `tests/test_codex_shared_machine.py` 第一次运行时多了 7 个 setup 错误（`WinError 3`，找不到 `pytest-of-<user>\pytest-N`）：
+  这是并行的 pytest 进程共用同一个 basetemp 根目录、互相清理旧编号目录造成的，是测量方式的问题，不是被测代码的问题。
+  该文件已单独串行重跑，表中用的是串行结果（25 failed，与 `--tb=native` 重跑一致）。
+- 归属规则与上一版相同：先按测试文件名匹配（`test_adopt_wrapper`、`test_prepare_wrapper_stage`、`test_relay_update_job`、
+  `test_desktop_remote_ui` 直接测 `deploy/` 脚本，归子项目 5）；文件名没有命中的，按调用栈里最深的仓库内模块归属
   （`deploy/` → 5，`cc_remote/claude_broker|claude_service` → 3，
   `cc_remote/tui*|viewer*|session_messages|timed_tasks|async_tasks|task_*` → 4），
   仍无法判断的（失败只在测试代码里的断言）默认归子项目 2（这类测试都在驱动 Wrapper）。
 - 测试 ID 超过 150 字符的参数化用例做了截断（以 `…]` 结尾）。异常文本里的临时目录替换成 `<tmp>`。
-- 本地 `.venv` 不是按 `requirements*.lock` 建的：`mcp` 为 2.2.0（lock 为 1.28.1，Linux CI 用 lock）。
-  因此 `Server.list_tools` 相关的 62 条失败是本地环境偏差，留在基线里仅作记录。
 - 一个用例同时有 call 失败和 teardown 错误时，两条都列出（标 `[error]` 的是 error）。
+- 机器可读版本见同目录的 `windows-baseline.json`（每条失败一条记录：`nodeid`、`outcome`、`owner`、`root_cause_key`、`first_error_line`）。
+
 
 ## 共性根因（跨子项目）
 
@@ -37,18 +42,71 @@
 | 调用方直接比较 `st_uid`/`st_mode & 0o077` 判私有（未走 `platform.perms.is_private`） | 342 | 2, 3, 4, 5 |
 | 私有状态文件持久化失败（journal/store could not be persisted） | 177 | 2 |
 | 测试数据用 POSIX 绝对路径，Windows 上 `Path.is_absolute()` 为假 | 156 | 2 |
-| 创建符号链接需要特权（WinError 1314，未开开发者模式） | 297 | 2, 3, 4, 5 |
+| 创建符号链接需要特权（WinError 1314，未开开发者模式） | 300 | 2, 3, 4, 5 |
 | `socket.AF_UNIX` / `asyncio.start_unix_server` 不可用 | 75 | 2, 4 |
-| MCP `Server.list_tools` 不存在（本地 venv 装的是 mcp 2.2.0，`requirements*.lock` 锁定 1.28.1；本地环境偏差，与平台无关，按 lock 重建 venv 后应消失） | 62 | 2, 4 |
 | 参数化测试 ID 超过 Windows 环境变量 32767 上限（PYTEST_CURRENT_TEST） | 8 | 2, 4 |
-| 超时（`TimeoutError`） | 57 | 2, 3, 4 |
-| 其余（断言差异、路径分隔符、子进程/可执行文件等，见明细） | 592 | 2, 3, 4, 5 |
+| 超时（`TimeoutError`） | 55 | 2, 3, 4 |
+| 整个测试文件 240 s 内未结束（记为一条） | 3 | 2 |
+| 其余（断言差异、路径分隔符、子进程/可执行文件等，见明细） | 584 | 2, 3, 4, 5 |
 
-## 子项目 1 遗留 — 0 个
+`windows-baseline.json` 里每条记录的 `root_cause_key` 与上表一一对应（未命中的为 `other`）。
+
+## 子项目 1 遗留（需修复）— 0 个
 
 无。所有失败调用栈都不经过 `cc_remote/platform/`。
 
-## 子项目 2（Wrapper 核心）— 1625 个
+## 与上一版对比
+
+| 范围 | 上一版（8fe5746） | 本版（232f19e） | 变化 |
+|---|---|---|---|
+| passed | 4205 | 4286 | +81 |
+| failed | 2181 | 2115 | -66 |
+| errors | 155 | 155 | +0 |
+| skipped | 64 | 65 | +1 |
+| 整体超时的测试文件 | 3 | 3 | +0 |
+| 子项目 1 遗留 | 0 | 0 | +0 |
+| 子项目 2（Wrapper 核心） | 1625 | 1596 | -29 |
+| 子项目 3（IPC/service/broker） | 225 | 225 | +0 |
+| 子项目 4（TUI/viewer/messages） | 239 | 202 | -37 |
+| 子项目 5（安装部署） | 250 | 250 | +0 |
+
+按根因：
+
+| 根因 | 上一版 | 本版 | 变化 |
+|---|---|---|---|
+| `os.O_NOFOLLOW` / `O_DIRECTORY` / `O_NONBLOCK` 等 POSIX open 标志 | 273 | 273 | +0 |
+| `os.getuid` / `geteuid` / `killpg` / `mkfifo` / `pread` / `signal.SIGKILL` 直接调用 | 65 | 65 | +0 |
+| `os.open(目录)` 做目录 fsync → 画像状态迁移失败 | 235 | 235 | +0 |
+| 调用方直接比较 `st_uid`/`st_mode & 0o077` 判私有 | 342 | 342 | +0 |
+| 私有状态文件持久化失败 | 177 | 177 | +0 |
+| 测试数据用 POSIX 绝对路径，Windows 上 `Path.is_absolute()` 为假 | 156 | 156 | +0 |
+| 创建符号链接需要特权 | 297 | 300 | +3 |
+| `socket.AF_UNIX` / `asyncio.start_unix_server` 不可用 | 75 | 75 | +0 |
+| MCP `Server.list_tools` 不存在 | 62 | 0 | -62 |
+| 参数化测试 ID 超过 Windows 环境变量 32767 上限 | 8 | 8 | +0 |
+| 超时 | 57 | 55 | -2 |
+| 整个测试文件 240 s 内未结束 | 3 | 3 | +0 |
+| 其余 | 589 | 584 | -5 |
+
+要点：
+
+- mcp 按 lock 重建后，上一版记为本地环境偏差的 MCP 失败全部消失：`Server.list_tools` 不存在的 62 条，
+  加上 `cannot import name 'RequestContext' from 'mcp.server.lowlevel.server'` 的 3 条（`tests/test_session_messages.py`），共 65 条。
+  按文件：`test_session_messages` 66 → 29（子项目 4），`test_claude_steering` 63 → 46、`test_claude_steer_attachments` 11 → 4（子项目 3），
+  `test_btw_history` 2 → 0、`test_question_batches` 3 → 1（子项目 2）。
+- P1 最终修复波次（`5d2cde8`、`59b0e3b`、`f5df874`）之后另外消失 2 条：
+  `tests/test_history.py::test_history_content_does_not_wait_for_external_ownership_scan`（`TimeoutError`）和
+  `tests/test_work_context.py::test_machine_splits_context_only_for_work`（`FileNotFoundError`）。没有发现因修复波次而新增的失败。
+- 新增 1 条：`tests/test_codex_rich_stream.py::test_codex_delta_bursts_coalesce_before_structural_boundaries`，`--tb=native` 重跑时通过，
+  属于时序不稳定，不是回归。
+- 根因分类的其它变化（用例本身仍失败，只是第一行异常换了类别）：
+  `tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[*]` 3 条原来是 `RequestContext` 导入失败（mcp 漂移），
+  现在越过了导入、撞到创建 `rpc.sock` 符号链接的 WinError 1314（“其余” → 符号链接特权，+3）；
+  `tests/test_claude_service.py::test_real_controller_process_exit_leaves_service_and_accepted_work_alive` 由 `TimeoutError` 变为
+  `assert b'' == b'ready'`（换行省略；超时 → 其余）。
+- 其余共性根因（POSIX open 标志、`getuid`/`killpg` 等、私有判断、持久化、POSIX 绝对路径、AF_UNIX）数量不变，仍待子项目 2–5 处理。
+
+## 子项目 2（Wrapper 核心）— 1596 个
 
 按文件汇总：
 
@@ -68,16 +126,16 @@
 | tests/test_dsh_runtime.py | 37 | cc_remote.wrapper.dsh_client.DshError: DSH 会话目录不可读取，请刷新会话目录。 |
 | tests/test_codex_app_tools.py | 35 | AttributeError: module 'socket' has no attribute 'AF_UNIX' |
 | tests/test_dsh_metadata_recovery.py | 33 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_history.py | 33 | cc_remote.wrapper.codex_process_clocks.CodexProcessClockStoreError: Codex process-clock store could not be persisted |
 | tests/test_codex_npm_ownership.py | 32 | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_dsh_mutations.py | 32 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
+| tests/test_history.py | 32 | cc_remote.wrapper.codex_process_clocks.CodexProcessClockStoreError: Codex process-clock store could not be persisted |
 | tests/test_claude_rate_limits.py | 30 | cc_remote.wrapper.claude_rate_limits.ClaudeRateLimitStoreError: Claude rate-limit cache could not be persisted |
 | tests/test_codex_worktree_fork.py | 28 | cc_remote.wrapper.codex_forks.ForkJournalError: Codex fork journal could not be persisted |
 | tests/test_codex_checkpoints.py | 27 | FileNotFoundError: [Errno 2] No such file or directory: '<tmp>' |
 | tests/test_codex_service.py | 27 | AttributeError: module 'os' has no attribute 'getuid'. Did you mean: 'getpid'? |
 | tests/test_claude_external.py | 26 | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_audio_preview.py | 25 | AssertionError: Regex pattern did not match. |
-| tests/test_codex_shared_machine.py | 25 | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc |
+| tests/test_codex_shared_machine.py | 25 | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc |
 | tests/test_claude_usage.py | 21 | cc_remote.wrapper.claude_rate_limits.ClaudeRateLimitStoreError: Claude rate-limit cache could not be persisted |
 | tests/test_codex_missing_sessions.py | 21 | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_claude_account_isolation.py | 20 | RuntimeError: Claude profile state migration is incomplete |
@@ -88,7 +146,6 @@
 | tests/test_claude_profiles.py | 18 | TimeoutError |
 | tests/test_codex_agent_activity.py | 18 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_dsh_artifact_reads.py | 18 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_claude_steering.py | 17 | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_wrapper_core_fixes.py | 17 | TimeoutError |
 | tests/test_claude_btw_identity.py | 16 | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_codex_launch_barrier.py | 16 | AttributeError: module 'os' has no attribute 'getuid'. Did you mean: 'getpid'? |
@@ -113,7 +170,6 @@
 | tests/test_dsh_interrupt_recovery.py | 8 | cc_remote.wrapper.dsh_client.DshError: DSH 会话目录不可读取，请刷新会话目录。 |
 | tests/test_profile_rollback.py | 8 | cc_remote.wrapper.claude_controls.ClaudeControlStoreError: Claude control store could not be persisted |
 | tests/test_ask_bounds.py | 7 | RuntimeError: Claude profile state migration is incomplete |
-| tests/test_claude_steer_attachments.py | 7 | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_codex_archives.py | 7 | cc_remote.wrapper.codex_archives.CodexArchiveJournalError: Codex archive journal could not be persisted |
 | tests/test_codex_context_settings.py | 7 | cc_remote.wrapper.codex_controls.CodexControlStoreError: Codex control store could not be persisted |
 | tests/test_codex_process_clocks.py | 7 | cc_remote.wrapper.codex_process_clocks.CodexProcessClockStoreError: Codex process-clock store could not be persisted |
@@ -140,9 +196,7 @@
 | tests/test_codex_runtime_events.py | 3 | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_devices.py | 3 | AssertionError: assert (33206 & 511) == 384 |
 | tests/test_dsh_export_scheduling.py | 3 | AssertionError: assert None == 'dsh@root' |
-| tests/test_question_batches.py | 3 | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_turn_changes.py | 3 | AssertionError: assert ('--- src/code.py' in '--- src\\code.py\n+++ src\\code.py\n@@ -1 +1 @@\n-A\n+B\n') |
-| tests/test_btw_history.py | 2 | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_codex_history.py | 2 | assert 647 == 642 |
 | tests/test_dsh_read_timeout.py | 2 | AssertionError: assert (None == 'dsh@other') |
 | tests/test_dsh_sidechats.py | 2 | cc_remote.wrapper.dsh_client.DshError: DSH 会话目录不可读取，请刷新会话目录。 |
@@ -159,6 +213,7 @@
 | tests/test_codex_controls.py | 1 | TIMEOUT: module did not finish within 240 s (also hangs on the pre-change base) |
 | tests/test_codex_daemon_restart.py | 1 | AssertionError: assert (33206 & 511) == 384 |
 | tests/test_codex_generated_images.py | 1 | KeyError: 'preview_id' |
+| tests/test_codex_rich_stream.py | 1 | AssertionError: assert ['a', 'b', 'c', None] == ['a', 'bc', None] |
 | tests/test_codex_rpc.py | 1 | ValueError: invalid POSIX Codex RPC nofile limit |
 | tests/test_codex_session_delete.py | 1 | TIMEOUT: module did not finish within 240 s (also hangs on the pre-change base) |
 | tests/test_codex_worktrees.py | 1 | AssertionError: assert 0 == 1 |
@@ -166,8 +221,8 @@
 | tests/test_dsh_client.py | 1 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_history_continuity.py | 1 | assert False |
 | tests/test_query_queue.py | 1 | RuntimeError: Claude profile state migration is incomplete |
+| tests/test_question_batches.py | 1 | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_spreadsheet_preview.py | 1 | ValueError: 没有权限读取该文件 |
-| tests/test_work_context.py | 1 | FileNotFoundError: [Errno 2] No such file or directory: '<tmp>' |
 | tests/test_wrapper_startup.py | 1 | AssertionError: assert [{'profile': ...ertionError'}] == [{'profile': ...us': 'ready'}] |
 
 明细：
@@ -224,8 +279,6 @@
 | tests/test_audio_preview.py::test_audio_preview_rejects_non_audio_bytes[.webm] | AssertionError: Regex pattern did not match. |
 | tests/test_audio_preview.py::test_audio_preview_rejects_video_riff_and_does_not_truncate | AssertionError: Regex pattern did not match. |
 | tests/test_audio_preview.py::test_work_audio_preview_retains_external_file_authorization_for_symlink_escapes | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
-| tests/test_btw_history.py::test_claude_btw_managed_replay_ignores_pre_echo_background_owner[None] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_btw_history.py::test_claude_btw_managed_replay_ignores_pre_echo_background_owner[previous-input] | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_btw_lifecycle.py::test_sync_destroyed_fork_keeps_history_scope_and_monotonic_readonly_state | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_child_env.py::test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured | AssertionError: assert 'C:\\Users\\x...\\bin\\claude' == 'C:\\Users\\x...\\bin\\claude' |
 | tests/test_child_env.py::test_claude_profiles_use_the_daily_cli_account_metadata[False-native] | RuntimeError: CLAUDE_BIN must be an absolute path |
@@ -296,21 +349,21 @@
 | tests/test_claude_catalog_cwd.py::test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions[-workspace-long-project-component-long-project…] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_catalog_cwd.py::test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions[-workspace-long-project-component-long-project…] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_catalog_cwd.py::test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions[-workspace-long-project-component-long-project…] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
-| tests/test_claude_catalog_cwd.py::test_cwd_recovery_skips_oversized_rows_without_unbounded_allocation | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106830326, file_size=17044734, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_cwd_recovery_skips_oversized_rows_without_unbounded_allocation | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114578636, file_size=17044734, custom_title='Ima… |
 | tests/test_claude_catalog_cwd.py::test_image_session_recovers_full_cwd_from_hashed_project_bucket[legacy-hash] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_catalog_cwd.py::test_image_session_recovers_full_cwd_from_hashed_project_bucket[native-ascii] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_catalog_cwd.py::test_image_session_recovers_full_cwd_from_hashed_project_bucket[native-emoji-hash] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_catalog_cwd.py::test_image_session_recovers_full_cwd_from_hashed_project_bucket[native-emoji-prefix] | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[base64-record-boundary-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106825352, file_size=8389401, custom_title='Imag… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[base64-record-boundary-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106825713, file_size=8389401, custom_title='Imag… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[count-and-total-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106828953, file_size=22371689, custom_title='Ima… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[count-and-total-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106829703, file_size=22371689, custom_title='Ima… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[sdk-window-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106824798, file_size=267465, custom_title='Image… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[sdk-window-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106825043, file_size=267465, custom_title='Image… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[single-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106826195, file_size=16778009, custom_title='Ima… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[single-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106826814, file_size=16778009, custom_title='Ima… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[total-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106827557, file_size=22370601, custom_title='Ima… |
-| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[total-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793106828253, file_size=22370601, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[base64-record-boundary-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114573499, file_size=8389401, custom_title='Imag… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[base64-record-boundary-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114573926, file_size=8389401, custom_title='Imag… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[count-and-total-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114577066, file_size=22371689, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[count-and-total-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114578005, file_size=22371689, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[sdk-window-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114572876, file_size=267465, custom_title='Image… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[sdk-window-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114573103, file_size=267465, custom_title='Image… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[single-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114574423, file_size=16778009, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[single-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114574909, file_size=16778009, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[total-limit-False] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114575424, file_size=22370601, custom_title='Ima… |
+| tests/test_claude_catalog_cwd.py::test_large_image_session_recovers_original_cwd_and_can_be_selected[total-limit-True] | AssertionError: assert (SDKSessionInfo(session_id='11111111-1111-4111-8111-111111111111', summary='Image review', last_modified=1793114576204, file_size=22370601, custom_title='Ima… |
 | tests/test_claude_catalog_cwd.py::test_long_cwd_legacy_hash_requires_explicit_native_root | FileNotFoundError: [WinError 3] 系统找不到指定的路径。: '<tmp>' |
 | tests/test_claude_client_messages.py::test_client_message_alias_is_bound_to_exact_transcript_inode | cc_remote.wrapper.claude_client_messages.ClaudeClientMessageStoreError: Claude client-message store could not be persisted |
 | tests/test_claude_client_messages.py::test_client_message_alias_survives_reopen_and_append | cc_remote.wrapper.claude_client_messages.ClaudeClientMessageStoreError: Claude client-message store could not be persisted |
@@ -511,30 +564,6 @@
 | tests/test_claude_session_fork.py::test_recovery_does_not_require_parent_session_info[submitted-missing] | cc_remote.wrapper.claude_forks.ClaudeForkJournalError: fork cwd must be absolute |
 | tests/test_claude_session_fork.py::test_same_reliable_request_replays_result_without_second_sdk_fork | assert 0 == 1 |
 | tests/test_claude_session_fork.py::test_submitted_marker_is_recovered_without_repeating_sdk_fork | cc_remote.wrapper.claude_forks.ClaudeForkJournalError: fork cwd must be absolute |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[disconnect-False] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[disconnect-True] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[drain_reconnect-False] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[drain_reconnect-True] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[shutdown-False] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_abnormal_turn_files_are_removed_after_native_close[shutdown-True] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steer_attachments.py::test_failed_service_close_keeps_files_for_the_live_native_owner | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[after-False-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[after-False-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[after-True-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[after-True-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before-False-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before-False-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before-True-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before-True-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before_request-False-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before_request-False-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before_request-True-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[before_request-True-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[none-False-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[none-False-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[none-True-origin0] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn[none-True-origin1] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_claude_steering.py::test_background_steering_cancellation_retires_only_pending_input | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_claude_storage_root.py::test_default_claude_root_remains_home_scoped | AssertionError: assert WindowsPath('C:/Users/xuhaodong/.claude') == WindowsPath('<tmp>') |
 | tests/test_claude_usage.py::test_busy_session_read_and_parallel_sessions_share_one_get | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_claude_usage.py::test_disabled_queries_never_inspect_or_run_existing_helper | RuntimeError: Claude profile state migration is incomplete |
@@ -578,10 +607,10 @@
 | tests/test_codex_agents.py::test_only_proven_descendants_in_same_account_can_be_read | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_codex_app_tools.py::test_discovery_rejects_two_matching_apps_and_pid_reuse | AttributeError: module 'os' has no attribute 'getuid'. Did you mean: 'getpid'? |
 | tests/test_codex_app_tools.py::test_discovery_requires_exact_shared_profile[same-ws://127.0.0.1:1234/rpc-True-True] | AttributeError: module 'os' has no attribute 'getuid'. Did you mean: 'getpid'? |
-| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[None] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-24i1__7a\\p\\6bcc9f2f060a2471be8648587be50315cec058b869ebe7ee29b216a10c7a3a31' -> 'C:\\tmp\\cc-app-24i1__7a\\app-server-contr… |
-| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[cross_account] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-kleddi92\\p\\adb202e3d8ae2b0c389dde779added5d41052dfdb1f6e5c9a1a24346f40d417a' -> 'C:\\tmp\\cc-app-kleddi92\\app-server-contr… |
-| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[shared_directory] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-hvg83iwb\\p\\08f1e7d25b110fa2f30b21382f381d4c64bfa320ffd713c11286ba4015d53349' -> 'C:\\tmp\\cc-app-hvg83iwb\\app-server-contr… |
-| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[shared_socket] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-p_aev46s\\p\\ff15ef1419b4bd060a9b7e26db876d71573eb7f6ad9f95481c2c8fb03ddf9670' -> 'C:\\tmp\\cc-app-p_aev46s\\app-server-contr… |
+| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[None] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-c0_o02fu\\p\\21edcb8e2ff22aab4a8bf274e3a6c7c0c6e291726c827adb90577d77966f7874' -> 'C:\\tmp\\cc-app-c0_o02fu\\app-server-contr… |
+| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[cross_account] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-4dtrtd4u\\p\\11b5bc06813f579b6502b71c7c4176a6070388258b0f32a2b5c8a1349a7f1cee' -> 'C:\\tmp\\cc-app-4dtrtd4u\\app-server-contr… |
+| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[shared_directory] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-sy3kpje9\\p\\c588ad36dadfdb3dc8213ad6c1ccf7e82beb15b065c7091ce1743745e28a5b21' -> 'C:\\tmp\\cc-app-sy3kpje9\\app-server-contr… |
+| tests/test_codex_app_tools.py::test_discovery_validates_protected_daemon_alias[shared_socket] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-app-n1rhwvf8\\p\\64488fa328c729a0eeb228786ef7ed2a12fb100c7ee65837e4821b54d0ab194e' -> 'C:\\tmp\\cc-app-n1rhwvf8\\app-server-contr… |
 | tests/test_codex_app_tools.py::test_open_log_marker_must_be_an_app_owned_socket | AssertionError: assert 'None' == '/tmp/codex-b...11111111.sock' |
 | tests/test_codex_app_tools.py::test_private_socket_rejects_world_access_and_symlinks | AttributeError: module 'socket' has no attribute 'AF_UNIX' |
 | tests/test_codex_app_tools.py::test_runtime_update_changes_generation_without_app_or_pipe_restart | AttributeError: module 'os' has no attribute 'getuid'. Did you mean: 'getpid'? |
@@ -598,19 +627,19 @@
 | tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[False-wrong_path] | AttributeError: module 'socket' has no attribute 'AF_UNIX' |
 | tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[False-wrong_peer] | AttributeError: module 'socket' has no attribute 'AF_UNIX' |
 | tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[False-wrong_profile] | AttributeError: module 'socket' has no attribute 'AF_UNIX' |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-None] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-34z0txrc\\p\\10b995dbaddf153862040abfaa7a13ed3f88fda450f73b6915265fbe656988e9' -> 'C:\\tmp\\cc-bridge-34z0txrc\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-ambiguous_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-sr1y5uu2\\p\\d7184ff06ef6d41d39b31bb55edd2f3492347e591ea477068f412399d7d8ea18' -> 'C:\\tmp\\cc-bridge-sr1y5uu2\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-app_reused] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-bq975z7t\\p\\d9b853773453ac8edd85e993b72edec3aab80804fd3b796d9b9759dbba3ac364' -> 'C:\\tmp\\cc-bridge-bq975z7t\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-bridge_reused] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-xf8kz6o0\\p\\8dd90924f0c4a3a20ef8fd2d1b11136e319c30170b05defb6e41314e90b0876a' -> 'C:\\tmp\\cc-bridge-xf8kz6o0\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-duplicate_profile] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-qs4s2tav\\p\\b05e87f809d9600d9258ceaa5cdb97038f59ad27055e3c5eaef138fd8a284510' -> 'C:\\tmp\\cc-bridge-qs4s2tav\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-foreign_owner] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-21yct8bd\\p\\e5bc40950e5a4b89349f88a12575a4218d32183e1e61f2140ec272c52a3251c3' -> 'C:\\tmp\\cc-bridge-21yct8bd\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-linked_daemon] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-le1_rtl4\\p\\9473bdcfe94f063392668bc89d83347009a568626ed87916d61dbebec7edb07e' -> 'C:\\tmp\\cc-bridge-le1_rtl4\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-missing_daemon] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-8cwdnltp\\p\\6bba4a2863fc6c825cf2d176a18542f39175c0505a06b3501d086c1b0aebeb0f' -> 'C:\\tmp\\cc-bridge-8cwdnltp\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-missing_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-gr1ea4w4\\p\\ea180ad4e113554b4bd0c62eefd8a812fb0e6c031aa8d94a2de6948eb827360f' -> 'C:\\tmp\\cc-bridge-gr1ea4w4\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-private_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-7g2ept4o\\p\\d9e0a1ab837cd0660b3513eb509d6cacb6fc7ae330245a53cb07d498b29c28f8' -> 'C:\\tmp\\cc-bridge-7g2ept4o\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_path] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-js67zizy\\p\\568df0bf7284c3ccf156e2949233e82bdf972ae738ed7b0f60e5cf59a4eb032f' -> 'C:\\tmp\\cc-bridge-js67zizy\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_peer] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-5ur1igc0\\p\\7d0b10091d775b7b2c3a7ae6cc22abe35cd948e6a8fa1ea78eb05da6b77a031e' -> 'C:\\tmp\\cc-bridge-5ur1igc0\\app-server… |
-| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_profile] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-xakzk84l\\p\\1f58dce6ca3ab75b318c9b039a079e553acae6d7e5997326857282848d7766d6' -> 'C:\\tmp\\cc-bridge-xakzk84l\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-None] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-nboors9f\\p\\21001112ee9d9d5ff1997a61b927f19870cc0dd62ee4af488d36b700d63a46f5' -> 'C:\\tmp\\cc-bridge-nboors9f\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-ambiguous_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-51qbr16g\\p\\9d6cd46448f839dc1f65e5779e2e6255d0e7b111c4ad2457735a2a0c524ce166' -> 'C:\\tmp\\cc-bridge-51qbr16g\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-app_reused] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-fpe6um40\\p\\c6dcd31d757cf7b8a049cf8d992bec2aa895e0795a70e77cfa721661a73e43af' -> 'C:\\tmp\\cc-bridge-fpe6um40\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-bridge_reused] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-jdvmb0q3\\p\\453bf551d73938bd4975e9cd2d333a319d16cac94825e1578fc4d497a890f13d' -> 'C:\\tmp\\cc-bridge-jdvmb0q3\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-duplicate_profile] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-_al0gjwx\\p\\80e9c9c9f380affef947af4d2326c74fb17d6f0c86c18d73b9aefe8022e41c93' -> 'C:\\tmp\\cc-bridge-_al0gjwx\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-foreign_owner] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-yvsbe9q9\\p\\8d41397cc61f88dbb8a75be5d10606b546f8c9732324417402948b9718a9be65' -> 'C:\\tmp\\cc-bridge-yvsbe9q9\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-linked_daemon] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-jxqt3ktj\\p\\1b8e6fd7795a8248d7310270e0bafff0fa21035aaa1c43f79e97c157024d4959' -> 'C:\\tmp\\cc-bridge-jxqt3ktj\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-missing_daemon] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-9dzcqxwq\\p\\b0932cccb0cc9300c0b4102e7a157ffaf6c8aaa65289c7be049325b0e21df11f' -> 'C:\\tmp\\cc-bridge-9dzcqxwq\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-missing_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-aocfq2rp\\p\\efe4c9e8fb7cf86f2cb3412a1d70e8e7cf46ed6bc9bf34c99d368f4555bc0945' -> 'C:\\tmp\\cc-bridge-aocfq2rp\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-private_listener] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-gmzzuy9y\\p\\e33ecf3e7562269d432e2132142b4a5f7dabbbd399a1c4bf1754985357c217bf' -> 'C:\\tmp\\cc-bridge-gmzzuy9y\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_path] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-p7jh0q7y\\p\\3791c1a548ed2cbd9fddafdd2229526d6eeccd2179381acdb3d4506b8090c64f' -> 'C:\\tmp\\cc-bridge-p7jh0q7y\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_peer] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-zpppsqa_\\p\\3a301baea8ab11874bdb3ea916d82ede3ce3de51f7d6f63bb5bc397414ca3e60' -> 'C:\\tmp\\cc-bridge-zpppsqa_\\app-server… |
+| tests/test_codex_app_tools.py::test_shared_app_requires_profile_bound_bridge_and_both_connection_ends[True-wrong_profile] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-bridge-g4h00bjc\\p\\655320ebfab8aca848ccac5cc3fd7f2198ad2fda20e17b9a906bc4426afb002b' -> 'C:\\tmp\\cc-bridge-g4h00bjc\\app-server… |
 | tests/test_codex_archives.py::test_byte_bound_batch_evicts_without_reserializing_whole_journal | cc_remote.wrapper.codex_archives.CodexArchiveJournalError: Codex archive journal could not be persisted |
 | tests/test_codex_archives.py::test_byte_bound_evicts_oldest_terminal_entry_and_survives_restart | cc_remote.wrapper.codex_archives.CodexArchiveJournalError: Codex archive journal could not be persisted |
 | tests/test_codex_archives.py::test_byte_bound_fails_without_mutating_when_no_terminal_entry_is_evictable | cc_remote.wrapper.codex_archives.CodexArchiveJournalError: Codex archive journal could not be persisted |
@@ -740,7 +769,7 @@
 | tests/test_codex_desktop.py::test_lock_rejects_symlink_and_writable_file | cc_remote.codex_desktop.LaunchError: 共享入口的状态目录不是当前用户的私有目录。 |
 | tests/test_codex_desktop.py::test_lock_survives_stale_inode_and_serializes_profiles | cc_remote.codex_desktop.LaunchError: 共享入口的状态目录不是当前用户的私有目录。 |
 | tests/test_codex_desktop.py::test_real_proxy_roundtrip_and_reject_self_after_preflight[False] | NotImplementedError |
-| tests/test_codex_desktop.py::test_real_proxy_roundtrip_and_reject_self_after_preflight[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-launch-6a7_n36y\\p\\319534deb2b7e6e4198baf24a3c0a367833dd188fe46eb765f5f8add5ec74610' -> 'C:\\tmp\\cc-launch-6a7_n36y\\app-server… |
+| tests/test_codex_desktop.py::test_real_proxy_roundtrip_and_reject_self_after_preflight[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\cc-launch-vo8rignx\\p\\4a9a36345e52cd19a2511a625aa7f502efbae5f8e218c3594c3ccc1fb89b515b' -> 'C:\\tmp\\cc-launch-vo8rignx\\app-server… |
 | tests/test_codex_external.py::test_active_passive_writer_prevents_orphan_timeout_until_writer_exits | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_codex_external.py::test_codex_app_server_client_socket_routes_implicit_profile_home | AssertionError: assert (False, None) == (True, 'C:\\U...control.sock') |
 | tests/test_codex_external.py::test_codex_app_server_proxy_socket_requires_one_absolute_socket | AssertionError: assert None == 'C:\\tmp\\codex-stack.sock' |
@@ -985,6 +1014,7 @@
 | tests/test_codex_readiness.py::test_proxy_probe_only_initializes_and_reaps_child[success] | NotImplementedError |
 | tests/test_codex_readiness.py::test_receipt_fences_physical_replacement_behind_native_alias[native-alias] [error] | failed on setup with "AttributeError: module 'socket' has no attribute 'AF_UNIX'" |
 | tests/test_codex_readiness.py::test_receipt_fences_physical_replacement_behind_native_alias[socket] [error] | failed on setup with "AttributeError: module 'socket' has no attribute 'AF_UNIX'" |
+| tests/test_codex_rich_stream.py::test_codex_delta_bursts_coalesce_before_structural_boundaries | AssertionError: assert ['a', 'b', 'c', None] == ['a', 'bc', None] |
 | tests/test_codex_rollback_integration.py::test_checkpoint_quarantine_failure_blocks_native_conversation_rollback | RuntimeError: coroutine raised StopIteration |
 | tests/test_codex_rollback_integration.py::test_combined_rollback_retires_checkpoint_before_native_history_mutation | assert [] == [(2, False)] |
 | tests/test_codex_rollback_integration.py::test_committed_turn_only_warns_when_untracked_baseline_changes[False] | FileNotFoundError: [Errno 2] No such file or directory: '<tmp>' |
@@ -1066,21 +1096,21 @@
 | tests/test_codex_shared_machine.py::test_lease_rebind_retry_uses_last_durable_message_id | AssertionError: assert None == 'message-a' |
 | tests/test_codex_shared_machine.py::test_managed_terminal_retries_initial_alias_before_releasing_lease | AssertionError: assert CodexTurnLease(session_id='sid', turn_id='owned-turn', msg_id='logical-message', initial_msg_id='logical-message', daemon_epoch=None, automatic=False, stream… |
 | tests/test_codex_shared_machine.py::test_query_waits_for_restart_ready_before_reconnecting | RuntimeError: Codex profile state migration is incomplete |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_binds_control_turn_to_exact_active_rollout_task | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-6xubumej' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_continues_aborted_goal_with_distinct_rollout_id | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-tt6f_slj' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-i6cxhgqd' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_hands_active_old_generation_to_new_daemon | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-ndkc5gux' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_keeps_lease_when_stream_witness_is_incomplete | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-varybkh6' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_reclaims_only_leased_active_daemon_turn | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-sockbau2' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_goal_with_distinct_rollout_turn_id | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-3allgoig' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_large_steered_turn_from_durable_binding | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-b3itejof' |
-| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_split_turn_without_tail_lifecycle_marker | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-m7io5980' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_binds_control_turn_to_exact_active_rollout_task | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-bt52a8d1' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_continues_aborted_goal_with_distinct_rollout_id | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-frw813fk' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-ov6h31uc' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_hands_active_old_generation_to_new_daemon | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-1gk33war' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_keeps_lease_when_stream_witness_is_incomplete | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-3ixj050z' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_reclaims_only_leased_active_daemon_turn | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-l7wg2rs5' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_goal_with_distinct_rollout_turn_id | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-vn6n2l1g' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_large_steered_turn_from_durable_binding | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-_mr0rg5i' |
+| tests/test_codex_shared_machine.py::test_restarted_wrapper_recovers_split_turn_without_tail_lifecycle_marker | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-axkizs7a' |
 | tests/test_codex_shared_machine.py::test_stdio_work_keeps_legacy_terminal_mutex_and_read_only_state | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_codex_shared_machine.py::test_unmarked_daemon_generation_persists_a_recoverable_turn_lease | AssertionError: assert None == 'owned-turn' |
 | tests/test_codex_shared_machine.py::test_unmarked_process_generation_swap_reconnects_before_query | AssertionError: assert 0 == 1 |
-| tests/test_codex_shared_machine.py::test_wrapper_startup_restores_background_owned_turns | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\cc-remote-test-pjj8z057' |
+| tests/test_codex_shared_machine.py::test_wrapper_startup_restores_background_owned_turns | PermissionError: [Errno 13] Permission denied: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-1f6a38a7\\cc-remote-test-lz5h49dx' |
 | tests/test_codex_spontaneous_stream.py::test_active_history_adds_official_alias_without_replacing_live_id | cc_remote.wrapper.codex_client_messages.CodexClientMessageStoreError: Codex client-message store could not be persisted |
-| tests/test_codex_spontaneous_stream.py::test_cross_turn_identity_retries_when_rollout_path_appears_late | AssertionError: assert {'native-dela...022E88B7B1C0>} == {} |
+| tests/test_codex_spontaneous_stream.py::test_cross_turn_identity_retries_when_rollout_path_appears_late | AssertionError: assert {'native-dela...0280AC98E020>} == {} |
 | tests/test_codex_spontaneous_stream.py::test_machine_deduplicates_cli_thread_catalog_hints_across_handles | assert 0 == 1 |
 | tests/test_codex_spontaneous_stream.py::test_machine_persists_cross_turn_steer_identity_and_refreshes_history | cc_remote.wrapper.codex_client_messages.CodexClientMessageStoreError: Codex client-message store is not a private bounded file |
 | tests/test_codex_spontaneous_stream.py::test_machine_persists_split_initial_query_identity | assert False |
@@ -1410,9 +1440,9 @@
 | tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[create-claude] | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[create-codex] | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[create-dsh] | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-claude] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2222164230896'>), buffer=<cc_...k object at 0x000… |
-| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-codex] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2222160365952'>), buffer=<cc_...k object at 0x000… |
-| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-dsh] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2222159177984'>), buffer=<cc_...k object at 0x000… |
+| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-claude] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2875435453808'>), buffer=<cc_...k object at 0x000… |
+| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-codex] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2875435389952'>), buffer=<cc_...k object at 0x000… |
+| tests/test_dsh_residency.py::test_dsh_uses_idle_capacity_from_any_engine[switch-dsh] | AssertionError: assert ('dsh@existing' in {'focused': SessionContext(session_id='focused', sdk=namespace(disconnect=<AsyncMock id='2875435389952'>), buffer=<cc_...k object at 0x000… |
 | tests/test_dsh_runtime.py::test_absolute_path_prompt_is_not_a_native_command | cc_remote.wrapper.dsh_client.DshError: DSH 会话目录不可读取，请刷新会话目录。 |
 | tests/test_dsh_runtime.py::test_cold_context_uses_native_projection_and_compaction_without_starting_an_agent | AttributeError: 'Error' object has no attribute 'available' |
 | tests/test_dsh_runtime.py::test_cold_history_and_switch_do_not_follow_or_activate_agent | AssertionError: assert None == 'dsh@cold' |
@@ -1494,7 +1524,6 @@
 | tests/test_history.py::test_fresh_hello_replays_only_current_inflight_turn_after_snapshot | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_history.py::test_hello_sends_snapshots_and_control_state_without_replay_flood | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_history.py::test_hello_with_cursor_replays_only_missing_tail | RuntimeError: Claude profile state migration is incomplete |
-| tests/test_history.py::test_history_content_does_not_wait_for_external_ownership_scan | TimeoutError |
 | tests/test_history.py::test_image_read_fallback_clears_provisional_preview_candidate | AssertionError: assert False |
 | tests/test_history.py::test_incomplete_codex_plan_is_not_rebound_without_matching_owner | cc_remote.wrapper.session_plans.SessionPlanStoreError: session plan store could not be persisted |
 | tests/test_history.py::test_live_codex_process_clock_starts_only_on_first_visible_process | cc_remote.wrapper.codex_process_clocks.CodexProcessClockStoreError: Codex process-clock store is not a private bounded file |
@@ -1610,8 +1639,6 @@
 | tests/test_profile_rollback.py::test_snapshot_refuses_symlinks[viewer-pages.json] | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_query_queue.py::test_replacement_priority_cancel_and_hello_projection_are_authoritative | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_question_batches.py::test_batch_rejects_partial_invalid_and_wrong_client_without_advancing | RuntimeError: Claude profile state migration is incomplete |
-| tests/test_question_batches.py::test_mcp_batch_runs_through_machine_and_returns_ordered_answers | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_question_batches.py::test_real_mcp_handler_accepts_legacy_and_batch_and_rejects_mixed_input | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_reliability_edges.py::test_cached_create_response_tracks_temp_to_real_rekey | RuntimeError: Claude profile state migration is incomplete |
 | tests/test_reliability_edges.py::test_client_hello_does_not_prebind_frames_before_latest_steer | RuntimeError: Codex profile state migration is incomplete |
 | tests/test_reliability_edges.py::test_client_hello_does_not_retarget_another_clients_ring_frame | RuntimeError: Claude profile state migration is incomplete |
@@ -1766,21 +1793,20 @@
 | tests/test_turn_changes.py::test_relative_paths_are_cwd_scoped_and_renames_do_not_duplicate_files | ValueError: too many values to unpack (expected 1) |
 | tests/test_turn_file_pages.py::test_file_pages_and_diffs_are_scoped_and_immutable_after_later_edits | TypeError: 'NoneType' object is not subscriptable |
 | tests/test_turn_file_pages.py::test_pre_normalization_archives_still_support_pages_and_rekey_cleanup | TypeError: 'NoneType' object is not subscriptable |
-| tests/test_work_context.py::test_machine_splits_context_only_for_work | FileNotFoundError: [Errno 2] No such file or directory: '<tmp>' |
 | tests/test_workspace_browser.py::test_code_can_browse_parents_absolute_paths_home_and_external_files | AttributeError: module 'os' has no attribute 'O_DIRECTORY' |
 | tests/test_workspace_browser.py::test_code_external_browsing_still_rejects_symlinks_and_special_files | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_workspace_browser.py::test_directory_handler_allows_code_parent_but_keeps_work_boundary[code] | AttributeError: module 'os' has no attribute 'O_DIRECTORY' |
 | tests/test_workspace_browser.py::test_directory_navigation_paging_and_hidden_files | AttributeError: module 'os' has no attribute 'O_DIRECTORY' |
 | tests/test_workspace_browser.py::test_escape_symlinks_special_files_and_changed_page_are_rejected | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
-| tests/test_workspaces.py::WorkRegistryTests::test_artifacts_list_only_user_deliverables_inside_private_workspace | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\tmpt8wtbqr4\\outside.txt' -> '<tmp>' |
+| tests/test_workspaces.py::WorkRegistryTests::test_artifacts_list_only_user_deliverables_inside_private_workspace | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-8d08f14a\\tmpt42iuimi\\outside.txt' -> '<tmp>' |
 | tests/test_workspaces.py::WorkRegistryTests::test_claude_policy_copies_only_runtime_provider_settings | AssertionError: 438 != 384 |
 | tests/test_workspaces.py::WorkRegistryTests::test_claude_policy_refreshes_a_rotated_oauth_token | AssertionError: 438 != 384 |
-| tests/test_workspaces.py::WorkRegistryTests::test_deleting_running_schedule_defers_cleanup_until_completion | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\tmpt6qcqeqq\\provider\\work\\registry.sqlite3' |
-| tests/test_workspaces.py::WorkRegistryTests::test_legacy_schedule_profile_backfill_is_topology_independent | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\tmp8lw3f3o3\\provider\\work\\legacy-codex\\registry.sqli… |
-| tests/test_workspaces.py::WorkRegistryTests::test_legacy_schema_migration_is_safe_under_concurrent_initialize | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\tmpt7y29tyx\\provider\\work\\registry.sqlite3' |
+| tests/test_workspaces.py::WorkRegistryTests::test_deleting_running_schedule_defers_cleanup_until_completion | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-8d08f14a\\tmpvb6m4lzw\\provider\\work\\registry.sqlite3' |
+| tests/test_workspaces.py::WorkRegistryTests::test_legacy_schedule_profile_backfill_is_topology_independent | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-8d08f14a\\tmpdyvckukd\\provider\\work\\legacy-codex\\registry.sqli… |
+| tests/test_workspaces.py::WorkRegistryTests::test_legacy_schema_migration_is_safe_under_concurrent_initialize | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-8d08f14a\\tmpvpdfaqab\\provider\\work\\registry.sqlite3' |
 | tests/test_workspaces.py::WorkRegistryTests::test_new_session_creates_private_uploads_inside_workspace | AssertionError: 511 != 448 |
 | tests/test_workspaces.py::WorkRegistryTests::test_project_sources_plugins_are_materialized_into_private_session | AssertionError: 511 != 448 |
-| tests/test_workspaces.py::WorkRegistryTests::test_repeated_initialize_does_not_rebuild_profile_identity_index | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-98219f0c\\tmp0f0_6lma\\provider\\work\\registry.sqlite3' |
+| tests/test_workspaces.py::WorkRegistryTests::test_repeated_initialize_does_not_rebuild_profile_identity_index | PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'C:\\Users\\XUHAOD~1\\AppData\\Local\\Temp\\codeg-acp\\18072-8d08f14a\\tmpj7ixkj9z\\provider\\work\\registry.sqlite3' |
 | tests/test_wrapper_core_fixes.py::test_background_job_scan_caps_entries_and_state_file_size | AssertionError: assert set() == {'session-valid'} |
 | tests/test_wrapper_core_fixes.py::test_bounded_subprocess_discards_residual_output_without_communicate | AttributeError: <module 'os' (frozen)> has no attribute 'killpg' |
 | tests/test_wrapper_core_fixes.py::test_bounded_subprocess_output_has_wall_clock_timeout | AttributeError: module 'signal' has no attribute 'SIGKILL'. Did you mean: 'SIGILL'? |
@@ -1938,7 +1964,7 @@
 | tests/test_claude_service.py::test_overlapping_buffered_background_turns_keep_each_unacknowledged_prefix | PermissionError: Claude service directory must be private and owned by this user |
 | tests/test_claude_service.py::test_pending_permission_keeps_its_future_until_replacement_answers | PermissionError: Claude service directory must be private and owned by this user |
 | tests/test_claude_service.py::test_private_socket_registration_and_explicit_override | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_claude_service.py::test_real_controller_process_exit_leaves_service_and_accepted_work_alive | TimeoutError |
+| tests/test_claude_service.py::test_real_controller_process_exit_leaves_service_and_accepted_work_alive | AssertionError: assert b'' == b'ready\n' |
 | tests/test_claude_service.py::test_reattachment_schedules_ask_refresh_without_session_messaging | PermissionError: Claude service directory must be private and owned by this user |
 | tests/test_claude_service.py::test_running_query_and_offline_terminal_survive_wrapper_disconnect | PermissionError: Claude service directory must be private and owned by this user |
 | tests/test_claude_service_callbacks.py::test_callback_answer_timeout_resends_same_result_without_rerunning_handler[mcp] | PermissionError: Claude service directory must be private and owned by this user |
@@ -2055,22 +2081,22 @@
 | tests/test_manual_compaction.py::test_manual_claude_compact_commits_service_and_next_message_is_accepted[missing-boundary] | PermissionError: Claude service directory must be private and owned by this user |
 | tests/test_manual_compaction.py::test_manual_claude_compact_commits_service_and_next_message_is_accepted[success] | PermissionError: Claude service directory must be private and owned by this user |
 
-## 子项目 4（TUI/viewer/messages）— 239 个
+## 子项目 4（TUI/viewer/messages）— 202 个
 
 按文件汇总：
 
 | 测试文件 | 失败数 | 主要原因 |
 |---|---|---|
 | tests/test_async_tasks.py | 72 | ValueError: Task state directory must be private and owned by this user |
-| tests/test_session_messages.py | 66 | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_viewer.py | 45 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
+| tests/test_session_messages.py | 29 | ValueError: Message state must be a private directory owned by this user |
 | tests/test_tui_tab_store.py | 15 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_viewer_home.py | 11 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_tui_review_delivery.py | 8 | AttributeError: module 'os' has no attribute 'O_NONBLOCK' |
 | tests/test_task_refresh.py | 4 | ValueError: Custom task MCP launcher; automatic refresh is not supported |
 | tests/test_tui_mermaid.py | 4 | failed on setup with "ValueError: the environment variable is longer than 32767 characters" |
 | tests/test_timed_tasks.py | 3 | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
-| tests/test_tui_launcher.py | 3 | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\scripts\\cc-remote-tui' -> '<tmp>' |
+| tests/test_tui_launcher.py | 3 | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\scripts\\cc-remote-tui' -> '<tmp>' |
 | tests/test_tui_diagram_families.py | 2 | failed on setup with "ValueError: the environment variable is longer than 32767 characters" |
 | tests/test_tui_markdown.py | 2 | AssertionError: assert ('╭' in '┌────────────────────────────────────────────────────────────┬───────┐\n│ Name           |
 | tests/test_claude_profiles.py | 1 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
@@ -2124,9 +2150,9 @@
 | tests/test_async_tasks.py::test_legacy_reconciliation_has_one_deadline_and_final_read[interrupted-failed] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_legacy_reconciliation_has_one_deadline_and_final_read[interrupted-unknown] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_lifetime_lock_and_detached_worker_survive_mcp_parent | ValueError: Task state directory must be private and owned by this user |
-| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[app_server] | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
-| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[legacy] | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
-| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[model_call] | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
+| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[app_server] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-5jkuv2dj\\rpc.sock' -> '<tmp>' |
+| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[legacy] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-pg91nv8i\\rpc.sock' -> '<tmp>' |
+| tests/test_async_tasks.py::test_mcp_tools_bind_native_caller_and_reject_target_override[model_call] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-wx5sv05g\\rpc.sock' -> '<tmp>' |
 | tests/test_async_tasks.py::test_native_task_receipt_projection | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_native_timeout_wins_before_local_deadline_poll[0-0.9995-False-completed] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_native_timeout_wins_before_local_deadline_poll[124-0.2-False-failed] | ValueError: Task state directory must be private and owned by this user |
@@ -2136,7 +2162,7 @@
 | tests/test_async_tasks.py::test_official_history_keeps_task_receipt_and_native_identity | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_pre_submission_disconnect_retains_pending_without_executing | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_production_socket_transport_uses_only_owned_existing_daemon[False] | ValueError: Codex socket parent is not private to its owner |
-| tests/test_async_tasks.py::test_production_socket_transport_uses_only_owned_existing_daemon[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-wire-3txcbrfz\\p\\5a8c08ba20c0d90fa02aeb73ec81b8f2d8ab91f29f1b053ab90e29aab3cc319b' -> 'C:\\tmp\\crt-wire-3txcbrfz\\app-server-c… |
+| tests/test_async_tasks.py::test_production_socket_transport_uses_only_owned_existing_daemon[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-wire-esok2pe1\\p\\7571afbe10bdd0bf86a34e2c817dc7d9090d8708dc853962d0edd06325be0b26' -> 'C:\\tmp\\crt-wire-esok2pe1\\app-server-c… |
 | tests/test_async_tasks.py::test_real_stdio_mcp_protocol_and_native_call_metadata[app_server] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_real_stdio_mcp_protocol_and_native_call_metadata[legacy] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_real_stdio_mcp_protocol_and_native_call_metadata[model_call] | ValueError: Task state directory must be private and owned by this user |
@@ -2149,15 +2175,12 @@
 | tests/test_async_tasks.py::test_reconciliation_never_guesses_receipt_identity_or_replays_delivery[unknown-] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_recovery_does_not_reexecute_running_or_resend_unknown | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_submission_idempotency_limits_and_private_state | ValueError: Task state directory must be private and owned by this user |
-| tests/test_async_tasks.py::test_timeout_output_bound_and_explicit_rejection | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-nj1bpcrv\\rpc.sock' -> '<tmp>' |
+| tests/test_async_tasks.py::test_timeout_output_bound_and_explicit_rejection | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\tmp\\crt-00_jorvn\\rpc.sock' -> '<tmp>' |
 | tests/test_async_tasks.py::test_unconfirmed_callback_is_retained_with_bounded_tracking[history] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_unconfirmed_callback_is_retained_with_bounded_tracking[malformed] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_unconfirmed_callback_is_retained_with_bounded_tracking[rpc] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_async_tasks.py::test_unconfirmed_callback_is_retained_with_bounded_tracking[socket] | ValueError: Task state directory must be private and owned by this user |
 | tests/test_claude_profiles.py::test_claude_profile_transitions_migrate_viewer_scopes_once | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_session_messages.py::test_ask_schema_refresh_does_not_require_session_messaging | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_attached_claude_refreshes_actual_tool_list_and_preserves_ask[False] | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
-| tests/test_session_messages.py::test_attached_claude_refreshes_actual_tool_list_and_preserves_ask[True] | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[autonomous-claude] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[human_queue-claude] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[human_queue-codex] | ValueError: Message state must be a private directory owned by this user |
@@ -2167,26 +2190,14 @@
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[terminal_drain-codex] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[turn-claude] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_busy_message_waits_for_real_boundary_without_interrupt[turn-codex] | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_claude_bound_mcp_and_live_echo | ImportError: cannot import name 'RequestContext' from 'mcp.server.lowlevel.server' (C:\Users\xuhaodong\work\cc-remote-p1\.venv\Lib\site-packages\mcp\server\lowlevel\server.py) |
 | tests/test_session_messages.py::test_cli_ownership_adopted_during_preflight_rejects_without_sending | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_cold_target_resumes_exact_account_without_focus_or_bootstrap[claude] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_cold_target_resumes_exact_account_without_focus_or_bootstrap[codex] | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_connected_message_tools_do_not_hide_a_missing_ask_tool[ask_user-False] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_connected_message_tools_do_not_hide_a_missing_ask_tool[ask_user-True] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_connected_message_tools_do_not_hide_a_missing_ask_tool[set_mode-False] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_connected_message_tools_do_not_hide_a_missing_ask_tool[set_mode-True] | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_corrupt_ack_is_unknown_not_a_rejection | AttributeError: module 'asyncio' has no attribute 'start_unix_server'. Did you mean: 'start_server'? |
-| tests/test_session_messages.py::test_disabled_ask_cannot_mask_missing_dedicated_message_tools | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_disabled_ask_does_not_block_independent_message_refresh[None] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_disabled_ask_does_not_block_independent_message_refresh[cc_remote_messages] | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_dispatch_uses_existing_lane_and_exact_target_once[claude] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_dispatch_uses_existing_lane_and_exact_target_once[codex] | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_failed_refresh_marker_does_not_disable_anything | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_failed_sdk_route_can_be_repaired_without_restarting_claude | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_inbox_claim_is_crash_safe_bounded_and_erases_delivered_payload | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_lost_native_ack_stays_unknown_and_never_repeats | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_lost_toggle_off_ack_always_restores_ask_and_remains_retryable | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_message_delivery_refreshes_independent_route_with_ask_disabled | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_missing_tools_retry_stays_queued_without_a_native_write | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_native_launch_fence_requeues_only_proven_unsent_input | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_no_send_for_ineligible_target[btw] | ValueError: Message state must be a private directory owned by this user |
@@ -2194,33 +2205,11 @@
 | tests/test_session_messages.py::test_no_send_for_ineligible_target[external] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_no_send_for_ineligible_target[work] | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_no_send_for_ineligible_target[wrong_engine] | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_optional_tool_refresh_does_not_block_ordinary_chat_with_background_work | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_ordinary_chat_recovers_pending_refresh_after_messaging_opt_out | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_ask_toggle_is_restored_even_with_independent_messaging | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_message_refresh_can_finish_after_messaging_is_disabled[absent] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_message_refresh_can_finish_after_messaging_is_disabled[connected] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_message_refresh_can_finish_after_messaging_is_disabled[disabled] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_message_refresh_can_finish_after_messaging_is_disabled[failed] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_pending_message_refresh_can_finish_after_messaging_is_disabled[pending] | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_queued_inbox_recovers_after_wrapper_restart_in_fifo_order | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_queued_target_is_revalidated_before_delivery | ValueError: Message state must be a private directory owned by this user |
 | tests/test_session_messages.py::test_real_stdio_mcp_binds_codex_metadata_and_private_socket | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_refresh_does_not_enable_a_previously_disabled_or_unready_server[disabled] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_refresh_does_not_enable_a_previously_disabled_or_unready_server[pending] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_refresh_intent_survives_controller_loss_between_off_and_on | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_restart_only_replays_queued_never_inflight_even_with_remaining_body | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_restore_pending_message_toggle_before_refreshing_separate_ask | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_retiring_pending_message_route_retains_intent_until_confirmed[marker_ack] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_retiring_pending_message_route_retains_intent_until_confirmed[missing_status] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_retiring_pending_message_route_retains_intent_until_confirmed[off_ack] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_retiring_pending_message_route_retains_intent_until_confirmed[still_connected] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_sdk_injects_message_server_only_into_code | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_session_messages.py::test_store_survives_restart_conflicts_and_caller_isolation | ValueError: Message state must be a private directory owned by this user |
-| tests/test_session_messages.py::test_tool_refresh_never_crosses_native_turn_or_pending_callback[_autonomous_steer_root] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_tool_refresh_never_crosses_native_turn_or_pending_callback[_background_callbacks_pending] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_tool_refresh_never_crosses_native_turn_or_pending_callback[_turn_active] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_tool_refresh_never_crosses_native_turn_or_pending_callback[_turn_consumer_active] | AttributeError: 'Server' object has no attribute 'list_tools' |
-| tests/test_session_messages.py::test_unknown_pending_route_is_not_cleared_or_toggled | AttributeError: 'Server' object has no attribute 'list_tools' |
 | tests/test_task_refresh.py::test_native_version_conflict_does_not_overwrite_or_retry | ValueError: Custom task MCP launcher; automatic refresh is not supported |
 | tests/test_task_refresh.py::test_no_thread_reports_only_requested_not_verified | ValueError: Custom task MCP launcher; automatic refresh is not supported |
 | tests/test_task_refresh.py::test_same_release_does_not_rewrite_config_but_still_verifies | ValueError: Custom task MCP launcher; automatic refresh is not supported |
@@ -2231,9 +2220,9 @@
 | tests/test_tui_clipboard_chrome.py::test_clipboard_helper_output_exit_timeout_and_cancellation | AssertionError: assert b'ok\r\n' == b'ok\n' |
 | tests/test_tui_diagram_families.py::test_limits_fail_closed[graph TB\nAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…] | failed on setup with "ValueError: the environment variable is longer than 32767 characters" |
 | tests/test_tui_diagram_families.py::test_limits_fail_closed[graph TB\nAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…] | failed on teardown with "ValueError: the environment variable is longer than 32767 characters" |
-| tests/test_tui_launcher.py::test_launcher_uses_own_checkout_from_unrelated_cwd | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\scripts\\cc-remote-tui' -> '<tmp>' |
-| tests/test_tui_launcher.py::test_launcher_with_bsd_readlink_and_chained_symlinks[False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\scripts\\cc-remote-tui' -> '<tmp> with spaces\\inner' |
-| tests/test_tui_launcher.py::test_launcher_with_bsd_readlink_and_chained_symlinks[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\scripts\\cc-remote-tui' -> '<tmp> with spaces\\inner' |
+| tests/test_tui_launcher.py::test_launcher_uses_own_checkout_from_unrelated_cwd | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\scripts\\cc-remote-tui' -> '<tmp>' |
+| tests/test_tui_launcher.py::test_launcher_with_bsd_readlink_and_chained_symlinks[False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\scripts\\cc-remote-tui' -> '<tmp> with spaces\\inner' |
+| tests/test_tui_launcher.py::test_launcher_with_bsd_readlink_and_chained_symlinks[True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\scripts\\cc-remote-tui' -> '<tmp> with spaces\\inner' |
 | tests/test_tui_local.py::test_different_user_service_is_not_read | AttributeError: module 'os' has no attribute 'O_DIRECTORY' |
 | tests/test_tui_markdown.py::test_folded_markdown_progress_keeps_tool_styles_and_navigation | AssertionError: assert ('progress explanation' in '── You ──  [1970-01-01 08:16:40 · completed · duration unavailable]\nquestion\n\n── Turn details ▾ ──  [Enter]\n\n── ...   │\n└──… |
 | tests/test_tui_markdown.py::test_tables_keep_all_columns_values_and_link_targets[70] | AssertionError: assert ('╭' in '┌────────────────────────────────────────────────────────────┬───────┐\n│ Name                                       ...─────┴───────┘\nhttps://exam… |
@@ -2329,7 +2318,7 @@
 | 测试文件 | 失败数 | 主要原因 |
 |---|---|---|
 | tests/test_update.py | 66 | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp> wrapper\\releases\\old' -> '<tmp> wrapper\\current' |
-| tests/test_install_commit.py | 42 | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py | 42 | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
 | tests/test_deploy_cleanup.py | 41 | failed on setup with "OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>'" |
 | tests/test_deploy.py | 18 | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_profile_rollback.py | 17 | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
@@ -2370,12 +2359,12 @@
 | tests/test_deploy.py::test_post_switch_activation_commits_or_restores_full_release_caddy_and_unit[source-success] | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_deploy.py::test_relay_retention_setup_failure_keeps_the_prepared_release[backup-error] | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
 | tests/test_deploy.py::test_relay_retention_setup_failure_keeps_the_prepared_release[interrupted-copy] | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
-| tests/test_deploy.py::test_release_permissions_remove_inherited_group_write_and_other_access | subprocess.CalledProcessError: Command '['bash', '-c', 'source "$1"; harden_release_permissions "$2"', 'permission-test', 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\deploy\\setup_t… |
+| tests/test_deploy.py::test_release_permissions_remove_inherited_group_write_and_other_access | subprocess.CalledProcessError: Command '['bash', '-c', 'source "$1"; harden_release_permissions "$2"', 'permission-test', 'C:\\Users\\xuhaodong\\work\\cc-remote\\deploy\\setup_tran… |
 | tests/test_deploy.py::test_release_snapshot_rejects_boolean_manifest_version | PermissionError: [Errno 13] Permission denied: '<tmp>' |
 | tests/test_deploy.py::test_release_snapshot_rejects_non_private_claude_control_state | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_deploy.py::test_release_snapshot_restores_absent_claude_control_state | PermissionError: [Errno 13] Permission denied: '<tmp>' |
 | tests/test_deploy.py::test_release_snapshot_restores_versioned_claude_control_state | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
-| tests/test_deploy.py::test_setup_script_is_valid_shell_and_keeps_safe_install_order | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\deploy\\setup-vps.sh']' returned non-zero exit status 1. |
+| tests/test_deploy.py::test_setup_script_is_valid_shell_and_keeps_safe_install_order | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote\\deploy\\setup-vps.sh']' returned non-zero exit status 1. |
 | tests/test_deploy.py::test_work_registry_migration_verifier_rejects_unowned_profile_rows[claude] | OSError: [Errno 9] Bad file descriptor |
 | tests/test_deploy.py::test_work_registry_migration_verifier_rejects_unowned_profile_rows[codex] | OSError: [Errno 9] Bad file descriptor |
 | tests/test_deploy.py::test_work_registry_snapshot_captures_wal_and_restores_absent_database | OSError: [Errno 9] Bad file descriptor |
@@ -2421,48 +2410,48 @@
 | tests/test_deploy_cleanup.py::test_unobservable_process_record_stops_cleanup[p42\x00\nfcwd\x00n/proc/42/cwd (readlink: Permission denied)\x00] [error] | failed on setup with "OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>'" |
 | tests/test_deploy_cleanup.py::test_unobservable_process_record_stops_cleanup[p42\x00\nfrtd\x00n/proc/42/root (readlink: Operation not permitted)\x00] …] | failed on setup with "OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>'" |
 | tests/test_desktop_remote_ui.py::test_stage_preserves_installed_app_and_never_replaces_an_existing_stage | ValueError: Unknown Desktop asset handler; refusing to patch |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-absent] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-running] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-absent] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-running] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[preflight] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[restore-failed] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[service-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[snapshot-restored] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp>' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[fail-output-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[fail-output-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[interrupt-readiness-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[interrupt-readiness-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[retention-failure-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[retention-failure-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[success-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
-| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[success-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-absent] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-running] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[False-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-absent] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-running] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_supervisor_rollback_restores_registration[True-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[preflight] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[restore-failed] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[service-stopped] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_cleanup_reports_only_recovery_that_actually_happened[snapshot-restored] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[fresh-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[same-release-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-adopt-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-adopt-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-darwin-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-darwin-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation [test]\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-supervisor-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-supervisor-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-systemd-path-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_preflight_preserves_arguments_under_nounset[upgrade-systemd-system-bash] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp>' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[fail-output-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[fail-output-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[interrupt-readiness-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[interrupt-readiness-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[retention-failure-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[retention-failure-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[success-False] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
+| tests/test_install_commit.py::test_wrapper_registration_matches_the_activation_commit[success-True] | OSError: [WinError 1314] 客户端没有所需的特权。: 'C:\\Users\\xuhaodong\\work\\cc-remote\\.venv\\Scripts\\python.exe' -> '<tmp> installation\\releases\\new\\.venv\\bin\\python' |
 | tests/test_install_lock.py::test_direct_wrapper_install_cannot_enter_during_managed_update | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_install_lock.py::test_inherited_marker_for_another_file_cannot_bypass_wrapper_lock | AssertionError: pass_fds not supported on Windows. |
 | tests/test_install_lock.py::test_lock_rejects_symlinks_and_wrong_inherited_file | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp>' -> '<tmp>' |
@@ -2488,7 +2477,7 @@
 | tests/test_profile_rollback.py::test_snapshot_restores_every_participant_and_absence[False] | PermissionError: [Errno 13] Permission denied: '<tmp>' |
 | tests/test_profile_rollback.py::test_snapshot_restores_every_participant_and_absence[True] | AttributeError: module 'os' has no attribute 'O_NOFOLLOW' |
 | tests/test_relay_update_job.py (collection) [error] | ModuleNotFoundError: No module named 'fcntl' |
-| tests/test_release_distribution.py::test_release_bootstrap_fails_closed_before_download | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\deploy\\install.sh']' returned non-zero exit status 1. |
+| tests/test_release_distribution.py::test_release_bootstrap_fails_closed_before_download | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote\\deploy\\install.sh']' returned non-zero exit status 1. |
 | tests/test_release_distribution.py::test_release_bootstrap_rejects_tampered_or_linked_archives[0000000000000000000000000000000000000000000000000000000…] | OSError: [WinError 193] %1 不是有效的 Win32 应用程序。 |
 | tests/test_release_distribution.py::test_release_bootstrap_rejects_tampered_or_linked_archives[None-True-unsafe path] | OSError: [WinError 193] %1 不是有效的 Win32 应用程序。 |
 | tests/test_release_distribution.py::test_release_bootstrap_verifies_before_invoking_role_installer | OSError: [WinError 193] %1 不是有效的 Win32 应用程序。 |
@@ -2498,7 +2487,7 @@
 | tests/test_release_distribution.py::test_release_bundles_are_deterministic_and_role_scoped[wrapper-darwin-arm64] | deploy.build_release.BuildError: uv executable is missing or not executable |
 | tests/test_release_distribution.py::test_release_bundles_are_deterministic_and_role_scoped[wrapper-linux-arm64] | deploy.build_release.BuildError: uv executable is missing or not executable |
 | tests/test_release_distribution.py::test_release_manifest_and_atomic_switch_fail_closed | deploy.build_release.BuildError: uv executable is missing or not executable |
-| tests/test_release_distribution.py::test_role_installers_keep_credentials_out_of_service_definitions | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote-p1\\deploy\\install-relay.sh']' returned non-zero exit status 1. |
+| tests/test_release_distribution.py::test_role_installers_keep_credentials_out_of_service_definitions | subprocess.CalledProcessError: Command '['bash', '-n', 'C:\\Users\\xuhaodong\\work\\cc-remote\\deploy\\install-relay.sh']' returned non-zero exit status 1. |
 | tests/test_release_retention.py (collection) [error] | ModuleNotFoundError: No module named 'pwd' |
 | tests/test_update.py::test_changed_installation_is_not_activated_after_download | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp> wrapper\\releases\\old' -> '<tmp> wrapper\\current' |
 | tests/test_update.py::test_check_never_downloads_locks_or_activates | OSError: [WinError 1314] 客户端没有所需的特权。: '<tmp> wrapper\\releases\\old' -> '<tmp> wrapper\\current' |
@@ -2603,7 +2592,7 @@
 ## Web 测试
 
 仓库里没有 vitest（`web/package.json` 无此依赖），因此按本仓库的门禁跑 `npm --prefix web run test:reliability`。
-该脚本用 `&&` 串联，第一处失败即停止，所以又把其中 42 个测试文件逐个执行：41 个通过，1 个失败。
+该脚本用 `&&` 串联，第一处失败即停止，所以又把其中 42 个测试文件逐个执行：41 个通过，1 个失败（与上一版相同）。
 
 | 测试 | 失败原因（第一行异常） | 归属 |
 |---|---|---|
