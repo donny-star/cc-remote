@@ -46,6 +46,7 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     outside = tmp_path / "outside.txt"
     outside.write_text("outside")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows expanduser source.
     start = browse_workspace(str(root), ".", confine_to_cwd=False)
     assert start["root"] == os.path.abspath(os.sep)
     assert start["path"] == str(root)

@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -65,7 +66,7 @@ def test_truncated_upload_names_keep_distinct_copies(tmp_path):
     assert len(rows) == 2 and len({row["path"] for row in rows}) == 2
     for row in rows:
         assert len(Path(row["path"]).name.encode("utf-8")) <= 255
-        assert Path(row["path"]).read_text() == row["name"]
+        assert Path(row["path"]).read_text(encoding="utf-8") == row["name"]
 
 
 @pytest.mark.parametrize("name", [
@@ -80,6 +81,7 @@ def test_oversized_upload_extensions_still_fit_byte_limit(tmp_path, name):
     assert len(path.name.encode("utf-8")) <= 255
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a pre-bound legacy copy exceeds MAX_PATH and never existed on Windows")
 def test_long_name_replay_reuses_existing_legacy_copy(tmp_path):
     import hashlib
 

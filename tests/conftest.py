@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+
+
+# Release activation, the relay updater and the systemd/launchd installers are
+# macOS/Linux only by design (``update.host_platform`` rejects Windows), and
+# their modules import fcntl/pwd at module scope.
+collect_ignore = [
+    "test_deploy_cleanup.py",
+    "test_install_lock.py",
+    "test_linux_service.py",
+    "test_relay_update_job.py",
+    "test_release_retention.py",
+    "test_update.py",
+    "test_update_diagnostics.py",
+    "test_update_installer_relay.py",
+    "test_update_relay.py",
+] if sys.platform == "win32" else []
 
 
 _ACCOUNT_PROFILE_ENV = (

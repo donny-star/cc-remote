@@ -791,11 +791,12 @@ def test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured(
         # HOMEDRIVE+HOMEPATH) on Windows, not from HOME.
         monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
-    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
+    default = "claude.exe" if sys.platform == "win32" else "claude"
+    assert WrapperConfig().claude_bin == str(home / ".local/bin" / default)
 
     # An explicitly empty dotenv value must not silently restore the SDK bundle.
     monkeypatch.setenv("CLAUDE_BIN", "   ")
-    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
+    assert WrapperConfig().claude_bin == str(home / ".local/bin" / default)
 
     cli = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_BIN", f"  {cli}  ")
@@ -808,10 +809,7 @@ def test_claude_pty_broker_is_hidden_and_opt_in(monkeypatch):
     monkeypatch.delenv("CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", raising=False)
     cfg = WrapperConfig()
     assert cfg.experimental_claude_broker is False
-    if sys.platform == "win32":
-        assert cfg.claude_broker_socket == ""
-    else:
-        assert os.path.isabs(cfg.claude_broker_socket)
+    assert os.path.isabs(cfg.claude_broker_socket)
 
     monkeypatch.setenv("CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", "true")
     assert WrapperConfig().experimental_claude_broker is True
