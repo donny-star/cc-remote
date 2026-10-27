@@ -49,6 +49,27 @@ def test_exited_process_has_no_identity(child) -> None:
     assert process_scan.process_identity(pid) is None
 
 
+def test_process_that_exited_with_still_active_code_has_no_identity() -> None:
+    from cc_remote.platform import win32_process
+
+    # Popen keeps its handle open, so the exited process object is still
+    # openable; only its signal state shows it is gone (exit code 259 ==
+    # STILL_ACTIVE).
+    process = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(259)"])
+    assert process.wait() == 259
+    assert win32_process.creation_time(process.pid) is None
+    assert process_scan.process_identity(process.pid) is None
+
+
+def test_pid_reused_during_parent_lookup_has_no_identity(monkeypatch) -> None:
+    from cc_remote.platform import win32_process
+
+    readings = iter([100, 200])
+    monkeypatch.setattr(win32_process, "creation_time", lambda pid: next(readings))
+    monkeypatch.setattr(win32_process, "parent_map", lambda: {1234: 42})
+    assert process_scan.process_identity(1234, parent_pid=42) is None
+
+
 def test_owner_of_own_child_is_current_uid(child) -> None:
     assert process_scan.process_owner_uid(child.pid) == identity.current_uid()
 

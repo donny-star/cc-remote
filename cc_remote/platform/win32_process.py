@@ -6,7 +6,8 @@ import os
 from ctypes import wintypes
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_STILL_ACTIVE = 259
+_SYNCHRONIZE = 0x00100000
+_WAIT_TIMEOUT = 0x102
 _PROCESS_COMMAND_LINE_INFORMATION = 60
 _TH32CS_SNAPPROCESS = 0x00000002
 _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
@@ -19,10 +20,12 @@ _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _kernel32.OpenProcess.restype = wintypes.HANDLE
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
 _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
 _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+_kernel32.LocalFree.restype = ctypes.c_void_p
 _ntdll.NtQueryInformationProcess.argtypes = [
     wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
     ctypes.POINTER(wintypes.ULONG),
@@ -59,24 +62,24 @@ _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEn
 _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
 
 
-def _open(pid: int) -> int | None:
+def _open(pid: int, access: int = _PROCESS_QUERY_LIMITED_INFORMATION) -> int | None:
     if pid <= 0:
         return None
-    return _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid) or None
+    return _kernel32.OpenProcess(access, False, pid) or None
 
 
 def creation_time(pid: int) -> int | None:
     """Kernel creation time in 100ns FILETIME ticks, or None once exited."""
-    handle = _open(pid)
+    # Liveness comes from the process object's signal state, not the exit
+    # code: a process that exited with 259 would otherwise look STILL_ACTIVE.
+    handle = _open(pid, _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE)
     if handle is None:
         return None
     try:
         times = [wintypes.FILETIME() for _ in range(4)]
         if not _kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
             return None
-        code = wintypes.DWORD()
-        if (not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-                or code.value != _STILL_ACTIVE):
+        if _kernel32.WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
             return None
         return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
     finally:

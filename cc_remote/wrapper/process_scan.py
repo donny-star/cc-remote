@@ -329,6 +329,9 @@ def process_identity(pid: int, *, proc_root: str = "/proc",
             parents = win32_process.parent_map()
             if parents is None or parents.get(pid) != parent_pid:
                 return None
+            # The PID may have been reused between the two reads.
+            if win32_process.creation_time(pid) != ticks:
+                return None
         return ProcessIdentity(pid, ticks)
     stat = _process_stat(Path(proc_root) / str(pid))
     if stat is not None:
