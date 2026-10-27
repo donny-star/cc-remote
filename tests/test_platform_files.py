@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import threading
+import time
 
 import pytest
 
@@ -65,6 +66,30 @@ def test_replace_retries_while_destination_is_briefly_held(tmp_path) -> None:
     threading.Timer(0.2, holder.close).start()
     files.replace(src, dst)
     assert dst.read_bytes() == b"new"
+
+
+@pytest.mark.windows_only(reason="exercises the Windows retry loop")
+def test_replace_raises_permanent_access_denied_without_backoff(tmp_path) -> None:
+    dst = tmp_path / "dst"
+    dst.mkdir()  # renaming a file over a directory is ERROR_ACCESS_DENIED, not a sharing violation
+    src = tmp_path / "src"
+    src.write_bytes(b"new")
+    started = time.monotonic()
+    with pytest.raises(PermissionError) as excinfo:
+        files.replace(src, dst)
+    assert excinfo.value.winerror == 5
+    assert time.monotonic() - started < 0.5
+    assert src.read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("attempts", [0, -1])
+def test_replace_rejects_non_positive_attempts(tmp_path, attempts) -> None:
+    src = tmp_path / "src"
+    src.write_bytes(b"new")
+    with pytest.raises(ValueError):
+        files.replace(src, tmp_path / "dst", attempts=attempts)
+    assert src.read_bytes() == b"new"
+    assert not (tmp_path / "dst").exists()
 
 
 def test_pread_pwrite_keep_file_position(tmp_path) -> None:

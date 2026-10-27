@@ -19,11 +19,10 @@ StrPath = str | PathLike[str]
 
 
 def fchmod(fd: int, path: StrPath, mode: int) -> None:
-    native = getattr(os, "fchmod", None)
-    if native is not None and not IS_WINDOWS:
-        native(fd, mode)
-    else:
+    if IS_WINDOWS:
         os.chmod(path, mode)
+    else:
+        os.fchmod(fd, mode)
 
 
 def fsync_directory(path: StrPath) -> None:
@@ -37,6 +36,7 @@ def fsync_directory(path: StrPath) -> None:
         os.close(descriptor)
 
 
+_ERROR_SHARING_VIOLATION = 32
 _ERROR_INVALID_PARAMETER = 87
 _ERROR_NOT_SUPPORTED = 50
 
@@ -93,7 +93,10 @@ def replace(src: StrPath, dst: StrPath, *, attempts: int = 10) -> None:
     Replaces targets held open with FILE_SHARE_DELETE, and rides out the
     short-lived sharing violations antivirus scanners and indexers cause.
     Falls back to MoveFileEx where POSIX renames are unsupported (FAT, old OS).
+    Other access errors, such as a directory target, raise immediately.
     """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
     if not IS_WINDOWS:
         os.replace(src, dst)
         return
@@ -106,7 +109,9 @@ def replace(src: StrPath, dst: StrPath, *, attempts: int = 10) -> None:
                     raise
                 os.replace(src, dst)
             return
-        except PermissionError:
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != _ERROR_SHARING_VIOLATION:
+                raise
             if attempt == attempts - 1:
                 raise
             time.sleep(min(0.02 * (2 ** attempt), 0.5))
@@ -194,8 +199,12 @@ def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
     )
     if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
-    return msvcrt.open_osfhandle(
-        handle, access_flags | os.O_BINARY | (flags & os.O_APPEND))
+    try:
+        return msvcrt.open_osfhandle(
+            handle, access_flags | os.O_BINARY | (flags & os.O_APPEND))
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
 
 
 def pread(fd: int, length: int, offset: int) -> bytes:
