@@ -6,7 +6,6 @@ the publication's FD-based resource checks on the device owning that file.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +16,11 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cc_remote.viewer import ViewerSite, clean_path, load_sites, open_resource
+from cc_remote.viewer import (
+    ViewerSite, clean_path, is_absolute_reference, load_sites, open_resource,
+)
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, flock
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 MAX_PAGES = 32
 MAX_SCOPES = 512
@@ -84,9 +87,8 @@ def locate_pages(registry: Path, paths: list[str], *, include_ambiguous=False) -
     sites = load_sites(registry)
     result = []
     for raw in paths:
-        if (not isinstance(raw, str) or len(raw) > 4096 or not raw.startswith("/")
-                or raw.startswith("//") or Path(raw).suffix.lower() not in {".html", ".htm"}
-                or any(p in {"..", "."} for p in raw.split("/"))):
+        if (not isinstance(raw, str) or len(raw) > 4096 or not is_absolute_reference(raw)
+                or Path(raw).suffix.lower() not in {".html", ".htm"}):
             continue
         matches = []
         for site in sites.values():
@@ -118,13 +120,13 @@ class ViewerPageStore:
 
     def _read(self):
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError:
             return {}
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                    or mode_exposed(info.st_mode) or info.st_nlink != 1
                     or info.st_size > MAX_STORE_BYTES):
                 raise ValueError("invalid page store")
             data = json.loads(stream.read(MAX_STORE_BYTES + 1))
@@ -148,13 +150,13 @@ class ViewerPageStore:
     @contextmanager
     def _edit(self):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
         with os.fdopen(fd, "rb") as lock:
             info = os.fstat(lock.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1):
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                    or mode_exposed(info.st_mode) or info.st_nlink != 1):
                 raise ValueError("invalid page store lock")
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            flock(lock.fileno(), LOCK_EX)
             data = self._read()
             before = json.dumps(data, ensure_ascii=False)
             yield data

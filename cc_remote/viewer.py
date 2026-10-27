@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import mimetypes
@@ -15,10 +14,18 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, flock
+from cc_remote.wrapper.os_compat import (
+    current_uid,
+    is_redirect,
+    mode_exposed,
+    open_with_share_delete,
+)
 
 CHUNK_SIZE = 64 * 1024
 PULL_WINDOW = 8
@@ -99,7 +106,7 @@ class ViewerSite(BaseModel):
     @classmethod
     def valid_root(cls, value: str) -> str:
         path = Path(value)
-        if (not path.is_absolute() or path == Path("/")
+        if (not path.is_absolute() or path == Path("/") or path == Path(path.anchor)
                 or path == Path.home() or path in Path.home().parents
                 or ".." in path.parts or "\x00" in value):
             raise ValueError("root must be a specific absolute project directory")
@@ -144,19 +151,39 @@ class ViewerSite(BaseModel):
                 "urls": self.urls}
 
     def open_root(self) -> int:
-        return os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        return os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+
+    def verified_root(self) -> str:
+        """Windows: the root path once it is proven a plain directory."""
+        info = os.lstat(self.root)
+        if is_redirect(info) or not stat.S_ISDIR(info.st_mode):
+            raise PermissionError("publication root changed")
+        return self.root
+
+
+def is_absolute_reference(raw: str) -> bool:
+    """An exact absolute local path: no traversal, UNC share or NTFS stream."""
+    if sys.platform == "win32":
+        if not re.match(r"[A-Za-z]:[\\/]", raw) or ":" in raw[2:]:
+            return False
+        parts = re.split(r"[\\/]", raw)
+    else:
+        if not raw.startswith("/") or raw.startswith("//"):
+            return False
+        parts = raw.split("/")
+    return not any(part in {".", ".."} for part in parts)
 
 
 def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
                max_bytes=64 * 1024) -> dict[str, ViewerSite]:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return {}
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > max_bytes):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or mode_exposed(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes):
             raise ValueError("Viewer registry must be a private, bounded regular file")
         raw = source.read(max_bytes + 1)
     data = json.loads(raw)
@@ -173,13 +200,13 @@ def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
 def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 1024):
     """Serialize local registrations; readers only ever see a complete snapshot."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
     with os.fdopen(lock_fd, "r+b") as lock:
         info = os.fstat(lock.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or mode_exposed(info.st_mode) or info.st_nlink != 1):
             raise ValueError("invalid Viewer registry lock")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        flock(lock.fileno(), LOCK_EX)
         sites = load_sites(path, model=model, limit=limit, max_bytes=max_bytes)
         before = {key: site.model_dump() for key, site in sites.items()}
         yield sites
@@ -207,24 +234,66 @@ def open_resource(site: ViewerSite, raw_path: str):
     path = clean_path(raw_path)
     if not site.allows(path) or Path(path).suffix.lower() not in EXTENSIONS:
         raise PermissionError("resource is outside this publication")
+    if sys.platform == "win32":
+        return _open_resource_windows(site, path)
     # Anchor every component to a verified directory FD; never follow symlinks,
     # including a swapped root, or reopen by path after validating it.
     fd = site.open_root()
     try:
         root = os.fstat(fd)
         if (root.st_dev != site.root_device or root.st_ino != site.root_inode
-                or root.st_uid != os.getuid()):
+                or root.st_uid != current_uid()):
             raise PermissionError("publication root changed")
         parts = path.lstrip("/").split("/")
         for index, part in enumerate(parts):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             if index < len(parts) - 1:
                 flags |= os.O_DIRECTORY
             child = os.open(part, flags, dir_fd=fd)
             os.close(fd)
             fd = child
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or info.st_size > MAX_FILE_BYTES or info.st_nlink != 1):
+            raise PermissionError("resource is not a bounded, privately owned regular file")
+        stream = os.fdopen(fd, "rb")
+        fd = -1
+        suffix = Path(path).suffix.lower()
+        mime = MIME_TYPES.get(suffix) or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return stream, info, mime
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _open_resource_windows(site: ViewerSite, path: str):
+    """Windows cannot open directories or resolve names relative to one.
+
+    Every component is ``lstat``'ed instead and must not be a symlink or
+    junction. The opened file must be the exact file that was checked, so a
+    swap between the check and the open fails closed.
+    """
+    current = site.verified_root()
+    root = os.lstat(current)
+    if (root.st_dev != site.root_device or root.st_ino != site.root_inode
+            or root.st_uid != current_uid()):
+        raise PermissionError("publication root changed")
+    parts = path.lstrip("/").split("/")
+    checked = root
+    for index, part in enumerate(parts):
+        if ":" in part:
+            raise PermissionError("alternate data streams are not resources")
+        current = os.path.join(current, part)
+        checked = os.lstat(current)
+        if is_redirect(checked) or (
+                index < len(parts) - 1 and not stat.S_ISDIR(checked.st_mode)):
+            raise PermissionError("resource is not a plain file")
+    # Share delete so a site rebuild can still replace a file being served.
+    fd = open_with_share_delete(current, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        info = os.fstat(fd)
+        if ((info.st_dev, info.st_ino) != (checked.st_dev, checked.st_ino)
+                or not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
                 or info.st_size > MAX_FILE_BYTES or info.st_nlink != 1):
             raise PermissionError("resource is not a bounded, privately owned regular file")
         stream = os.fdopen(fd, "rb")

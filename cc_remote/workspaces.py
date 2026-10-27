@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -22,6 +23,7 @@ from typing import Iterable, Literal, cast
 from uuid import uuid4
 
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.wrapper.os_compat import current_euid, is_redirect
 
 
 Engine = Literal["claude", "codex"]
@@ -2030,12 +2032,14 @@ class WorkRegistry:
 
     @staticmethod
     def _is_managed_upload_root(path: Path) -> bool:
+        if sys.platform == "win32":
+            return WorkRegistry._is_managed_upload_root_win32(path)
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
             return False
         flags = (
             os.O_RDONLY
             | os.O_DIRECTORY
-            | os.O_NOFOLLOW
+            | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
         )
         directory_fd = marker_fd = -1
@@ -2044,7 +2048,7 @@ class WorkRegistry:
             directory = os.fstat(directory_fd)
             marker_fd = os.open(
                 WORK_UPLOADS_MARKER,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=directory_fd,
             )
             marker = os.fstat(marker_fd)
@@ -2058,7 +2062,27 @@ class WorkRegistry:
                     os.close(descriptor)
         return (stat.S_ISDIR(directory.st_mode)
                 and stat.S_ISREG(marker.st_mode)
-                and marker.st_uid == os.geteuid()
+                and marker.st_uid == current_euid()
+                and marker.st_nlink == 1
+                and payload == WORK_UPLOADS_MARKER_PAYLOAD)
+
+    @staticmethod
+    def _is_managed_upload_root_win32(path: Path) -> bool:
+        """``lstat`` analog: Windows cannot open a directory descriptor."""
+        marker_path = path / WORK_UPLOADS_MARKER
+        try:
+            directory = os.lstat(path)
+            marker = os.lstat(marker_path)
+            if is_redirect(directory) or is_redirect(marker):
+                return False
+            with open(marker_path, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                payload = stream.read(len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+        except OSError:
+            return False
+        return (stat.S_ISDIR(directory.st_mode)
+                and stat.S_ISREG(marker.st_mode)
+                and (opened.st_dev, opened.st_ino) == (marker.st_dev, marker.st_ino)
                 and marker.st_nlink == 1
                 and payload == WORK_UPLOADS_MARKER_PAYLOAD)
 

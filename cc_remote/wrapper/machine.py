@@ -220,15 +220,14 @@ from cc_remote.wrapper.codex_daemon import (
     CodexProfileDaemonUnavailable,
 )
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
-if sys.platform != "win32":
-    from cc_remote.claude_broker import BrokerClient, BrokerClientError
-    from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
-    from cc_remote.wrapper.claude_broker_history import (
-        MAX_PARTIAL_LINE,
-        claude_broker_tail_state,
-        first_claude_sdk_user_id,
-        parse_claude_broker_lifecycle,
-    )
+from cc_remote.claude_broker import BrokerClient, BrokerClientError
+from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+from cc_remote.wrapper.claude_broker_history import (
+    MAX_PARTIAL_LINE,
+    claude_broker_tail_state,
+    first_claude_sdk_user_id,
+    parse_claude_broker_lifecycle,
+)
 from cc_remote.wrapper.ask import make_ask_server
 from cc_remote.wrapper.claude_questions import (
     AskCancelled,
@@ -429,7 +428,9 @@ from cc_remote.wrapper.preview_capabilities import (
     PreviewCapabilityError,
     PreviewCapabilityStore,
 )
-from cc_remote.wrapper.os_compat import current_uid, fchmod, fsync_directory
+from cc_remote.wrapper.os_compat import (
+    current_euid, current_uid, fchmod, fsync_directory, is_redirect,
+)
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -469,11 +470,7 @@ def _quarantine_rebuildable_projection(
         )
         return False
     try:
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
     except OSError as exc:
         # The rename already made the unsafe projection unreachable. A failed
         # directory fsync affects crash durability, not this process's safety.
@@ -2230,22 +2227,20 @@ class WrapperMachine:
         except CodexProcessClockStoreError:
             self._codex_process_clocks = None
             log.exception("Codex process-clock store unavailable")
+        self._claude_broker = BrokerClient(
+            getattr(cfg, "claude_broker_socket", None))
         # Claude's official SDK/CLI does not expose a supported multi-writer
         # control plane. Keep the PTY broker code available for development,
         # but never discover or adopt it in the customer path by default.
         requested_broker = bool(getattr(
             cfg, "experimental_claude_broker", False))
+        # The PTY broker needs AF_UNIX and POSIX terminals.
         self._claude_broker_enabled = (
             requested_broker and sys.platform != "win32"
         )
-        if sys.platform != "win32":
-            self._claude_broker = BrokerClient(
-                getattr(cfg, "claude_broker_socket", None))
-        else:
-            self._claude_broker = None
-            if requested_broker:
-                log.warning(
-                    "Claude broker is not supported on Windows; ignoring opt-in")
+        if requested_broker and sys.platform == "win32":
+            log.warning(
+                "Claude broker is not supported on Windows; ignoring opt-in")
         self._claude_rate_limit_lock = asyncio.Lock()
         self._claude_rate_limit_emit_lock = asyncio.Lock()
         legacy_claude_root = str(
@@ -8882,11 +8877,7 @@ class WrapperMachine:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(path.parent)
         finally:
             try:
                 tmp.unlink()
@@ -13225,7 +13216,6 @@ class WrapperMachine:
                     profile.home / "shell_snapshots")
             if shared_darwin_snapshot is not None:
                 scan_kwargs["darwin_snapshot"] = shared_darwin_snapshot
-            scan_kwargs.setdefault("wrapper_pid", os.getpid())
             scan = await asyncio.to_thread(
                 writable_rollout_holders,
                 native_paths,
@@ -38471,11 +38461,11 @@ class WrapperMachine:
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.geteuid()
+                or info.st_uid != current_euid()
                 or info.st_nlink != 1
             ):
                 raise RuntimeError("attachment target is not a private file")
-            os.fchmod(descriptor, 0o600)
+            fchmod(descriptor, path, 0o600)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(data)
                 stream.flush()
@@ -38486,12 +38476,17 @@ class WrapperMachine:
     @contextmanager
     def _open_work_upload_dir(cwd: str, msg_id: str):
         """Bind a Work upload directory without following mutable path links."""
+        if sys.platform == "win32":
+            with WrapperMachine._open_work_upload_dir_win32(
+                    cwd, msg_id) as bound:
+                yield bound
+            return
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
             raise RuntimeError("secure Work upload directories are unsupported")
         flags = (
             os.O_RDONLY
             | os.O_DIRECTORY
-            | os.O_NOFOLLOW
+            | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
         )
         workspace_fd = uploads_fd = message_fd = -1
@@ -38501,7 +38496,7 @@ class WrapperMachine:
                 workspace_info = os.fstat(workspace_fd)
                 if (
                     not stat.S_ISDIR(workspace_info.st_mode)
-                    or workspace_info.st_uid != os.geteuid()
+                    or workspace_info.st_uid != current_euid()
                 ):
                     raise RuntimeError(
                         "Work workspace is not a private directory")
@@ -38516,14 +38511,14 @@ class WrapperMachine:
                 uploads_info = os.fstat(uploads_fd)
                 if (
                     not stat.S_ISDIR(uploads_info.st_mode)
-                    or uploads_info.st_uid != os.geteuid()
+                    or uploads_info.st_uid != current_euid()
                 ):
                     raise RuntimeError(
                         "Work uploads path is not a private directory")
                 if created_uploads:
                     marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                     marker_flags |= (
-                        os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+                        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
                     marker_fd = os.open(
                         WORK_UPLOADS_MARKER,
                         marker_flags,
@@ -38542,7 +38537,7 @@ class WrapperMachine:
                 marker_fd = os.open(
                     WORK_UPLOADS_MARKER,
                     os.O_RDONLY
-                    | os.O_NOFOLLOW
+                    | getattr(os, "O_NOFOLLOW", 0)
                     | getattr(os, "O_CLOEXEC", 0),
                     dir_fd=uploads_fd,
                 )
@@ -38555,7 +38550,7 @@ class WrapperMachine:
                             len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
                     if (
                         not stat.S_ISREG(marker_info.st_mode)
-                        or marker_info.st_uid != os.geteuid()
+                        or marker_info.st_uid != current_euid()
                         or marker_info.st_nlink != 1
                         or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
                     ):
@@ -38570,7 +38565,7 @@ class WrapperMachine:
                 message_info = os.fstat(message_fd)
                 if (
                     not stat.S_ISDIR(message_info.st_mode)
-                    or message_info.st_uid != os.geteuid()
+                    or message_info.st_uid != current_euid()
                 ):
                     raise RuntimeError("Work message upload path is unsafe")
                 os.fchmod(message_fd, 0o700)
@@ -38581,6 +38576,70 @@ class WrapperMachine:
             for descriptor in (message_fd, uploads_fd, workspace_fd):
                 if descriptor >= 0:
                     os.close(descriptor)
+
+    @staticmethod
+    @contextmanager
+    def _open_work_upload_dir_win32(cwd: str, msg_id: str):
+        """Windows analog of ``_open_work_upload_dir`` without ``dir_fd``.
+
+        Windows cannot open directories as descriptors, so each component is
+        checked with ``lstat`` instead: a symlink or junction (reparse point)
+        anywhere below the private Work workspace is rejected. The per-message
+        directory is created exclusively, so a racing creator fails closed.
+        Privacy comes from the user profile's ACLs, as for every other
+        cc-remote state directory on Windows.
+        """
+        def private_directory(path: str) -> bool:
+            info = os.lstat(path)
+            return stat.S_ISDIR(info.st_mode) and not is_redirect(info)
+
+        workspace = os.path.abspath(cwd)
+        uploads = os.path.join(workspace, "uploads")
+        # ``:`` is a valid wire id character but names an NTFS alternate data
+        # stream. Exclusive mkdir below fails closed on any mapped collision.
+        message = os.path.join(uploads, msg_id.replace(":", "_"))
+        try:
+            if not private_directory(workspace):
+                raise RuntimeError("Work workspace is not a private directory")
+            created_uploads = False
+            try:
+                os.mkdir(uploads, mode=0o700)
+                created_uploads = True
+            except FileExistsError:
+                pass
+            if not private_directory(uploads):
+                raise RuntimeError(
+                    "Work uploads path is not a private directory")
+            marker_path = os.path.join(uploads, WORK_UPLOADS_MARKER)
+            if created_uploads:
+                marker_fd = os.open(
+                    marker_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY,
+                    0o600,
+                )
+                try:
+                    with os.fdopen(marker_fd, "wb", closefd=False) as stream:
+                        stream.write(WORK_UPLOADS_MARKER_PAYLOAD)
+                        stream.flush()
+                finally:
+                    os.close(marker_fd)
+            marker_info = os.lstat(marker_path)
+            with open(marker_path, "rb") as stream:
+                marker_payload = stream.read(
+                    len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+            if (
+                not stat.S_ISREG(marker_info.st_mode)
+                or marker_info.st_nlink != 1
+                or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
+            ):
+                raise RuntimeError(
+                    "Work uploads path conflicts with workspace content")
+            os.mkdir(message, mode=0o700)
+            if not private_directory(message):
+                raise RuntimeError("Work message upload path is unsafe")
+        except OSError as exc:
+            raise RuntimeError("Work upload directory is unsafe") from exc
+        yield message, None
 
     def _stash_work_attachments(
         self,
@@ -38603,11 +38662,13 @@ class WrapperMachine:
     @staticmethod
     def _strip_attachment_paths(prompt: str) -> tuple[str, list[dict[str, str]]]:
         """Remove private attachment paths from transcript-facing history."""
+        # Windows staging paths are drive-rooted and use either separator.
         path_re = re.compile(
-            r"(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
-            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/"
-            r"(?:workspace/)?uploads/[A-Za-z0-9._:@-]+)"
-            r"/\d{2}-([^\s]+)")
+            r"(?:(?:[A-Za-z]:)?[/\\]\S*cc-remote-turn-[A-Za-z0-9_-]+|"
+            r"(?:[A-Za-z]:)?[/\\]\S*[/\\]cc-remote[/\\]work[/\\]chats[/\\]"
+            r"work-[0-9a-f]+[/\\]"
+            r"(?:workspace[/\\])?uploads[/\\][A-Za-z0-9._:@-]+)"
+            r"[/\\]\d{2}-([^\s]+)")
         marker = "\n\n[用户附件,请用工具读取以下文件]:\n"
         if marker in prompt:
             original, block = prompt.rsplit(marker, 1)
@@ -38616,15 +38677,16 @@ class WrapperMachine:
                 return original, [{"filename": name} for name in names]
 
         matches = list(re.finditer(
-            r"@(?P<path>(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
-            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/"
-            r"(?:workspace/)?uploads/[A-Za-z0-9._:@-]+)"
-            r"/\d{2}-(?P<name>[^\s]+))",
+            r"@(?P<path>(?:(?:[A-Za-z]:)?[/\\]\S*cc-remote-turn-[A-Za-z0-9_-]+|"
+            r"(?:[A-Za-z]:)?[/\\]\S*[/\\]cc-remote[/\\]work[/\\]chats[/\\]"
+            r"work-[0-9a-f]+[/\\]"
+            r"(?:workspace[/\\])?uploads[/\\][A-Za-z0-9._:@-]+)"
+            r"[/\\]\d{2}-(?P<name>[^\s]+))",
             prompt,
         ))
         if matches:
             suffix = prompt[matches[0].start():]
-            without_paths = re.sub(r"@/\S+", "", suffix)
+            without_paths = re.sub(r"@(?:[A-Za-z]:)?[/\\]\S+", "", suffix)
             if not without_paths.strip():
                 return (
                     prompt[:matches[0].start()].rstrip(),

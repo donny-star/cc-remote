@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import sys
+
+from cc_remote.wrapper.os_compat import is_redirect
 
 MAX_DIRECTORY_ENTRIES = 20_000
 
@@ -20,7 +23,10 @@ def browse_workspace(
     if os.path.commonpath([root, candidate]) != root:
         raise ValueError("请选择当前会话目录内的文件或文件夹")
     parts = Path(os.path.relpath(candidate, root)).parts
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if sys.platform == "win32":
+        return _browse_windows(root, candidate, parts, offset=offset,
+                               limit=limit, hidden=hidden, revision=revision)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(root, flags)
     try:
         for index, part in enumerate(parts):
@@ -36,29 +42,73 @@ def browse_workspace(
         current_revision = f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}"
         if offset and revision != current_revision:
             raise ValueError("目录已变化，请刷新后重新查看")
-        entries = []
-        scanned = 0
         with os.scandir(fd) as iterator:
-            for entry in iterator:
-                scanned += 1
-                if scanned > MAX_DIRECTORY_ENTRIES:
-                    raise ValueError("目录条目过多，请输入更具体的子目录路径")
-                if not hidden and entry.name.startswith("."):
-                    continue
-                kind = ("directory" if entry.is_dir(follow_symlinks=False)
-                        else "file" if entry.is_file(follow_symlinks=False)
-                        else "unsupported")
-                entries.append({"name": entry.name,
-                                "path": os.path.join(candidate, entry.name),
-                                "kind": kind})
-        entries.sort(key=lambda entry: (
-            entry["kind"] != "directory", entry["name"].casefold(), entry["name"]))
-        return {
-            "root": root, "path": candidate, "kind": "directory",
-            "parent": os.path.dirname(candidate) if candidate != root else None,
-            "entries": entries[offset:offset + limit],
-            "revision": current_revision,
-            "next_offset": offset + limit if offset + limit < len(entries) else None,
-        }
+            entries = _list_entries(iterator, candidate, hidden=hidden)
+        return _directory_page(root, candidate, entries, current_revision,
+                               offset=offset, limit=limit)
     finally:
         os.close(fd)
+
+
+def _browse_windows(
+    root: str, candidate: str, parts: tuple[str, ...], *, offset: int,
+    limit: int, hidden: bool, revision: str | None,
+) -> dict:
+    """Path-based walk: Windows cannot open directories or use ``dir_fd``.
+
+    Each component is lstat'ed and must be a plain directory (or the final
+    regular file), so a symlink or junction never redirects the listing.
+    """
+    current = root
+    info = os.lstat(current)
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        info = os.lstat(current)
+        if is_redirect(info):
+            raise ValueError("不支持打开符号链接或特殊文件")
+        if stat.S_ISREG(info.st_mode) and index == len(parts) - 1:
+            return {"root": root, "path": candidate, "kind": "file"}
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("不支持打开符号链接或特殊文件")
+    current_revision = f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}"
+    if offset and revision != current_revision:
+        raise ValueError("目录已变化，请刷新后重新查看")
+    with os.scandir(current) as iterator:
+        entries = _list_entries(iterator, candidate, hidden=hidden)
+    return _directory_page(root, candidate, entries, current_revision,
+                           offset=offset, limit=limit)
+
+
+def _list_entries(iterator, candidate: str, *, hidden: bool) -> list[dict]:
+    entries = []
+    scanned = 0
+    for entry in iterator:
+        scanned += 1
+        if scanned > MAX_DIRECTORY_ENTRIES:
+            raise ValueError("目录条目过多，请输入更具体的子目录路径")
+        if not hidden and entry.name.startswith("."):
+            continue
+        # A Windows junction reports is_dir(follow_symlinks=False) as true.
+        kind = ("unsupported" if getattr(entry, "is_junction", lambda: False)()
+                else "directory" if entry.is_dir(follow_symlinks=False)
+                else "file" if entry.is_file(follow_symlinks=False)
+                else "unsupported")
+        entries.append({"name": entry.name,
+                        "path": os.path.join(candidate, entry.name),
+                        "kind": kind})
+    entries.sort(key=lambda entry: (
+        entry["kind"] != "directory", entry["name"].casefold(), entry["name"]))
+    return entries
+
+
+def _directory_page(
+    root: str, candidate: str, entries: list[dict], current_revision: str, *,
+    offset: int, limit: int,
+) -> dict:
+    return {
+        "root": root, "path": candidate, "kind": "directory",
+        "parent": os.path.dirname(candidate) if candidate != root else None,
+        "entries": entries[offset:offset + limit],
+        "revision": current_revision,
+        "next_offset": offset + limit if offset + limit < len(entries) else None,
+    }

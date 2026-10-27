@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
 
 from cc_remote.attachments import MAX_IMAGE_PIXELS, decode_attachment, validate_attachments
+from cc_remote.wrapper.os_compat import current_euid
 
 
 # Extra durable copies, not the user's working files or native transcripts.
@@ -35,10 +37,26 @@ class ArtifactStorageFull(OSError):
     """An optional durable copy would exceed its storage budget."""
 
 
-def _upload_copy_name(name: str, digest: str) -> str:
-    """Fit one filesystem component, keeping the extension used by previews."""
+# Without the opt-in LongPathsEnabled policy, Win32 file APIs reject a full
+# path of MAX_PATH (260 UTF-16 units including the terminator) or more.
+_WINDOWS_MAX_PATH = 259
+
+
+def _component_limit(directory: Path) -> int:
+    if sys.platform != "win32":
+        return 255
+    return min(255, _WINDOWS_MAX_PATH - len(os.path.abspath(directory)) - 1)
+
+
+def _upload_copy_name(name: str, digest: str, limit: int = 255) -> str:
+    """Fit one filesystem component, keeping the extension used by previews.
+
+    The budget is counted in UTF-8 bytes, which is never fewer than the UTF-16
+    units Windows counts, so one bound serves both platforms.
+    """
     safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ") or "attachment"
-    budget = 255 - len(digest) - 1  # SHA-256 hex plus the separating dash.
+    # SHA-256 hex plus the separating dash; never a negative slice bound.
+    budget = max(1, limit - len(digest) - 1)
     if len(safe.encode("utf-8")) > budget:
         suffix = Path(safe).suffix
         if len(suffix.encode("utf-8")) >= budget:
@@ -256,7 +274,7 @@ class SessionArtifactStore:
         self.root = Path(state_dir) / "session-artifacts"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_euid():
             raise OSError("unsafe artifact directory")
         os.chmod(self.root, 0o700)
         self.path = self.root / "index.sqlite3"
@@ -378,18 +396,19 @@ class SessionArtifactStore:
                 previous = db.execute("SELECT path FROM artifacts WHERE scope=? AND identity=?",
                                       (scope, identity)).fetchone()
                 digest = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
-                path = Path(previous[0]) if previous else self.root / _upload_copy_name(name, digest)
+                path = Path(previous[0]) if previous else self.root / _upload_copy_name(
+                    name, digest, _component_limit(self.root))
                 if path.parent != self.root:
                     raise OSError("unsafe artifact upload path")
                 try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
                 except FileNotFoundError:
                     new_files[path] = len(data)
                 else:
                     with os.fdopen(fd, "rb") as existing:
                         info = os.fstat(existing.fileno())
                         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                                or info.st_uid != os.geteuid()):
+                                or info.st_uid != current_euid()):
                             raise OSError("unsafe artifact upload")
                         if existing.read(len(data) + 1) != data:
                             raise OSError("artifact upload content changed")
@@ -400,7 +419,7 @@ class SessionArtifactStore:
             try:
                 for identity, name, path, data in pending:
                     if path in new_files:
-                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
                         created.append(path)
                         with os.fdopen(fd, "wb") as out:
                             out.write(data)

@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.file_lock_compat import flock, LOCK_EX, LOCK_UN
-from cc_remote.wrapper.os_compat import force_rmtree
+from cc_remote.wrapper.os_compat import force_rmtree, fsync_directory
 
 
 _FORMAT_VERSION = 2
@@ -240,30 +240,43 @@ def cleanup_codex_checkpoint_session(
 
         lock_fd: Optional[int] = None
         tombstone: Optional[Path] = None
+        # Windows cannot rename a directory while its journal lock is still
+        # open, so the rename follows the lock release there (see cleanup()).
+        defer_rename = sys.platform == "win32"
         try:
             lock_flags = os.O_RDWR | os.O_CREAT
             lock_flags |= getattr(os, "O_NOFOLLOW", 0)
             lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            flock(lock_fd, LOCK_EX)
             tombstone = candidate.with_name(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
             )
-            try:
-                os.replace(candidate, tombstone)
-            except FileNotFoundError:
-                tombstone = None
-                continue
+            if not defer_rename:
+                try:
+                    os.replace(candidate, tombstone)
+                except FileNotFoundError:
+                    tombstone = None
+                    continue
         except OSError as exc:
             raise CheckpointError(
                 "Unable to retire Codex checkpoint journal"
             ) from exc
         finally:
             if lock_fd is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                flock(lock_fd, LOCK_UN)
                 os.close(lock_fd)
+        if defer_rename and tombstone is not None:
+            try:
+                os.replace(candidate, tombstone)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise CheckpointError(
+                    "Unable to retire Codex checkpoint journal"
+                ) from exc
         if tombstone is not None:
             try:
-                shutil.rmtree(tombstone, ignore_errors=False)
+                force_rmtree(tombstone)
             except OSError as exc:
                 raise CheckpointError(
                     "Unable to remove Codex checkpoint journal"
@@ -365,12 +378,7 @@ def migrate_codex_checkpoint_profiles(
                         sort_keys=True,
                     ).encode("utf-8"),
                 )
-                manifest_directory_fd = os.open(
-                    manifest_path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(manifest_directory_fd)
-                finally:
-                    os.close(manifest_directory_fd)
+                fsync_directory(manifest_path.parent)
                 session_id = target_session_id
                 durable_revision = profile_revision
                 migrated += 1
@@ -386,11 +394,7 @@ def migrate_codex_checkpoint_profiles(
                     "Checkpoint profile migration target already exists")
             os.replace(stage, target)
         if staged:
-            directory_fd = os.open(repository_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(repository_dir)
     return migrated
 
 
@@ -557,6 +561,18 @@ class CodexCheckpointJournal:
             check=check,
             stdin=stdin,
         )
+
+    def _plain_symlinks(self) -> bool:
+        """Whether this checkout stores Git symlinks as plain files.
+
+        Git for Windows defaults ``core.symlinks`` to false, then writes a
+        link's target text into a regular file; restore it the same way so
+        Git sees an unchanged worktree.
+        """
+        if sys.platform != "win32":
+            return False
+        result = self._git("config", "--bool", "core.symlinks", check=False)
+        return _decode(result.stdout).strip() != "true"
 
     def _capture_tree(self) -> str:
         fd, temporary_name = tempfile.mkstemp(prefix="index-", dir=self.temp_dir)
@@ -1592,10 +1608,13 @@ class CodexCheckpointJournal:
                 f".{target.name}.cc-remote-{uuid.uuid4().hex}.tmp"
             )
             try:
-                if entry.mode == "120000":
+                if entry.mode == "120000" and not self._plain_symlinks():
                     os.symlink(content, os.fsencode(temporary))
                 else:
-                    assert permission is not None
+                    # Without the Windows symlink privilege Git itself checks
+                    # a link out as a plain file holding its target.
+                    if permission is None:
+                        permission = 0o644
                     fd = os.open(
                         temporary,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL,

@@ -3,10 +3,26 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 
 from cc_remote.relay.viewer import ViewerError
 from cc_remote.viewer_pages import PageRef, PageScope
+
+
+# A drive-absolute reference from a Windows device. The relay host is usually
+# POSIX, so this is string-only; the owning device re-validates it on open.
+_WINDOWS_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/][^:]*")
+
+
+def _windows_absolute(path: str) -> bool:
+    return (_WINDOWS_ABSOLUTE.fullmatch(path) is not None
+            and not any(p in {".", ".."} for p in re.split(r"[\\/]", path)))
+
+
+def _device_checked(raw: str) -> bool:
+    """Absolute references and URL hints are proven by each device, not the parent."""
+    return raw.startswith(("/", "http://")) or _windows_absolute(raw)
 
 
 async def page_api(relay, claims, payload):
@@ -70,6 +86,10 @@ async def page_api(relay, claims, payload):
                 # the relay never resolves DNS or requests the URL.
                 candidates[path] = path
                 continue
+            if _windows_absolute(path):
+                if Path(path).suffix.lower() in {".html", ".htm"}:
+                    candidates[path] = path
+                continue
             if path.startswith("~/"):
                 if Path(path).suffix.lower() in {".html", ".htm"}:
                     candidates[path] = path
@@ -85,7 +105,7 @@ async def page_api(relay, claims, payload):
 
         async def locate(mid, peer):
             eligible = [absolute for raw, absolute in candidates.items()
-                        if raw.startswith(("/", "http://")) or mid == parent_id]
+                        if _device_checked(raw) or mid == parent_id]
             if not eligible:
                 return []
             values = await peer.metadata("locate", {"paths": list(dict.fromkeys(eligible))})
@@ -100,7 +120,7 @@ async def page_api(relay, claims, payload):
         additions = []
         for raw, absolute in candidates.items():
             matches = [v for v in found if v["reference"] == absolute
-                       and (raw.startswith(("/", "http://")) or v["machine_id"] == parent_id)]
+                       and (_device_checked(raw) or v["machine_id"] == parent_id)]
             if len(matches) != 1:
                 continue
             value = matches[0]

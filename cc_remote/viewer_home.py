@@ -8,14 +8,18 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import stat
+import sys
 
 from pydantic import field_validator, model_validator
 
 from cc_remote.viewer import (
-    SCRIPT_ORIGINS, ViewerSite, clean_path, edit_sites, load_sites,
+    SCRIPT_ORIGINS, ViewerSite, clean_path, edit_sites, is_absolute_reference,
+    load_sites,
 )
 from cc_remote.viewer_pages import locate_pages, verify_page
 from cc_remote.viewer_static_server import static_page
+from cc_remote.wrapper.os_compat import current_uid, is_redirect
 
 MAX_HOME_SITES = 128
 HOME_STORE_BYTES = 1024 * 1024
@@ -25,22 +29,46 @@ def open_home_directory(home: Path, directory: Path, identity=None) -> int:
     relative = directory.relative_to(home)
     if any(p.startswith(".") for p in relative.parts):
         raise PermissionError("private directory")
-    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     try:
         info = os.fstat(fd)
-        if info.st_uid != os.getuid() or identity and (info.st_dev, info.st_ino) != identity:
+        if info.st_uid != current_uid() or identity and (info.st_dev, info.st_ino) != identity:
             raise PermissionError("home directory changed")
         for part in relative.parts:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
             os.close(fd)
             fd = child
-            if os.fstat(fd).st_uid != os.getuid():
+            if os.fstat(fd).st_uid != current_uid():
                 raise PermissionError("directory belongs to another user")
         result, fd = fd, -1
         return result
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def verify_home_directory(home: Path, directory: Path, identity=None) -> os.stat_result:
+    """Windows analog of ``open_home_directory``: no directory descriptors.
+
+    Each component below home is ``lstat``'ed and must be a plain directory,
+    never a symlink or junction. Returns the final directory's metadata.
+    """
+    relative = directory.relative_to(home)
+    if any(p.startswith(".") for p in relative.parts):
+        raise PermissionError("private directory")
+    info = os.lstat(home)
+    if (is_redirect(info) or not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid()
+            or identity and (info.st_dev, info.st_ino) != identity):
+        raise PermissionError("home directory changed")
+    current = home
+    for part in relative.parts:
+        current = current / part
+        info = os.lstat(current)
+        if is_redirect(info) or not stat.S_ISDIR(info.st_mode):
+            raise PermissionError("not a plain directory")
+        if info.st_uid != current_uid():
+            raise PermissionError("directory belongs to another user")
+    return info
 
 
 class HomeSite(ViewerSite):
@@ -78,6 +106,11 @@ class HomeSite(ViewerSite):
         return open_home_directory(Path(self.home), Path(self.root),
                                    (self.home_device, self.home_inode))
 
+    def verified_root(self) -> str:
+        verify_home_directory(Path(self.home), Path(self.root),
+                              (self.home_device, self.home_inode))
+        return self.root
+
 
 class HomePages:
     def __init__(self, path: Path, *, home: Path | None = None, enabled: bool | None = None):
@@ -106,11 +139,14 @@ class HomePages:
     def _publication(self, root: Path, entry: Path) -> HomeSite:
         root.relative_to(self.home)
         # Validate every directory via FDs before writing any discovery state.
-        fd = open_home_directory(self.home, root)
-        try:
-            info = os.fstat(fd)
-        finally:
-            os.close(fd)
+        if sys.platform == "win32":
+            info = verify_home_directory(self.home, root)
+        else:
+            fd = open_home_directory(self.home, root)
+            try:
+                info = os.fstat(fd)
+            finally:
+                os.close(fd)
         home_info = self.home.stat()
         path = clean_path("/" + entry.relative_to(root).as_posix())
         key = "auto-" + hashlib.sha256(str(root).encode()).hexdigest()[:32]
@@ -147,9 +183,7 @@ class HomePages:
                     root, entry = found
                 else:
                     expanded = str(self.home) + raw[1:] if raw.startswith("~/") else raw
-                    if not expanded.startswith("/") or expanded.startswith("//"):
-                        continue
-                    if any(part in {".", ".."} for part in expanded.split("/")):
+                    if not is_absolute_reference(expanded):
                         continue
                     entry = Path(expanded)
                     if entry.suffix.lower() not in {".htm", ".html"}:
