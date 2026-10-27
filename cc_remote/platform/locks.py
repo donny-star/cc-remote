@@ -7,6 +7,7 @@ beyond any real data, which keeps file content readable while the lock is held.
 from __future__ import annotations
 
 import errno
+from typing import IO, Any
 
 from cc_remote.platform import IS_WINDOWS
 
@@ -32,7 +33,9 @@ if IS_WINDOWS:
         overlapped.OffsetHigh = _OFFSET_HIGH
         return overlapped
 
-    def flock(fd: int, operation: int) -> None:
+    def flock(fd: int | IO[Any], operation: int) -> None:
+        if not isinstance(fd, int):
+            fd = fd.fileno()  # fcntl.flock also accepts file objects
         handle = msvcrt.get_osfhandle(fd)
         base = operation & ~LOCK_NB
         if base == LOCK_UN:

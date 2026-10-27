@@ -60,6 +60,20 @@ def test_lock_does_not_block_reading_file_content(tmp_path) -> None:
         os.close(b)
 
 
+def test_file_object_lock_contends_with_fd_lock(tmp_path) -> None:
+    path = tmp_path / "l"
+    b = _open(path)
+    try:
+        with open(path, "a") as lock:
+            locks.flock(lock, locks.LOCK_EX)
+            with pytest.raises(BlockingIOError):
+                locks.flock(b, locks.LOCK_EX | locks.LOCK_NB)
+            locks.flock(lock, locks.LOCK_UN)
+            locks.flock(b, locks.LOCK_EX | locks.LOCK_NB)
+    finally:
+        os.close(b)
+
+
 def test_unlock_without_lock_is_noop(tmp_path) -> None:
     a = _open(tmp_path / "l")
     try:
