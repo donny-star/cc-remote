@@ -85,3 +85,16 @@ def test_protected_system_process_is_unreadable_not_an_error() -> None:
     from cc_remote.platform import win32_process
 
     assert win32_process.argv(4) is None  # PID 4 is the System process
+
+
+def test_oversized_argv_is_rejected_like_proc_cmdline(monkeypatch) -> None:
+    from cc_remote.platform import win32_process
+
+    ident = process_scan.ProcessIdentity(1234, 100)
+    monkeypatch.setattr(win32_process, "creation_time", lambda pid: 100)
+    fitting = (b"x" * (process_scan.MAX_CMDLINE_BYTES - 1),)
+    monkeypatch.setattr(win32_process, "argv", lambda pid: fitting)
+    assert process_scan.process_command(ident) == fitting
+    oversized = (b"x" * (process_scan.MAX_CMDLINE_BYTES // 2),) * 2
+    monkeypatch.setattr(win32_process, "argv", lambda pid: oversized)
+    assert process_scan.process_command(ident) is None

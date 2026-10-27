@@ -129,7 +129,7 @@ class PreviewCapabilityStore:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
                     or getattr(info, "st_uid", -1) != current_euid()
-                    or (not IS_WINDOWS and info.st_nlink != 1)):
+                    or info.st_nlink != 1):
                 raise OSError("preview capability lock file is unsafe")
             fchmod(descriptor, self._lock_path, 0o600)
             deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
@@ -327,7 +327,7 @@ class PreviewCapabilityStore:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
                     or getattr(info, "st_uid", -1) != current_euid()
-                    or (not IS_WINDOWS and info.st_nlink != 1)
+                    or info.st_nlink != 1
                     or info.st_size > _EPOCH_FILE_MAX_BYTES):
                 raise ValueError("preview capability epoch file is unsafe")
             raw = os.read(descriptor, _EPOCH_FILE_MAX_BYTES + 1)

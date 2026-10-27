@@ -42,7 +42,10 @@ def install_shutdown_handler(
     import win32api
 
     def on_signal(_signum: int, _frame: object) -> None:
-        loop.call_soon_threadsafe(callback)
+        try:
+            loop.call_soon_threadsafe(callback)
+        except RuntimeError:  # loop already closed: nothing left to run
+            pass
 
     windows_signals = (signal.SIGINT, signal.SIGBREAK)
     previous = {signum: signal.getsignal(signum) for signum in windows_signals}

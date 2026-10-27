@@ -128,3 +128,22 @@ def test_missing_console_logs_and_skips_unregister(monkeypatch) -> None:
     asyncio.run(scenario())
     assert calls == [True]
     assert warnings and warnings[0][0] == "console control handler unavailable"
+
+
+@pytest.mark.windows_only(reason="SIGINT/SIGBREAK handlers are Python-level only on Windows")
+def test_signal_after_loop_closed_is_ignored(monkeypatch) -> None:
+    import signal as stdlib_signal
+
+    import win32api
+
+    monkeypatch.setattr(win32api, "SetConsoleCtrlHandler", lambda h, add: None)
+    original = stdlib_signal.getsignal(stdlib_signal.SIGINT)
+    loop = asyncio.new_event_loop()
+    uninstall = signals.install_shutdown_handler(loop, lambda: None)
+    try:
+        loop.close()
+        for signum in (stdlib_signal.SIGINT, stdlib_signal.SIGBREAK):
+            stdlib_signal.getsignal(signum)(signum, None)  # must not raise
+    finally:
+        uninstall()
+    assert stdlib_signal.getsignal(stdlib_signal.SIGINT) is original

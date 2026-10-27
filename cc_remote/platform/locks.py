@@ -3,6 +3,15 @@
 Windows byte-range locks are mandatory, so locking real file content would make
 other handles' reads fail. The Windows backend therefore locks one byte far
 beyond any real data, which keeps file content readable while the lock is held.
+
+Windows differences callers must respect:
+
+- There is no ``LOCK_SH``; only ``LOCK_EX`` (optionally ``| LOCK_NB``) and
+  ``LOCK_UN`` are supported.
+- Locks do not upgrade or re-enter: taking ``LOCK_EX`` twice on the same handle
+  deadlocks (or fails with ``LOCK_NB``) instead of being a no-op.
+- A lock belongs to the process that took it. A descriptor inherited by a child
+  process cannot re-take, release or verify the parent's lock.
 """
 from __future__ import annotations
 

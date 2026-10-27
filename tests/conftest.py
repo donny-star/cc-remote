@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -35,11 +36,15 @@ def _isolate_account_profile_environment(
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    if sys.platform == "win32" and not sys.flags.utf8_mode:
+    if sys.platform != "win32":
+        return
+    if not sys.flags.utf8_mode:
         raise pytest.UsageError(
             "On Windows run the suite in UTF-8 mode: "
-            "python -X utf8 -m pytest (or set PYTHONUTF8=1)"
+            "set PYTHONUTF8=1 (or python -X utf8 -m pytest)"
         )
+    # ``-X utf8`` is not inherited by pytest-xdist workers; the variable is.
+    os.environ.setdefault("PYTHONUTF8", "1")
 
 
 def pytest_collection_modifyitems(

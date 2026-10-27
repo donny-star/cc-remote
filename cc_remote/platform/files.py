@@ -19,6 +19,11 @@ StrPath = str | PathLike[str]
 
 
 def fchmod(fd: int, path: StrPath, mode: int) -> None:
+    """``os.fchmod`` on POSIX; Windows only toggles the read-only attribute.
+
+    On Windows this does not make a file private; use
+    :func:`cc_remote.platform.perms.make_private` for that.
+    """
     if IS_WINDOWS:
         os.chmod(path, mode)
     else:
@@ -156,7 +161,11 @@ def force_rmtree(path: StrPath) -> None:
 
 
 def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
-    """``os.open`` whose descriptor never blocks unlink/replace of ``path``."""
+    """``os.open`` whose descriptor never blocks unlink/replace of ``path``.
+
+    ``mode`` is ignored on Windows: a created file inherits its directory's
+    ACL. Use :func:`cc_remote.platform.perms.make_private` to restrict it.
+    """
     if not IS_WINDOWS:
         return os.open(path, flags, mode)
 

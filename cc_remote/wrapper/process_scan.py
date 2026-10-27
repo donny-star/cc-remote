@@ -360,6 +360,8 @@ def process_command(
         args = win32_process.argv(identity.pid)
         if win32_process.creation_time(identity.pid) != identity.start_ticks:
             return None
+        if args is not None and sum(len(arg) + 1 for arg in args) > MAX_CMDLINE_BYTES:
+            return None  # same bound as the NUL-separated /proc cmdline
         return args
     proc_dir = Path(proc_root) / str(identity.pid)
     stat = _process_stat(proc_dir)
