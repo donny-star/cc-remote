@@ -23,6 +23,7 @@ import re
 import stat
 import threading
 from uuid import uuid4
+from cc_remote.wrapper.os_compat import current_uid, fsync_directory, mode_exposed
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -112,8 +113,8 @@ class ClaudeClientMessageStore:
         if (
             not stat.S_ISREG(info.st_mode)
             or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_uid != current_uid()
+            or mode_exposed(info.st_mode)
             or info.st_size > _MAX_FILE_BYTES
         ):
             raise ClaudeClientMessageStoreError(
@@ -272,11 +273,7 @@ class ClaudeClientMessageStore:
                 raise
             os.replace(temporary, path)
             os.chmod(path, 0o600)
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.directory)
             info = path.lstat()
             self._cache[session_id] = _CachedRecord(
                 file_signature=self._file_signature(info),

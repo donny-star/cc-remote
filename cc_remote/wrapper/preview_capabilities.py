@@ -19,7 +19,7 @@ from uuid import uuid4
 from cc_remote.log import logger
 from cc_remote.wrapper.file_lock_compat import flock, LOCK_EX, LOCK_NB, LOCK_UN
 from cc_remote.wrapper.os_compat import (
-    current_uid, fchmod, fsync_directory, open_with_share_delete, pread,
+    current_euid, fchmod, fsync_directory, open_with_share_delete, pread,
 )
 
 log = logger("cc_remote.wrapper.preview_capabilities")
@@ -67,7 +67,7 @@ class PreviewCapability:
             and file_stat.st_ino == self.inode
             and getattr(file_stat, "st_uid", -1) == self.uid
             and (not require_write or (
-                self.mode == "read_write" and self.uid == current_uid()))
+                self.mode == "read_write" and self.uid == current_euid()))
         )
 
 
@@ -128,7 +128,7 @@ class PreviewCapabilityStore:
         try:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
-                    or getattr(info, "st_uid", -1) != current_uid()
+                    or getattr(info, "st_uid", -1) != current_euid()
                     or (sys.platform != "win32" and info.st_nlink != 1)):
                 raise OSError("preview capability lock file is unsafe")
             fchmod(descriptor, self._lock_path, 0o600)
@@ -176,7 +176,7 @@ class PreviewCapabilityStore:
         if (
             not stat.S_ISREG(path_info.st_mode)
             or stat.S_ISLNK(path_info.st_mode)
-            or path_info.st_uid != current_uid()
+            or path_info.st_uid != current_euid()
             or (sys.platform != "win32"
                 and stat.S_IMODE(path_info.st_mode) & 0o077)
             or path_info.st_size > _INVALIDATION_FILE_MAX_BYTES
@@ -326,7 +326,7 @@ class PreviewCapabilityStore:
         try:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode)
-                    or getattr(info, "st_uid", -1) != current_uid()
+                    or getattr(info, "st_uid", -1) != current_euid()
                     or (sys.platform != "win32" and info.st_nlink != 1)
                     or info.st_size > _EPOCH_FILE_MAX_BYTES):
                 raise ValueError("preview capability epoch file is unsafe")
@@ -745,7 +745,7 @@ class PreviewCapabilityStore:
             raise PreviewCapabilityError("预览权限来源无效")
         canonical = self._canonical_path(path)
         file_stat = self._inspect_regular_file(canonical)
-        if mode == "read_write" and file_stat.st_uid != current_uid():
+        if mode == "read_write" and file_stat.st_uid != current_euid():
             raise PreviewCapabilityError("只允许编辑当前用户拥有的文件")
         return PreviewCapability(
             engine=engine,

@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +34,8 @@ from cc_remote.wrapper.process_scan import (
     process_identity,
     process_owner_uid,
 )
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, LOCK_NB, flock
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 _REPO = Path(__file__).resolve().parent.parent
 _START_TIMEOUT = 40
@@ -53,7 +54,7 @@ def state_root() -> Path:
 def private_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or mode_exposed(info.st_mode):
         raise LaunchError("共享入口的状态目录不是当前用户的私有目录。")
 
 
@@ -85,7 +86,7 @@ def matches_launch(identity: ProcessIdentity, profile: Path, endpoint: str) -> b
     return bool(
         home_ok and home and Path(home).resolve() == profile
         and url_ok and url == endpoint and process_identity(identity.pid) == identity
-        and process_owner_uid(identity.pid) == os.getuid()
+        and process_owner_uid(identity.pid) == current_uid()
     )
 
 
@@ -134,14 +135,14 @@ async def launch_lock(app: Path, root: Path):
     """
     private_directory(root)
     key = hashlib.sha256(os.fsencode(app)).hexdigest()[:24]
-    fd = os.open(root / f"{key}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = os.open(root / f"{key}.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     acquired = False
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid() or mode_exposed(info.st_mode) or info.st_nlink != 1:
             raise LaunchError("共享启动锁不安全；未启动 App。")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(fd, LOCK_EX | LOCK_NB)
             acquired = True
         except BlockingIOError:
             pass
@@ -201,7 +202,7 @@ class Bridge:
                 pid, uid = int(line[1:]), None
             elif line.startswith("u"):
                 uid = int(line[1:])
-            elif line == expected and uid == os.getuid() and pid is not None:
+            elif line == expected and uid == current_uid() and pid is not None:
                 identity = process_identity(pid)
                 if identity is None:
                     return None

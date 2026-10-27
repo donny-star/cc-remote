@@ -498,7 +498,7 @@ def _patch_rollout(
     )
     flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         before = os.fstat(descriptor)
@@ -598,7 +598,7 @@ def _recover_journals(
             )
         flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+            flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(rollout, flags)
         try:
             identity = os.fstat(descriptor)
@@ -783,7 +783,7 @@ def repair_http_provider_records(
                 try:
                     flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
                     if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
+                        flags |= getattr(os, "O_NOFOLLOW", 0)
                     descriptor = os.open(path, flags)
                     try:
                         current = pread(descriptor, len(replacement), 0)

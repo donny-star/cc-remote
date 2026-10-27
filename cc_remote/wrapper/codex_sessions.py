@@ -519,9 +519,9 @@ def _catalog_rollout_fork_parent(
 
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(expanded, flags)
     except OSError:

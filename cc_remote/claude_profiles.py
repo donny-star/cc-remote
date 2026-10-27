@@ -17,6 +17,8 @@ import re
 import stat
 from typing import Any, Iterator
 
+from cc_remote.wrapper.os_compat import fsync_directory
+
 
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 # Claude currently emits UUIDs, but the historical wrapper contract accepted
@@ -622,11 +624,7 @@ class ClaudeProfileTopologyStore:
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
             path.chmod(0o600)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(path.parent)
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -640,8 +638,4 @@ class ClaudeProfileTopologyStore:
             self.pending_path.unlink()
         except FileNotFoundError:
             return
-        directory_fd = os.open(self.pending_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(self.pending_path.parent)

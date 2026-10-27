@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
@@ -15,17 +14,19 @@ from cc_remote.wrapper.process_scan import process_identity
 
 from .server import Service
 from .wire import private_directory
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, LOCK_NB, flock
+from cc_remote.wrapper.os_compat import current_uid
 
 
 async def serve(directory: Path) -> None:
     private_directory(directory)
-    lock_fd = os.open(directory / "service.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_fd = os.open(directory / "service.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        flock(lock_fd, LOCK_EX | LOCK_NB)
         path = directory / "service.sock"
         if path.exists() or path.is_symlink():
             info = path.lstat()
-            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
                 raise PermissionError("unsafe Claude service socket")
             path.unlink()
         service = Service(directory)
@@ -38,7 +39,7 @@ async def serve(directory: Path) -> None:
             "socket": str(path), "protocol": 1,
         }
         descriptor = directory / "service.json"
-        fd = os.open(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = os.open(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w") as out:
             json.dump(state, out)
         stopped = asyncio.Event()

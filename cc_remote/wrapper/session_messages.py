@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +16,8 @@ from cc_remote.protocol import Error, Query
 from cc_remote.session_messages import (
     MAX_FRAME, envelope, make_server, reference, request_id, split_reference,
 )
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, LOCK_NB, flock
+from cc_remote.wrapper.os_compat import current_uid, fchmod, mode_exposed
 
 log = logger("cc_remote.wrapper.session_messages")
 MAX_PENDING = 32
@@ -31,14 +32,14 @@ class MessageStore:
     def db(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or mode_exposed(info.st_mode):
             raise ValueError("Message state must be a private directory owned by this user")
         path = self.root / "receipts.sqlite3"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_uid != os.getuid():
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_uid != current_uid():
                 raise ValueError("Invalid message store")
-            os.fchmod(fd, 0o600)
+            fchmod(fd, path, 0o600)
         finally:
             os.close(fd)
         db = sqlite3.connect(path, timeout=2)
@@ -144,16 +145,16 @@ class SessionMessages:
             pass
         if len(os.fsencode(self.socket)) > 103:
             raise ValueError("Message socket path exceeds the platform limit")
-        self.lock_fd = os.open(self.store.root / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        self.lock_fd = os.open(self.store.root / "server.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             lock_info = os.fstat(self.lock_fd)
-            if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid():
+            if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != current_uid():
                 raise ValueError("Invalid message server lock")
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(self.lock_fd, LOCK_EX | LOCK_NB)
             self.store.recover()
             if self.socket.exists() or self.socket.is_symlink():
                 info = self.socket.lstat()
-                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid():
                     raise ValueError("Refusing to replace an unrelated message socket")
                 self.socket.unlink()
             self.server = await asyncio.start_unix_server(self._client, str(self.socket), limit=MAX_FRAME)

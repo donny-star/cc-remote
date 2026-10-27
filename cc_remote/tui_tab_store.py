@@ -1,11 +1,12 @@
 """Private, endpoint-scoped tab identities; no transcript or credentials."""
 
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+
+from cc_remote.wrapper.file_lock_compat import LOCK_EX, flock
 
 
 def clean(value):
@@ -56,9 +57,9 @@ class TabStore:
         current = clean({"tabs": tabs, "active": active, "scope": list(scope)})
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_path = self.path.with_suffix(".lock")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            flock(lock.fileno(), LOCK_EX)
             latest = self._read() or clean(None)
             removed = set(self.previous["tabs"]) - set(current["tabs"])
             added = [sid for sid in current["tabs"]

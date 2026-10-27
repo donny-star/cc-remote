@@ -26,6 +26,7 @@ import time
 from typing import Callable, Iterable
 
 from cc_remote.protocol import CodexTerminalFence
+from cc_remote.wrapper.os_compat import fchmod
 
 
 # v1 could persist task_complete(error=...) as a successful terminal.
@@ -361,7 +362,7 @@ class CodexTerminalLedger:
         fd, temporary = tempfile.mkstemp(
             prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
-            os.fchmod(fd, 0o600)
+            fchmod(fd, temporary, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(payload)
                 stream.flush()

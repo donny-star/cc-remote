@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 from urllib.parse import urlsplit
+from cc_remote.wrapper.os_compat import current_uid
 
 
 _ENV_LIMIT = 1024 * 1024
@@ -73,12 +74,12 @@ def _service_environment() -> dict[str, str]:
             return {}
         directory = os.open(Path("/proc") / pid, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            if os.fstat(directory).st_uid != os.getuid():
+            if os.fstat(directory).st_uid != current_uid():
                 return {}
-            descriptor = os.open("environ", os.O_RDONLY | os.O_NOFOLLOW,
+            descriptor = os.open("environ", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                                  dir_fd=directory)
             with os.fdopen(descriptor, "rb") as stream:
-                if os.fstat(stream.fileno()).st_uid != os.getuid():
+                if os.fstat(stream.fileno()).st_uid != current_uid():
                     return {}
                 raw = stream.read(_ENV_LIMIT + 1)
         finally:

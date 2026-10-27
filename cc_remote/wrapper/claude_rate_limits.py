@@ -20,6 +20,7 @@ from typing import Any
 from uuid import uuid4
 
 from cc_remote.protocol import RateLimitUpdate, StatusRateLimitWindow
+from cc_remote.wrapper.os_compat import fsync_directory
 
 
 _VERSION = 1
@@ -189,11 +190,7 @@ class ClaudeRateLimitStore:
                 raise
             os.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(parent)
         except Exception as exc:
             try:
                 temporary.unlink()

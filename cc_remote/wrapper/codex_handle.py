@@ -36,6 +36,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.token_usage import CodexUsageTracker
 from cc_remote.wrapper.btw_history import CodexBtwCompletions
 from cc_remote.protocol import (
@@ -4536,6 +4537,10 @@ class CodexHandle:
                 try:
                     if process_group is not None:
                         os.killpg(process_group, sig)
+                    elif proc.returncode is None and sys.platform == "win32":
+                        # A Windows CLI is usually an npm ``.cmd`` shim; stop
+                        # the real app-server and its tools, not just cmd.exe.
+                        kill_process_tree(proc.pid)
                     elif proc.returncode is None:
                         (proc.kill() if force else proc.terminate())
                 except ProcessLookupError:

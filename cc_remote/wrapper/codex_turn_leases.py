@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from cc_remote.wrapper.os_compat import fchmod
+from cc_remote.wrapper.os_compat import fchmod, fsync_directory
 
 
 _SCHEMA_VERSION = 3
@@ -294,11 +294,7 @@ class CodexTurnLeaseStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.path.parent)
         finally:
             if fd >= 0:
                 os.close(fd)

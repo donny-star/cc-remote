@@ -20,6 +20,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from cc_remote.protocol import TurnPlan
+from cc_remote.wrapper.os_compat import fsync_directory
 
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -414,11 +415,7 @@ class SessionPlanStore:
                     pass
                 raise
             os.replace(tmp, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.path.parent)
         except Exception as exc:
             try:
                 tmp.unlink()

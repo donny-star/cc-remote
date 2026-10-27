@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import time
 from uuid import UUID, uuid4
+from cc_remote.wrapper.os_compat import current_uid, fchmod, mode_exposed
 
 OUTPUT_BYTES = 64 * 1024
 MAX_ACTIVE = 8
@@ -65,7 +66,7 @@ def request_thread(meta):
 class TaskStore:
     def __init__(self, home: Path):
         self.home = home.expanduser().resolve(strict=True)
-        if not self.home.is_dir() or self.home.stat().st_uid != os.getuid():
+        if not self.home.is_dir() or self.home.stat().st_uid != current_uid():
             raise ValueError("Codex home must be an existing directory owned by this user")
         self.root = self.home / "cc-remote-async-tasks"
         self.path = self.root / "tasks.sqlite3"
@@ -74,14 +75,14 @@ class TaskStore:
     def db(self):
         self.root.mkdir(mode=0o700, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or mode_exposed(info.st_mode):
             raise ValueError("Task state directory must be private and owned by this user")
         if self.path.exists() or self.path.is_symlink():
             info = self.path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid():
                 raise ValueError("Invalid task database")
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        os.fchmod(fd, 0o600)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fchmod(fd, self.path, 0o600)
         os.close(fd)
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
@@ -182,15 +183,15 @@ class TaskStore:
             root = self.root.lstat()
         except FileNotFoundError:
             return []
-        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid()
-                or root.st_mode & 0o077):
+        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != current_uid()
+                or mode_exposed(root.st_mode)):
             raise ValueError("Invalid task state directory")
         try:
             info = self.path.lstat()
         except FileNotFoundError:
             return []
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or mode_exposed(info.st_mode)):
             raise ValueError("Invalid task database")
         db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
         db.row_factory = sqlite3.Row

@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import re
-import resource
 import signal
 import shutil
 import stat
@@ -27,13 +26,18 @@ from typing import Any, Mapping, Optional
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
-from cc_remote.wrapper.os_compat import current_uid
+from cc_remote.wrapper.os_compat import current_uid, fsync_directory, mode_exposed
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
     ProcessIdentity,
     process_identity,
     process_owner_uid,
 )
+
+if sys.platform != "win32":
+    import resource
+else:  # Windows has no POSIX resource limits; prlimit checks are Linux-only.
+    resource = None
 
 log = logger("cc_remote.wrapper.codex_daemon")
 
@@ -202,9 +206,9 @@ def _prepare_profile_standalone(
     if (
         source_binary != binary
         or not stat.S_ISDIR(source_stat.st_mode)
-        or source_stat.st_uid != os.getuid()
+        or source_stat.st_uid != current_uid()
         or not stat.S_ISDIR(home_stat.st_mode)
-        or home_stat.st_uid != os.getuid()
+        or home_stat.st_uid != current_uid()
     ):
         return None
 
@@ -229,9 +233,9 @@ def _prepare_profile_standalone(
             existing_release = existing.parent.parent
             safely_replaceable = bool(
                 stat.S_ISLNK(destination_stat.st_mode)
-                and destination_stat.st_uid == os.getuid()
+                and destination_stat.st_uid == current_uid()
                 and stat.S_ISREG(existing_stat.st_mode)
-                and existing_stat.st_uid == os.getuid()
+                and existing_stat.st_uid == current_uid()
                 and os.access(existing, os.X_OK)
                 and existing.parent.name == "bin"
                 and existing_release.parent.name == "releases"
@@ -266,11 +270,7 @@ def _prepare_profile_standalone(
                 pass
             return False
         try:
-            directory_fd = os.open(destination.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(destination.parent)
         except OSError as exc:
             # The atomic replacement is already visible. A directory-fsync
             # failure weakens crash durability but must not make callers retry
@@ -300,7 +300,7 @@ def _prepare_profile_standalone(
             directory_stat = directory.lstat()
             if (
                 not stat.S_ISDIR(directory_stat.st_mode)
-                or directory_stat.st_uid != os.getuid()
+                or directory_stat.st_uid != current_uid()
             ):
                 return False
         os.symlink(source_current, destination, target_is_directory=True)
@@ -374,7 +374,7 @@ def _managed_daemon_process_identity(
     """
     home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
     pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
-    if pid is None or process_owner_uid(pid) != os.getuid():
+    if pid is None or process_owner_uid(pid) != current_uid():
         return None
     return process_identity(pid)
 
@@ -391,13 +391,13 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
     Accept only that exact mapping, never an arbitrary or cross-account link.
     The physical listener's identity fences replacement behind an unchanged alias.
     """
-    uid = os.getuid() if owner_uid is None else owner_uid
+    uid = current_uid() if owner_uid is None else owner_uid
     address = Path(path)
     parent = address.parent
     parent_info = parent.lstat()
     if (not address.is_absolute() or str(parent.resolve()) != str(parent)
             or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != uid
-            or parent_info.st_mode & 0o022):
+            or mode_exposed(parent_info.st_mode, 0o022)):
         raise ValueError("Codex socket parent is not private to its owner")
     info = address.lstat()
     if stat.S_ISLNK(info.st_mode):
@@ -411,7 +411,7 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
             raise ValueError("Codex protected socket directory is not private")
         info = target.lstat()
     if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid
-            or info.st_mode & 0o077):
+            or mode_exposed(info.st_mode)):
         raise ValueError("Codex socket is not private to its owner")
     return info.st_dev, info.st_ino, info.st_ctime_ns
 
@@ -486,7 +486,7 @@ def _ensure_managed_daemon_nofile(
         "app-server-daemon"
     )
     pid = _managed_pid(daemon_root / "app-server.pid")
-    if pid is None or process_owner_uid(pid) != os.getuid():
+    if pid is None or process_owner_uid(pid) != current_uid():
         return False
     proc_root = _PROC_ROOT / str(pid)
     before = _linux_process_start_ticks(pid)

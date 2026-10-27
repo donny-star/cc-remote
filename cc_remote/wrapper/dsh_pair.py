@@ -10,20 +10,20 @@ import asyncio
 import getpass
 import json
 import os
-import stat
 import tempfile
 from pathlib import Path
 
 from cc_remote.wrapper.dsh_client import (
     DshClient, DshConnection, DshError,
 )
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 
 def save_connection(connection: DshConnection, path: Path) -> None:
     path = path.expanduser().absolute()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.parent.stat()
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    if info.st_uid != current_uid() or mode_exposed(info.st_mode, 0o022):
         raise DshError("invalid_connection", "配对文件所在目录必须由当前用户拥有且其他用户不可写。")
     fd, staging = tempfile.mkstemp(prefix=".dsh-pair-", dir=path.parent)
     try:

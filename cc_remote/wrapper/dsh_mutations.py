@@ -15,6 +15,7 @@ from pathlib import Path
 import sqlite3
 
 from cc_remote.wrapper.dsh_client import DshError
+from cc_remote.wrapper.os_compat import fsync_directory
 
 
 def digest(value) -> str:
@@ -30,7 +31,7 @@ class DshMutationJournal:
     def connection(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.close(fd)
             with closing(sqlite3.connect(self.path, timeout=10)) as db:
                 db.row_factory = sqlite3.Row
@@ -40,11 +41,7 @@ class DshMutationJournal:
                            "sid TEXT, result TEXT)")
                 yield db
             # Include the initial database's directory entry in durability.
-            fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            fsync_directory(self.path.parent)
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise DshError("mutation_journal", "无法确认 DSH 操作记录，已停止自动执行。请检查设备状态。") from exc
 

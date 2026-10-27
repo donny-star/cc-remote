@@ -12,7 +12,6 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
-import signal
 import tempfile
 import time
 from typing import Any
@@ -27,6 +26,7 @@ from cc_remote import __version__
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, socket_identity
 from cc_remote.wrapper.codex_service import DaemonIsolationError
 from cc_remote.wrapper.process_scan import process_identity
+from cc_remote.wrapper.os_compat import current_euid, kill_process_tree
 
 REPORT_NAME = "codex-readiness.json"
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -40,7 +40,7 @@ async def probe_config(socket_path: str) -> None:
     alone doesn't exercise the config loader used to start the next turn. Never
     expose the config or raw native errors in this acceptance check.
     """
-    before = socket_identity(socket_path, owner_uid=os.geteuid())
+    before = socket_identity(socket_path, owner_uid=current_euid())
     async with asyncio.timeout(_TIMEOUT):
         async with unix_connect(
             socket_path, uri="ws://localhost/", proxy=None,
@@ -66,7 +66,7 @@ async def probe_config(socket_path: str) -> None:
             result = await request(2, "config/read", {"includeLayers": False})
             if not isinstance(result.get("config"), dict):
                 raise RuntimeError("Codex live configuration response is invalid")
-    if socket_identity(socket_path, owner_uid=os.geteuid()) != before:
+    if socket_identity(socket_path, owner_uid=current_euid()) != before:
         raise RuntimeError("Codex daemon changed during configuration check")
 
 
@@ -141,7 +141,7 @@ async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> Non
         except TimeoutError:
             # Only this short-lived, thread-free probe is terminated.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                kill_process_tree(process.pid)
             except ProcessLookupError:
                 pass
             await process.wait()

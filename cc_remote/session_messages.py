@@ -9,10 +9,10 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import re
 import stat
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 MAX_PROMPT = 32_000
 MAX_FRAME = 256 * 1024
@@ -157,9 +157,9 @@ def make_server(call):
 async def rpc(path: Path, request: dict) -> dict:
     info = path.lstat()
     parent = path.parent.lstat()
-    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
-            or info.st_mode & 0o077 or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != os.getuid() or parent.st_mode & 0o077):
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid()
+            or mode_exposed(info.st_mode) or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != current_uid() or mode_exposed(parent.st_mode)):
         raise ValueError("Message socket must be private and owned by this user")
     async with asyncio.timeout(45):
         reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_FRAME)

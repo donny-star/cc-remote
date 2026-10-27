@@ -10,11 +10,11 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import signal
 import stat
 import time
 
 from cc_remote.claude_profiles import ClaudeProfile
+from cc_remote.wrapper.os_compat import current_uid, kill_process_tree, mode_exposed
 
 
 MAX_BYTES = 64 * 1024
@@ -36,8 +36,8 @@ class ClaudeUsageReader:
         try:
             with self.path.open("rb") as stream:
                 info = os.fstat(stream.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_mode & 0o077 or info.st_size > MAX_BYTES):
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                        or mode_exposed(info.st_mode) or info.st_size > MAX_BYTES):
                     raise ValueError()
                 raw = json.loads(stream.read(MAX_BYTES + 1))
             if not isinstance(raw, dict) or raw.get("version") != 1:
@@ -129,7 +129,7 @@ class ClaudeUsageReader:
         finally:
             if process is not None and process.returncode is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    kill_process_tree(process.pid)
                 except ProcessLookupError:
                     pass
                 await process.wait()

@@ -27,6 +27,7 @@ from cc_remote.wrapper.process_scan import (
     process_identity,
     process_owner_uid,
 )
+from cc_remote.wrapper.os_compat import current_uid, mode_exposed
 
 _TEAM = "2DC432GLL2"
 _MAX_LOG = 256 * 1024
@@ -76,8 +77,8 @@ def app_paths(app: Path) -> tuple[Path, Path, Path, str]:
 def _private_socket(path: Path) -> os.stat_result:
     info = path.lstat()
     if (
-        not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
-        or info.st_mode & 0o077
+        not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid()
+        or mode_exposed(info.st_mode)
     ):
         raise ValueError("socket is not private to this login user")
     return info
@@ -89,7 +90,7 @@ def _matching_app_pids(executable: Path) -> list[int]:
         fields = line.strip().split(None, 2)
         if (
             len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit()
-            and int(fields[1]) == os.getuid() and fields[2] == str(executable)
+            and int(fields[1]) == current_uid() and fields[2] == str(executable)
         ):
             found.append(int(fields[0]))
     return found
@@ -108,12 +109,12 @@ def _shared_bridge(profile: Path, port: int) -> ProcessIdentity | None:
             pid, uid = int(line[1:]), None
         elif line.startswith("u"):
             uid = int(line[1:])
-        elif line == f"n127.0.0.1:{port}" and uid == os.getuid() and pid is not None:
+        elif line == f"n127.0.0.1:{port}" and uid == current_uid() and pid is not None:
             pids.add(pid)
     if len(pids) != 1:
         return None
     identity = process_identity(pids.pop())
-    if identity is None or process_owner_uid(identity.pid) != os.getuid():
+    if identity is None or process_owner_uid(identity.pid) != current_uid():
         return None
     argv = process_command(identity)
     if not argv:
@@ -180,7 +181,7 @@ def _shared_app(identity, profile: Path) -> bool:
                 for peer in peers)
             and process_identity(bridge.pid) == bridge
             and process_identity(identity.pid) == identity
-            and process_owner_uid(identity.pid) == os.getuid()
+            and process_owner_uid(identity.pid) == current_uid()
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
@@ -210,12 +211,12 @@ def _pipe_from_open_logs(pid: int, bundle_id: str) -> Path | None:
         inspected += 1
         if inspected > 8:
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         try:
             info = os.fstat(fd)
             if (
-                not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o022
+                not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+                or mode_exposed(info.st_mode, 0o022)
             ):
                 continue
             raw = os.read(fd, _MAX_LOG).decode("utf-8", errors="replace")
@@ -251,7 +252,7 @@ def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> 
         socket_identity(str(profile / "app-server-control/app-server-control.sock"))
         executable, node, plugin, bundle_id = app_paths(app)
         if expected_manifest is not None:
-            entry = json.loads((plugin / "desktop-mcp.json").read_text())["mcpServers"]["codex_app"]
+            entry = json.loads((plugin / "desktop-mcp.json").read_text(encoding="utf-8"))["mcpServers"]["codex_app"]
             if _manifest_hash(entry) != expected_manifest:
                 return {"state": "unavailable", "reason": "official_policy_changed"}
         matches = []
@@ -268,7 +269,7 @@ def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> 
             if _runtime_fingerprint(node) != runtime:
                 continue  # An updater replaced the runtime during validation.
             socket = _private_socket(pipe)
-            if process_owner_uid(pid) != os.getuid() or process_identity(pid) != identity:
+            if process_owner_uid(pid) != current_uid() or process_identity(pid) != identity:
                 continue
             matches.append({
                 "state": "ready", "pid": pid,
@@ -288,7 +289,7 @@ def mcp_config(profile: Path, app: Path) -> dict:
     _, node, plugin, _ = app_paths(app)
     _signed(app.resolve())
     _signed(node)
-    entry = json.loads((plugin / "desktop-mcp.json").read_text())["mcpServers"]["codex_app"]
+    entry = json.loads((plugin / "desktop-mcp.json").read_text(encoding="utf-8"))["mcpServers"]["codex_app"]
     manifest_hash = _manifest_hash(entry)
     entry.update({
         "command": str(node),

@@ -169,7 +169,7 @@ async def _rpc_connection(cwd, codex_home, nofile_soft_limit=None):
     bin_path = await asyncio.to_thread(_resolve_codex_bin)
     workdir = os.path.realpath(os.path.expanduser(cwd or "~"))
     app_server_argv = (bin_path, "app-server", "--stdio")
-    if nofile_soft_limit is not None:
+    if nofile_soft_limit is not None and os.name == "posix":
         app_server_argv = (
             sys.executable,
             _RLIMIT_EXEC,

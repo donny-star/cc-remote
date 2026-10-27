@@ -9,10 +9,88 @@ import time
 from os import PathLike
 
 
+def use_binary_descriptors() -> None:
+    """Make raw ``os.open`` descriptors binary on Windows, as on POSIX.
+
+    The Windows CRT opens descriptors in *text* mode unless ``O_BINARY`` is
+    passed: ``os.write`` then expands LF to CRLF and ``os.read`` folds CRLF
+    and stops at Ctrl-Z. Every journal, lock, attachment
+    and atomic-replace writer in cc-remote assumes byte-exact descriptors, so
+    switch the process-wide UCRT default once instead of trusting each call
+    site to remember the flag. Buffered ``open()`` already forces binary.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        set_fmode = ctypes.CDLL("ucrtbase")._set_fmode
+    except (AttributeError, OSError):
+        return
+    set_fmode.argtypes = [ctypes.c_int]
+    set_fmode.restype = ctypes.c_int
+    set_fmode(os.O_BINARY)
+
+
 def current_uid() -> int:
     """Return the Unix uid, or the stable Windows ``st_uid`` placeholder."""
     getuid = getattr(os, "getuid", None)
     return getuid() if getuid is not None else 0
+
+
+def current_euid() -> int:
+    """Return the effective Unix uid, or the Windows ``st_uid`` placeholder."""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid() if geteuid is not None else 0
+
+
+def mode_exposed(mode: int, mask: int = 0o077) -> bool:
+    """Whether POSIX permission bits grant access outside ``mask``'s owner.
+
+    Windows synthesizes ``st_mode`` (0o666/0o444) and enforces privacy with
+    the user profile's ACLs instead, so the bit test never applies there.
+    """
+    return sys.platform != "win32" and bool(mode & mask)
+
+
+def is_redirect(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symlink or a Windows reparse point.
+
+    Junctions and other name-surrogate reparse points redirect path lookups
+    exactly like symlinks but are not reported by ``S_ISLNK``.
+    """
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def kill_process_tree(pid: int) -> None:
+    """Force-stop a child started with ``start_new_session`` and its descendants.
+
+    POSIX kills the child's process group. Windows has no process groups for
+    this purpose; npm installs ``claude``/``codex`` as ``.cmd`` shims, so
+    killing only the direct child would orphan the real CLI. ``taskkill /T``
+    walks the recorded parent links instead. Raises ``ProcessLookupError``
+    when the process is already gone, matching ``os.killpg``.
+    """
+    if sys.platform != "win32":
+        import signal
+
+        os.killpg(pid, signal.SIGKILL)
+        return
+    import subprocess
+
+    result = subprocess.run(
+        ["taskkill", "/T", "/F", "/PID", str(pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    # 128: no such process. Any other failure leaves the caller's own wait()
+    # to surface a still-running child.
+    if result.returncode == 128:
+        raise ProcessLookupError(pid)
 
 
 def fchmod(fd: int, path: str | PathLike[str], mode: int) -> None:
