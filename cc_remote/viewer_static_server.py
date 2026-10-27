@@ -12,11 +12,14 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 from urllib.parse import urlsplit
 
 from cc_remote.viewer import clean_path
+from cc_remote.wrapper import process_scan_win32
+from cc_remote.wrapper.os_compat import current_uid
 
 
 def command(argv: list[str]) -> str:
@@ -31,7 +34,15 @@ def command(argv: list[str]) -> str:
     value = subprocess.run(argv, capture_output=True, timeout=2, check=True).stdout
     if len(value) > 512 * 1024:
         raise ValueError("discovery output too large")
+    if sys.platform == "win32":
+        # netstat localizes its headers in the OEM code page; the parsed
+        # address/PID columns are always ASCII.
+        return value.decode("ascii", errors="replace")
     return value.decode("utf-8", errors="strict")
+
+
+def _netstat() -> str:
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "NETSTAT.EXE")
 
 
 def local_addresses() -> set[str]:
@@ -41,13 +52,21 @@ def local_addresses() -> set[str]:
         addresses.update(info["local"] for link in data for info in link.get("addr_info", []))
     elif sys.platform == "darwin":
         addresses.update(re.findall(r"\binet6?\s+([0-9a-fA-F:.]+)", command(["/sbin/ifconfig", "-a"])))
+    elif sys.platform == "win32":
+        # Link-local scoped addresses are never private-network URL hosts.
+        addresses.update(
+            info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)
+            if "%" not in info[4][0])
     else:
         raise ValueError("unsupported listener discovery")
     return {str(ipaddress.ip_address(value)) for value in addresses}
 
 
 def python_static_root(argv: list[str], cwd: Path, port: int) -> Path | None:
-    if not argv or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(argv[0]).name.casefold()):
+    name = Path(argv[0]).name.casefold() if argv else ""
+    if sys.platform == "win32":
+        name = name.removesuffix(".exe")
+    if not argv or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", name):
         return None
     args = list(argv[1:])
     while args and args[0] in {"-u", "-I", "-E", "-s", "-S", "-B", "-P"}:
@@ -104,7 +123,7 @@ def mac_argv(pid: int) -> list[str]:
 def process(pid: int) -> tuple[list[str], Path]:
     if sys.platform == "linux":
         root = Path("/proc") / str(pid)
-        if root.stat().st_uid != os.getuid():
+        if root.stat().st_uid != current_uid():
             raise PermissionError("listener belongs to another user")
         with (root / "cmdline").open("rb") as stream:
             raw = stream.read(128 * 1024 + 1)
@@ -112,7 +131,7 @@ def process(pid: int) -> tuple[list[str], Path]:
             raise ValueError("invalid process arguments")
         return [arg.decode("utf-8") for arg in raw[:-1].split(b"\0")], Path(os.readlink(root / "cwd"))
     if sys.platform == "darwin":
-        if int(command(["/bin/ps", "-p", str(pid), "-o", "uid="]).strip()) != os.getuid():
+        if int(command(["/bin/ps", "-p", str(pid), "-o", "uid="]).strip()) != current_uid():
             raise PermissionError("listener belongs to another user")
         paths = [line[1:] for line in command([
             "/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn",
@@ -120,6 +139,16 @@ def process(pid: int) -> tuple[list[str], Path]:
         if len(paths) != 1:
             raise ValueError("ambiguous process directory")
         return mac_argv(pid), Path(paths[0])
+    if sys.platform == "win32":
+        if process_scan_win32.owner_matches_current(pid) is not True:
+            raise PermissionError("listener belongs to another user")
+        found = process_scan_win32.identity(pid)
+        snapshot = found and process_scan_win32.command_environment(
+            pid, found[0], 128 * 1024, 1024 * 1024)
+        if not snapshot or not snapshot[0] or snapshot[1] is None:
+            raise OSError("process arguments unavailable")
+        args, cwd, _ = snapshot
+        return [os.fsdecode(arg) for arg in args], Path(cwd)
     raise ValueError("unsupported process discovery")
 
 
@@ -149,6 +178,16 @@ def listeners(port: int, address: str) -> set[int]:
                 pid = int(line[1:])
             elif line.startswith("n") and pid and matches(line[1:]):
                 pids.add(pid)
+        return pids
+    if sys.platform == "win32":
+        output = command([_netstat(), "-ano", "-p", "TCPv6" if family == 6 else "TCP"])
+        pids = set()
+        for line in output.splitlines():
+            fields = line.split()
+            # The state column is localized; a listener's foreign port is 0.
+            if (len(fields) == 5 and fields[0] == "TCP" and fields[2].endswith(":0")
+                    and fields[4].isdecimal() and matches(fields[1])):
+                pids.add(int(fields[4]))
         return pids
     raise ValueError("unsupported listener discovery")
 

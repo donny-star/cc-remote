@@ -7,6 +7,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from cc_remote.wrapper import process_scan_win32
+from cc_remote.wrapper.os_compat import current_uid
+
 
 MAX_PROC_SCAN = 8192
 MAX_CMDLINE_BYTES = 64 * 1024
@@ -277,7 +280,7 @@ def _darwin_needs_engine_argv(metadata: DarwinBsdSnapshot) -> bool:
     # turning an unreadable root/other-user Node process into a permanent
     # fail-closed state for every local Codex profile; exact rollout writers
     # remain covered independently by the inode/lsof scan below.
-    if metadata[3] != os.getuid():
+    if metadata[3] != current_uid():
         return False
     names = {metadata[4].lower(), metadata[5].lower()}
     return any(
@@ -315,6 +318,65 @@ def darwin_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
     return result, complete
 
 
+def _win32_needs_engine_argv(image: str) -> bool:
+    name = image.lower()
+    return (
+        "claude" in name or "codex" in name
+        or name in {"node.exe", "bun.exe"}
+    )
+
+
+def win32_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
+    """Windows analog of :func:`darwin_process_snapshot`.
+
+    Toolhelp32 supplies the complete PID/parent map. Processes this account
+    cannot open (protected services, other users) are skipped: they can never
+    be this account's Claude/Codex client. Only plausible engine images pay for
+    an argv read, and a live candidate with unreadable argv makes the scan
+    incomplete. Windows has no controlling TTY, so every row reports one.
+    """
+    entries, complete = process_scan_win32.process_entries()
+    if not complete:
+        return [], False
+    result: list[DarwinProcessInfo] = []
+    for pid, _parent, image in entries:
+        if pid <= 0:
+            continue
+        observed = process_scan_win32.identity(pid)
+        if observed is None:
+            continue
+        identity = ProcessIdentity(pid, observed[0])
+        args: tuple[bytes, ...] = ()
+        if _win32_needs_engine_argv(image):
+            read = process_scan_win32.command(
+                pid, identity.start_ticks, MAX_CMDLINE_BYTES)
+            if read is None:
+                if process_identity(pid) == identity:
+                    complete = False
+                continue
+            args = read
+        result.append((identity, observed[1], 1, args))
+    return result, complete
+
+
+def win32_process_cwds(
+    identities: list[ProcessIdentity],
+) -> tuple[dict[int, str], bool]:
+    """Return realpath cwds for exact live identities; incomplete on a stable miss."""
+    result: dict[int, str] = {}
+    complete = True
+    for identity in identities:
+        payload = process_scan_win32.command_environment(
+            identity.pid, identity.start_ticks,
+            MAX_CMDLINE_BYTES, MAX_ENVIRON_BYTES)
+        if payload is None or payload[1] is None:
+            if process_identity(identity.pid) == identity:
+                complete = False
+            continue
+        result[identity.pid] = os.path.realpath(payload[1])
+    return result, complete
+
+
 def process_identity(pid: int, *, proc_root: str = "/proc",
                      parent_pid: int | None = None) -> ProcessIdentity | None:
     stat = _process_stat(Path(proc_root) / str(pid))
@@ -327,6 +389,12 @@ def process_identity(pid: int, *, proc_root: str = "/proc",
         if info is None or (parent_pid is not None and info[1] != parent_pid):
             return None
         return info[0]
+    if sys.platform == "win32" and proc_root == "/proc":
+        observed = process_scan_win32.identity(pid)
+        if observed is None or (
+                parent_pid is not None and observed[1] != parent_pid):
+            return None
+        return ProcessIdentity(pid, observed[0])
     return None
 
 
@@ -352,6 +420,9 @@ def process_command(
         if info is None or info[0] != identity:
             return None
         return info[3]
+    if sys.platform == "win32" and proc_root == "/proc":
+        return process_scan_win32.command(
+            identity.pid, identity.start_ticks, MAX_CMDLINE_BYTES)
     return None
 
 
@@ -414,6 +485,15 @@ def process_command_environment_value(
         complete, value = _environment_value(
             tuple(item for item in raw.split(b"\0") if item), key)
         return complete, args, value
+    if sys.platform == "win32" and proc_root == "/proc":
+        snapshot = process_scan_win32.command_environment(
+            identity.pid, identity.start_ticks,
+            MAX_CMDLINE_BYTES, MAX_ENVIRON_BYTES)
+        if snapshot is None:
+            return False, None, None
+        args, _cwd, environment = snapshot
+        complete, value = _environment_value(environment, key.upper())
+        return complete, args, value
     if sys.platform != "darwin" or proc_root != "/proc":
         return False, None, None
     payload = _darwin_exact_process_payload(identity.pid, identity)
@@ -442,6 +522,11 @@ def process_owner_uid(pid: int, *, proc_root: str = "/proc") -> int | None:
         return os.stat(str(Path(proc_root) / str(pid))).st_uid
     except OSError:
         pass
+    if sys.platform == "win32" and proc_root == "/proc":
+        matches = process_scan_win32.owner_matches_current(pid)
+        if matches is None:
+            return None
+        return current_uid() if matches else process_scan_win32.FOREIGN_OWNER_UID
     if sys.platform != "darwin" or proc_root != "/proc":
         return None
     metadata = _darwin_bsd_snapshot(pid)

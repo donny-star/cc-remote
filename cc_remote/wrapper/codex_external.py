@@ -37,6 +37,7 @@ from cc_remote.wrapper.process_scan import (
     _process_start_ticks,
     _process_stat,
     darwin_process_snapshot,
+    win32_process_snapshot,
     process_command,
     process_command_environment_value,
     process_identity,
@@ -272,6 +273,13 @@ class CodexTuiLogTracker:
         return result, True
 
 
+def _command_name(arg: bytes) -> bytes:
+    """Return an argv basename; Windows accepts either separator and folds case."""
+    if sys.platform == "win32":
+        return arg.replace(b"\\", b"/").rsplit(b"/", 1)[-1].lower()
+    return arg.rsplit(b"/", 1)[-1]
+
+
 def _is_passive_app_server(
     proc_dir: Path, tty_nr: int, args: tuple[bytes, ...] | None = None,
 ) -> bool:
@@ -400,7 +408,7 @@ def _codex_resume_sids(
     """
     if not args or b"resume" not in args:
         return set()
-    command_names = {arg.rsplit(b"/", 1)[-1] for arg in args[:2]}
+    command_names = {_command_name(arg) for arg in args[:2]}
     if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
         return set()
     resume_at = args.index(b"resume")
@@ -438,7 +446,7 @@ def _is_interactive_codex_tui(
     """Recognize a native Codex TUI without treating helper commands as one."""
     if tty_nr == 0 or not args:
         return False
-    command_names = {arg.rsplit(b"/", 1)[-1] for arg in args[:2]}
+    command_names = {_command_name(arg) for arg in args[:2]}
     if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
         return False
     return not any(
@@ -466,7 +474,7 @@ def _fold_npm_tui_launchers(
     children: dict[int, list[DarwinProcessInfo]] = {}
     for row in rows:
         _identity, ppid, tty_nr, args = row
-        if (args and args[0].rsplit(b"/", 1)[-1] in {b"codex", b"codex.exe"}
+        if (args and _command_name(args[0]) in {b"codex", b"codex.exe"}
                 and _is_interactive_codex_tui(args, tty_nr)):
             children.setdefault(ppid, []).append(row)
 
@@ -474,9 +482,9 @@ def _fold_npm_tui_launchers(
     for parent in rows:
         identity, _ppid, tty_nr, args = parent
         if (len(args) < 2
-                or args[0].rsplit(b"/", 1)[-1] not in {
+                or _command_name(args[0]) not in {
                     b"node", b"nodejs", b"node.exe"}
-                or args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+                or _command_name(args[1]) not in {b"codex", b"codex.js"}
                 or not _is_interactive_codex_tui(args, tty_nr)):
             continue
         candidates = children.get(identity.pid, [])
@@ -518,7 +526,7 @@ def _is_owned_npm_app_server_child(
     identity, ppid, tty_nr, args = child
     root = own_roots.get(ppid)
     if (root is None or tty_nr != 0 or not args
-            or args[0].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.exe"}
+            or _command_name(args[0]) not in {b"codex", b"codex.exe"}
             or args[1:3] not in {
                 (b"app-server", b"proxy"), (b"app-server", b"--stdio")}):
         return False
@@ -527,9 +535,9 @@ def _is_owned_npm_app_server_child(
         return False
     parent_identity, _parent_ppid, parent_tty, parent_args = parent
     if (parent_identity != root or parent_tty != 0 or len(parent_args) < 3
-            or parent_args[0].rsplit(b"/", 1)[-1] not in {
+            or _command_name(parent_args[0]) not in {
                 b"node", b"nodejs", b"node.exe"}
-            or parent_args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+            or _command_name(parent_args[1]) not in {b"codex", b"codex.js"}
             or identity.start_ticks < root.start_ticks
             or args[1:] != parent_args[2:]):
         return False
@@ -760,48 +768,6 @@ def _darwin_writable_rollout_holders(
     return scan
 
 
-def _win32_process_parent_map() -> dict[int, int] | None:
-    """Return {pid: ppid} for every live process via Toolhelp32."""
-    import ctypes
-    from ctypes import wintypes
-
-    TH32CS_SNAPPROCESS = 0x00000002
-    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_wchar * 260),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == INVALID_HANDLE_VALUE:
-        return None
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
-            return None
-        parent_map: dict[int, int] = {}
-        while True:
-            parent_map[int(entry.th32ProcessID)] = int(
-                entry.th32ParentProcessID)
-            if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
-                break
-        return parent_map
-    finally:
-        kernel32.CloseHandle(snap)
-
-
 def _win32_is_descendant(
     pid: int,
     ancestor_pid: int,
@@ -825,6 +791,7 @@ def _win32_writable_rollout_holders(
     own_processes: Iterable[ProcessIdentity],
     *,
     wrapper_pid: int,
+    process_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
 ) -> HolderScan:
     """Windows implementation of writable_rollout_holders.
 
@@ -836,12 +803,10 @@ def _win32_writable_rollout_holders(
     parent map, and ``own_processes`` covers the exact SDK process identities.
 
     Unreadable protected processes are the norm on Windows and are never Codex
-    clients; they are skipped without marking the scan incomplete, matching the
-    established ``_win32_claude_session_holders`` convention.  ``complete`` is
-    therefore only False when the process snapshot itself fails or overflows.
+    clients; :func:`win32_process_snapshot` skips them, and only reports an
+    incomplete scan when the snapshot fails or a live engine candidate's argv
+    cannot be read.
     """
-    import win32process
-
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
     private = {sid: set() for sid in paths}
@@ -853,32 +818,20 @@ def _win32_writable_rollout_holders(
         for sid, path in paths.items() if path
     }
     own = set(own_processes)
-    parent_map = _win32_process_parent_map()
-
-    try:
-        pids = win32process.EnumProcesses()
-    except Exception:
+    snapshot = process_snapshot or win32_process_snapshot()
+    processes, complete = snapshot
+    if not processes and not complete:
         return HolderScan(result, False, passive, client_proxies, private)
-    complete = True
-    if len(pids) > MAX_PROC_SCAN:
-        complete = False
-        pids = pids[:MAX_PROC_SCAN]
+    parent_map = {row[0].pid: row[1] for row in processes}
+    owned_roots = {identity.pid for identity in own}
 
-    for pid in pids:
-        if pid == 0 or pid == wrapper_pid:
+    for identity, _parent_pid, _tty_nr, args in processes:
+        pid = identity.pid
+        if pid == wrapper_pid or identity in own or not args:
             continue
-        identity = process_identity(pid)
-        if identity is None or identity in own:
-            continue
-        if parent_map is not None and _win32_is_descendant(
-                pid, wrapper_pid, parent_map):
-            continue
-        args = process_command(identity)
-        if args is None:
-            continue
-        # Reject PID reuse/exit races: only a live identity with the exact
-        # start ticks may claim ownership of a watched rollout.
-        if process_identity(pid) != identity:
+        if _win32_is_descendant(pid, wrapper_pid, parent_map) or any(
+                _win32_is_descendant(pid, root, parent_map)
+                for root in owned_roots):
             continue
         interactive_tui = _is_interactive_codex_tui(args, 1)
         is_proxy = _is_app_server_proxy(args, 0)
@@ -896,6 +849,10 @@ def _win32_writable_rollout_holders(
                     matched.add(watched_sid)
         if not matched and not logical_sids:
             continue
+        # Reject PID reuse/exit races: only a live identity with the exact
+        # creation time may claim ownership of a watched rollout.
+        if process_identity(pid) != identity:
+            continue
         for sid in logical_sids:
             result[sid].add(identity)
             if sid not in matched:
@@ -907,7 +864,7 @@ def _win32_writable_rollout_holders(
                 if not _is_managed_shared_app_server(args):
                     private[sid].add(identity)
     return HolderScan(result, complete, passive, client_proxies, private,
-                      logical_holders=logical)
+                      logical_holders=logical, darwin_snapshot=snapshot)
 
 
 def writable_rollout_holders(
@@ -931,7 +888,8 @@ def writable_rollout_holders(
     if sys.platform == "win32" and proc_root == "/proc":
         return _win32_writable_rollout_holders(
             paths, own_processes, wrapper_pid=(
-                wrapper_pid if wrapper_pid is not None else os.getpid()))
+                wrapper_pid if wrapper_pid is not None else os.getpid()),
+            process_snapshot=darwin_snapshot)
 
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
