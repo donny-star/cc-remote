@@ -119,7 +119,8 @@ def test_missing_path_raises_file_not_found(tmp_path) -> None:
 
 
 @pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
-def test_dacl_inspection_error_fails_closed(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("failure", ["GetAceCount-denied", "GetAce-index"])
+def test_dacl_inspection_error_fails_closed(tmp_path, monkeypatch, failure) -> None:
     import pywintypes
     import win32security
 
@@ -127,11 +128,16 @@ def test_dacl_inspection_error_fails_closed(tmp_path, monkeypatch) -> None:
     path.write_bytes(b"")
     user = win32security.ConvertStringSidToSid(identity.current_sid())
 
-    class _DeniedDacl(_FakeDacl):
+    class _FailingDacl(_FakeDacl):
         def GetAceCount(self) -> int:
-            raise pywintypes.error(5, "GetAceCount", "denied")
+            if failure == "GetAceCount-denied":
+                raise pywintypes.error(5, "GetAceCount", "denied")
+            return 1
 
-    descriptor = _FakeDescriptor(user, _DeniedDacl([]))
+        def GetAce(self, index):
+            raise IndexError("ace index")
+
+    descriptor = _FakeDescriptor(user, _FailingDacl([]))
     monkeypatch.setattr(
         win32security, "GetNamedSecurityInfo", lambda *args: descriptor)
     assert perms.is_private(path) is False

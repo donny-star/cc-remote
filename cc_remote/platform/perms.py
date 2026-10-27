@@ -65,8 +65,8 @@ def is_private(path: StrPath) -> bool:
         return False
     try:
         return _dacl_is_private(descriptor, trusted, user, admins)
-    except (pywintypes.error, TypeError, ValueError):
-        # An owner or DACL that cannot be inspected is not verifiably private.
+    except Exception:
+        # Fail-closed gate over a side-effect-free evaluation: any inspection failure means "not private".
         return False
 
 
