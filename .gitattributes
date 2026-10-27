@@ -1,0 +1,3 @@
+# Keep LF in every checkout. Git for Windows defaults to core.autocrlf=true,
+# which breaks the deploy shell scripts and the source-text regression tests.
+* text=auto eol=lf
