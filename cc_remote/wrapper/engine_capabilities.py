@@ -7,7 +7,6 @@ and deliberately avoids importing settings, credentials, schemas or plugin code.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.platform import locks
 from cc_remote.wrapper.child_env import (
     claude_profile_process_env,
     sanitized_child_env,
@@ -963,7 +963,7 @@ def _atomic_update_json(path: Path, mutate) -> None:
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     lock_fd = os.open(lock_path, flags, 0o600)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        locks.flock(lock_fd, locks.LOCK_EX)
         current = _read_json_object(path)
         updated = mutate(current)
         if not isinstance(updated, dict):
@@ -995,7 +995,7 @@ def _atomic_update_json(path: Path, mutate) -> None:
             except FileNotFoundError:
                 pass
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        locks.flock(lock_fd, locks.LOCK_UN)
         os.close(lock_fd)
 
 

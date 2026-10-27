@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +26,7 @@ import uuid
 from websockets.asyncio.client import connect
 
 from cc_remote import codex_app_tools as desktop
+from cc_remote.platform import locks
 from cc_remote.wrapper.codex_daemon import socket_identity
 from cc_remote.wrapper.process_scan import (
     ProcessIdentity,
@@ -141,7 +141,7 @@ async def launch_lock(app: Path, root: Path):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise LaunchError("共享启动锁不安全；未启动 App。")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
             acquired = True
         except BlockingIOError:
             pass

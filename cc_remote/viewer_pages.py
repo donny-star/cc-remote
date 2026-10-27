@@ -6,7 +6,6 @@ the publication's FD-based resource checks on the device owning that file.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +16,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cc_remote.platform import locks
 from cc_remote.viewer import ViewerSite, clean_path, load_sites, open_resource
 
 MAX_PAGES = 32
@@ -154,7 +154,7 @@ class ViewerPageStore:
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                     or info.st_mode & 0o077 or info.st_nlink != 1):
                 raise ValueError("invalid page store lock")
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            locks.flock(lock, locks.LOCK_EX)
             data = self._read()
             before = json.dumps(data, ensure_ascii=False)
             yield data

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +12,7 @@ import stat
 from uuid import uuid4
 
 from cc_remote.log import logger
+from cc_remote.platform import locks
 from cc_remote.protocol import Error, Query
 from cc_remote.session_messages import (
     MAX_FRAME, envelope, make_server, reference, request_id, split_reference,
@@ -149,7 +149,7 @@ class SessionMessages:
             lock_info = os.fstat(self.lock_fd)
             if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid():
                 raise ValueError("Invalid message server lock")
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.flock(self.lock_fd, locks.LOCK_EX | locks.LOCK_NB)
             self.store.recover()
             if self.socket.exists() or self.socket.is_symlink():
                 info = self.socket.lstat()

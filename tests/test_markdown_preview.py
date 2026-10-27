@@ -1206,14 +1206,14 @@ def test_preview_lock_wait_is_bounded(tmp_path, monkeypatch):
     clock = iter((0.0, 0.0, 6.0))
 
     def busy_lock(_descriptor, operation):
-        if operation & preview_capabilities.fcntl.LOCK_NB:
+        if operation & preview_capabilities.locks.LOCK_NB:
             raise BlockingIOError
 
     monkeypatch.setattr(
         preview_capabilities.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(
         preview_capabilities.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(preview_capabilities.fcntl, "flock", busy_lock)
+    monkeypatch.setattr(preview_capabilities.locks, "flock", busy_lock)
 
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         with store._exclusive_lock():

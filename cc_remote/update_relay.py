@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import pwd
 import re
 import shlex
 import subprocess
@@ -21,7 +20,6 @@ from dotenv import dotenv_values
 from cc_remote.update import Installation, UpdateError, version_tuple
 from cc_remote.update_errors import endpoint, network_reason, ssh_reason
 from deploy.install_cli import _atomic_file
-from deploy import relay_update_job
 from deploy.release_manifest import load_manifest
 
 
@@ -144,6 +142,7 @@ class RelayUpdate:
             # Local activation runs as root, SSH remains the original user's
             # identity. Do not copy private keys or use root's unrelated config.
             user = self.installation.metadata["user"]
+            import pwd  # relay hosts are POSIX-only
             try:
                 pwd.getpwnam(user)
             except KeyError as exc:
@@ -185,6 +184,8 @@ class RelayUpdate:
         request["domain"] = urlsplit(self.origin).hostname
         # Send the small stdlib-only launcher so older Relays need no separate
         # bootstrap deployment. The remote receipt serializes lost-SSH retries.
+        from deploy import relay_update_job  # POSIX-only (fcntl); imported for its path
+
         script = Path(relay_update_job.__file__).read_text()
         output = self._ssh(
             ["sudo", "-n", "/opt/cc-remote/current/.venv/bin/python", "-I", "-c",

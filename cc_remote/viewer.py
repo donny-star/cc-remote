@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import mimetypes
@@ -19,6 +18,8 @@ import tempfile
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from cc_remote.platform import locks
 
 CHUNK_SIZE = 64 * 1024
 PULL_WINDOW = 8
@@ -179,7 +180,7 @@ def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or info.st_mode & 0o077 or info.st_nlink != 1):
             raise ValueError("invalid Viewer registry lock")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        locks.flock(lock, locks.LOCK_EX)
         sites = load_sites(path, model=model, limit=limit, max_bytes=max_bytes)
         before = {key: site.model_dump() for key, site in sites.items()}
         yield sites

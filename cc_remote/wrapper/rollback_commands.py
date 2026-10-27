@@ -9,7 +9,6 @@ never makes a submitted or uncertain command eligible for another mutation.
 from __future__ import annotations
 
 import copy
-import fcntl
 import json
 import math
 import os
@@ -23,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 from uuid import uuid4
+
+from cc_remote.platform import locks
 
 
 _VERSION = 1
@@ -276,7 +277,7 @@ class RollbackCommandJournal:
                     or st.st_size > len(_LOCK_MAGIC)):
                 raise OSError("rollback lock is not a regular file")
             os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            locks.flock(fd, locks.LOCK_EX)
             os.lseek(fd, 0, os.SEEK_SET)
             marker = os.read(fd, len(_LOCK_MAGIC) + 1)
             if marker == _LOCK_MAGIC:
@@ -298,7 +299,7 @@ class RollbackCommandJournal:
             yield fd, created, initialized
         finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                locks.flock(fd, locks.LOCK_UN)
             finally:
                 os.close(fd)
 

@@ -294,11 +294,14 @@ def test_root_custom_registration_round_trip_and_relay_launcher_preservation(bin
     assert 'managed_wrapper_root=' + str(root) in cli.read_text()
 
 
+@pytest.mark.posix_only(reason='pwd and geteuid are POSIX-only')
 def test_root_upstream_ssh_does_not_require_sudo(binding, monkeypatch):
+    import pwd
+
     root, profile = binding
     installation = update.Installation(root, root, {'os': 'linux'}, {'user': 'root', 'linux_service': profile})
     monkeypatch.setattr(update_relay.os, 'geteuid', lambda: 0)
-    monkeypatch.setattr(update_relay.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_name='root'))
+    monkeypatch.setattr(pwd, 'getpwnam', lambda _: SimpleNamespace(pw_name='root'))
     calls = []
     def run(args, **kwargs):
         calls.append(args)

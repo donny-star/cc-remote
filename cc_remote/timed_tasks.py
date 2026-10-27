@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import contextmanager
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,8 @@ import time
 from uuid import UUID, uuid4
 
 from websockets.asyncio.client import unix_connect
+
+from cc_remote.platform import locks
 
 MAX_TASKS = 32
 MAX_SENDS = 1000
@@ -249,7 +250,7 @@ async def run_task(store: TimedTaskStore, task_id: str) -> None:
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
         except BlockingIOError:
             return
         await _run_task(store, task_id)

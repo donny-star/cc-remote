@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -22,6 +21,8 @@ import tempfile
 import time
 from typing import Literal, Optional
 from uuid import uuid4
+
+from cc_remote.platform import locks
 
 
 _SCHEMA_VERSION = 2
@@ -201,10 +202,10 @@ def _exclusive_lock(path: Path):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        locks.flock(fd, locks.LOCK_EX)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        locks.flock(fd, locks.LOCK_UN)
         os.close(fd)
 
 

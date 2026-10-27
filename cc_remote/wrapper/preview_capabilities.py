@@ -11,12 +11,12 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from cc_remote.log import logger
+from cc_remote.platform import locks
 
 log = logger("cc_remote.wrapper.preview_capabilities")
 
@@ -131,8 +131,8 @@ class PreviewCapabilityStore:
             deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
             while True:
                 try:
-                    fcntl.flock(
-                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locks.flock(
+                        descriptor, locks.LOCK_EX | locks.LOCK_NB)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
@@ -142,7 +142,7 @@ class PreviewCapabilityStore:
             yield
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 
@@ -161,7 +161,7 @@ class PreviewCapabilityStore:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locks.flock(descriptor, locks.LOCK_EX | locks.LOCK_NB)
                 return
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -218,7 +218,7 @@ class PreviewCapabilityStore:
                 self._recover_invalidation_locked(descriptor)
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 
@@ -248,7 +248,7 @@ class PreviewCapabilityStore:
                 os.fsync(descriptor)
                 # The inode is locked before the public link exists, so another
                 # process can never mistake this live intent for crash residue.
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locks.flock(descriptor, locks.LOCK_EX)
                 try:
                     os.link(temporary, self._invalidation_path)
                     linked = True
@@ -262,7 +262,7 @@ class PreviewCapabilityStore:
             finally:
                 if not returned:
                     try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        locks.flock(descriptor, locks.LOCK_UN)
                     finally:
                         os.close(descriptor)
                     try:
@@ -278,7 +278,7 @@ class PreviewCapabilityStore:
             yield descriptor, token
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locks.flock(descriptor, locks.LOCK_UN)
             finally:
                 os.close(descriptor)
 

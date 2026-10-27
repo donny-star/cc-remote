@@ -13,7 +13,10 @@ import hashlib
 import json
 import os
 import re
-import resource
+try:
+    import resource
+except ImportError:  # Windows has no RLIMIT_NOFILE; daemons are not rlimit-raised there
+    resource = None  # type: ignore[assignment]
 import signal
 import shutil
 import stat
@@ -513,6 +516,8 @@ def _ensure_managed_daemon_nofile(
         or b"app-server" not in argv
         or (b"--remote-control" not in argv and not local_listener)
     ):
+        return False
+    if resource is None:
         return False
     try:
         soft, hard = prlimit(pid, resource.RLIMIT_NOFILE)
