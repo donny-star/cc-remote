@@ -70,3 +70,26 @@ def foreign_readable_dir(path: os.PathLike[str] | str) -> None:
         os.fspath(path), win32security.SE_FILE_OBJECT,
         win32security.DACL_SECURITY_INFORMATION,
         None, None, dacl, None)
+
+
+def security_snapshot(path: os.PathLike[str] | str) -> object:
+    """Who may access ``path``: its mode bits, or its DACL and read-only bit.
+
+    The Windows DACL is SDDL, which also records whether it is protected
+    from inheritance. The auto-inheritance bookkeeping flags (``AI``/``AR``)
+    grant nothing, and setting any DACL turns ``AI`` on, so they are dropped.
+    """
+    if sys.platform != "win32":
+        return stat.S_IMODE(os.stat(path).st_mode)
+    import win32security
+
+    descriptor = win32security.GetNamedSecurityInfo(
+        os.fspath(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION)
+    dacl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+        descriptor, win32security.SDDL_REVISION_1,
+        win32security.DACL_SECURITY_INFORMATION)
+    flags, separator, aces = dacl.partition("(")
+    flags = flags.replace("AI", "").replace("AR", "")
+    readonly = bool(os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+    return flags + separator + aces, readonly

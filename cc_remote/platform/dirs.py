@@ -174,8 +174,18 @@ class DirHandle:
         return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
 
     def unlink(self, name: str) -> None:
+        """Remove a non-directory name; a link itself, never its target.
+
+        Like POSIX unlink, a read-only file is removed: Windows clears the
+        attribute through a no-follow handle first.
+        """
         if IS_WINDOWS:
-            os.unlink(self._os_child(name))
+            path = self._os_child(name)
+            try:
+                os.unlink(path)
+            except PermissionError:
+                if not files._win32_unlink_read_only(path):
+                    raise
         else:
             os.unlink(name, dir_fd=self.fd)
 

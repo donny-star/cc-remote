@@ -56,6 +56,8 @@ def _posix_rename(src: str, dst: str) -> None:
     Plain MoveFileEx refuses to replace a target that any handle keeps open,
     even with FILE_SHARE_DELETE. FILE_RENAME_FLAG_POSIX_SEMANTICS replaces it
     and leaves existing handles reading the old content, like a POSIX inode.
+    Like POSIX rename, a link at ``src`` is renamed itself rather than
+    followed, and a read-only target is replaced.
     """
     import ctypes
     from ctypes import wintypes
@@ -72,7 +74,8 @@ def _posix_rename(src: str, dst: str) -> None:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     delete_access, share_all, open_existing, backup_semantics = 0x00010000, 0x7, 3, 0x02000000
     handle = kernel32.CreateFileW(
-        src, delete_access, share_all, None, open_existing, backup_semantics, None)
+        src, delete_access, share_all, None, open_existing,
+        backup_semantics | _FILE_FLAG_OPEN_REPARSE_POINT, None)
     if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -86,9 +89,11 @@ def _posix_rename(src: str, dst: str) -> None:
                 ("FileName", ctypes.c_wchar * (len(target) + 1)),
             ]
 
-        replace_if_exists, posix_semantics, file_rename_info_ex = 0x1, 0x2, 22
+        replace_if_exists, posix_semantics, ignore_readonly = 0x1, 0x2, 0x40
+        file_rename_info_ex = 22
         info = _RenameInfo(
-            replace_if_exists | posix_semantics, None, len(target) * 2, target)
+            replace_if_exists | posix_semantics | ignore_readonly,
+            None, len(target) * 2, target)
         if not kernel32.SetFileInformationByHandle(
                 handle, file_rename_info_ex, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -184,6 +189,10 @@ def _kernel32():
         wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
     ]
     kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     return kernel32
 
@@ -200,6 +209,83 @@ def _win32_handle_attributes(handle: int) -> int:
             handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(info), ctypes.sizeof(info)):
         raise ctypes.WinError(ctypes.get_last_error())
     return int(info.FileAttributes)
+
+
+_FILE_ATTRIBUTE_READONLY = 0x1
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FILE_ATTRIBUTE_NORMAL = 0x80
+_FILE_BASIC_INFO = 0
+_FILE_DISPOSITION_INFO = 4
+
+
+def _win32_set_read_only(handle: int, read_only: bool) -> None:
+    """Set or clear FILE_ATTRIBUTE_READONLY through an open handle.
+
+    The handle needs FILE_READ_ATTRIBUTES and FILE_WRITE_ATTRIBUTES; the
+    file's timestamps are left alone.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    attributes = _win32_handle_attributes(handle)
+    wanted = (attributes | _FILE_ATTRIBUTE_READONLY if read_only
+              else attributes & ~_FILE_ATTRIBUTE_READONLY)
+    if wanted == attributes:
+        return
+
+    class _BasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    # Zero times mean "unchanged"; zero attributes would too, hence NORMAL.
+    info = _BasicInfo(0, 0, 0, 0, wanted or _FILE_ATTRIBUTE_NORMAL)
+    if not _kernel32().SetFileInformationByHandle(
+            handle, _FILE_BASIC_INFO, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win32_unlink_read_only(path: str) -> bool:
+    """Delete ``path`` if it is a read-only non-directory; False otherwise.
+
+    The name itself is opened (a link is never followed), its read-only
+    attribute cleared and the delete requested through the same handle, so
+    nothing is resolved twice. Returns False, changing nothing, when the
+    name cannot be opened or is not a read-only non-directory.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    delete_access, read_attributes, write_attributes = 0x00010000, 0x80, 0x100
+    share_all, open_existing = 0x7, 3
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        path, delete_access | read_attributes | write_attributes, share_all, None,
+        open_existing, _FILE_FLAG_OPEN_REPARSE_POINT, None)
+    if handle == wintypes.HANDLE(-1).value:
+        return False
+    try:
+        attributes = _win32_handle_attributes(handle)
+        if (not attributes & _FILE_ATTRIBUTE_READONLY
+                or attributes & _FILE_ATTRIBUTE_DIRECTORY):
+            return False
+        _win32_set_read_only(handle, False)
+        delete = wintypes.BOOLEAN(True)
+        if not kernel32.SetFileInformationByHandle(
+                handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            try:
+                _win32_set_read_only(handle, True)
+            except OSError:
+                pass
+            raise error
+        return True
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 def _win32_create(path: StrPath, flags: int, *, refuse_reparse: bool) -> int:

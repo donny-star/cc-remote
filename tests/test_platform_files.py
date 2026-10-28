@@ -97,6 +97,30 @@ def test_replace_rejects_non_positive_attempts(tmp_path, attempts) -> None:
     assert not (tmp_path / "dst").exists()
 
 
+def test_replace_renames_a_link_at_the_source_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "secret").write_bytes(b"victim")
+    src = tmp_path / "src"
+    _link_directory(victim, src)
+    dst = tmp_path / "dst"
+    files.replace(src, dst)  # POSIX rename never follows its source
+    assert (victim / "secret").read_bytes() == b"victim"
+    assert files.is_reparse_point(dst)
+    assert not os.path.lexists(src)
+
+
+def test_replace_overwrites_a_read_only_destination(tmp_path) -> None:
+    dst = tmp_path / "dst"
+    dst.write_bytes(b"old")
+    os.chmod(dst, stat.S_IREAD)
+    src = tmp_path / "src"
+    src.write_bytes(b"new")
+    files.replace(src, dst)
+    assert dst.read_bytes() == b"new"
+    assert not src.exists()
+
+
 def test_pread_pwrite_keep_file_position(tmp_path) -> None:
     fd = os.open(tmp_path / "f", os.O_RDWR | os.O_CREAT, 0o600)
     try:

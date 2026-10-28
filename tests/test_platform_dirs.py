@@ -69,6 +69,56 @@ def test_directory_link_is_refused_at_every_hop(tmp_path) -> None:
         DirHandle.open_root(tmp_path / "link")
 
 
+def test_replace_renames_a_link_at_the_source_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "secret").write_bytes(b"victim")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "note.md").write_bytes(b"note")
+    _link_directory(victim, project / ".tmp")
+    with DirHandle.open_root(project) as root:
+        try:
+            root.replace(".tmp", "new.md")
+        except OSError:
+            pass  # refusing is as good as renaming the link itself
+    assert (victim / "secret").read_bytes() == b"victim"
+    assert (project / "note.md").read_bytes() == b"note"
+
+
+def test_unlink_removes_a_read_only_file(tmp_path) -> None:
+    (tmp_path / "f").write_bytes(b"x")
+    os.chmod(tmp_path / "f", stat.S_IREAD)
+    with DirHandle.open_root(tmp_path) as root:
+        root.unlink("f")
+    assert not os.path.lexists(tmp_path / "f")
+
+
+def test_unlink_refuses_a_read_only_directory(tmp_path) -> None:
+    (tmp_path / "d").mkdir()
+    os.chmod(tmp_path / "d", stat.S_IREAD | stat.S_IEXEC)
+    try:
+        with DirHandle.open_root(tmp_path) as root:
+            with pytest.raises(OSError):
+                root.unlink("d")
+        assert (tmp_path / "d").is_dir()
+    finally:
+        os.chmod(tmp_path / "d", stat.S_IRWXU)
+
+
+def test_unlink_removes_a_directory_link_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "secret").write_bytes(b"victim")
+    os.chmod(victim / "secret", stat.S_IREAD)
+    _link_directory(victim, tmp_path / "link")
+    with DirHandle.open_root(tmp_path) as root:
+        root.unlink("link")
+    assert not os.path.lexists(tmp_path / "link")
+    assert (victim / "secret").read_bytes() == b"victim"
+    os.chmod(victim / "secret", stat.S_IREAD | stat.S_IWRITE)
+
+
 @pytest.mark.requires_symlink(reason="opens a file symbolic link through a directory handle")
 def test_file_symlink_is_refused(tmp_path) -> None:
     (tmp_path / "target").write_bytes(b"secret")
