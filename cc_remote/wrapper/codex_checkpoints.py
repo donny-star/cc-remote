@@ -250,7 +250,6 @@ def cleanup_codex_checkpoint_session(
                 os.replace(candidate, tombstone)
             except FileNotFoundError:
                 tombstone = None
-                continue
         except OSError as exc:
             raise CheckpointError(
                 "Unable to retire Codex checkpoint journal"
@@ -259,15 +258,18 @@ def cleanup_codex_checkpoint_session(
             if lock_fd is not None:
                 locks.flock(lock_fd, locks.LOCK_UN)
                 os.close(lock_fd)
-        if tombstone is not None:
-            try:
-                platform_files.force_rmtree(tombstone)
-            except OSError as exc:
-                raise CheckpointError(
-                    "Unable to remove Codex checkpoint journal"
-                ) from exc
+        if tombstone is None:
+            # Another remover won; its discard failed while this lock was open.
             dirs.discard_lock(candidate, "journal.lock")
-            removed += 1
+            continue
+        try:
+            platform_files.force_rmtree(tombstone)
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to remove Codex checkpoint journal"
+            ) from exc
+        dirs.discard_lock(candidate, "journal.lock")
+        removed += 1
     return removed
 
 

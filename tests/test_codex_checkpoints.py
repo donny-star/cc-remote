@@ -789,3 +789,22 @@ def test_journal_lock_open_rides_out_a_concurrent_discard(tmp_path):
     finally:
         stop.set()
         discarder.join()
+
+
+def test_cold_cleanup_losing_the_race_leaves_no_journal_lock(tmp_path, monkeypatch):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "raced-cold")
+    replace = os.replace
+
+    def another_remover_got_there_first(src, dst):
+        if Path(src) == journal.session_dir:
+            checkpoint_module.platform_files.force_rmtree(src)
+            raise FileNotFoundError(2, "already removed", str(src))
+        replace(src, dst)
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", another_remover_got_there_first)
+
+    assert cleanup_codex_checkpoint_session(state, "raced-cold") == 0
+    assert not journal.session_dir.exists()
+    assert not journal.lock_path.exists()
