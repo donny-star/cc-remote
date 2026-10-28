@@ -291,6 +291,19 @@ def is_reparse_point(path: StrPath) -> bool:
     return bool(info.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+_IO_REPARSE_TAG_AF_UNIX = 0x80000023
+
+
+def is_unix_socket(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result describes a Unix-domain socket file.
+
+    Windows AF_UNIX sockets report S_IFREG plus the AF_UNIX reparse tag.
+    """
+    if not IS_WINDOWS:
+        return stat.S_ISSOCK(info.st_mode)
+    return getattr(info, "st_reparse_tag", 0) == _IO_REPARSE_TAG_AF_UNIX
+
+
 def open_nofollow(path: StrPath, flags: int, mode: int = 0o600) -> int:
     """Open a regular file without following a final link.
 

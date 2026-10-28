@@ -271,3 +271,18 @@ def test_open_nofollow_refuses_a_reparse_point_without_superseding_it(socket_dir
         assert caught.value.errno == errno.ELOOP
         # CREATE_ALWAYS would have replaced the socket with a regular file.
         assert files.is_reparse_point(path) is True
+
+
+def test_is_unix_socket_rejects_regular_files_and_directories(tmp_path) -> None:
+    regular = tmp_path / "f"
+    regular.write_bytes(b"")
+    assert files.is_unix_socket(regular.lstat()) is False
+    assert files.is_unix_socket(tmp_path.lstat()) is False
+
+
+def test_is_unix_socket_accepts_a_bound_listener(socket_dir) -> None:
+    from tests.unix_socket import unix_listener
+
+    path = socket_dir / "s.sock"
+    with unix_listener(path):
+        assert files.is_unix_socket(path.lstat()) is True

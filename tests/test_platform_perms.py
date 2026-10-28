@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 
 import pytest
 
@@ -279,3 +280,90 @@ def test_make_private_failure_raises_permission_error(tmp_path, monkeypatch) -> 
     with pytest.raises(PermissionError) as caught:
         perms.make_private(path, directory=False)
     assert caught.value.filename == str(path)
+
+
+def test_info_helpers_accept_a_private_file(tmp_path) -> None:
+    path = tmp_path / "secret"
+    path.write_bytes(b"x")
+    perms.make_private(path, directory=False)
+    info = path.lstat()
+    assert perms.owned_info(path, info)
+    assert perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        opened = os.fstat(fd)
+        assert perms.owned_info(fd, opened)
+        assert perms.private_mode_info(fd, opened)
+        assert perms.no_foreign_write_info(fd, opened)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.posix_only(reason="mode bits are the POSIX privacy mechanism")
+def test_info_helpers_read_only_the_given_mode_bits(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    os.chmod(path, 0o640)
+    info = path.lstat()
+    assert not perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)
+    os.chmod(path, 0o620)
+    info = path.lstat()
+    assert not perms.no_foreign_write_info(path, info)
+    # The decision comes from ``info``, not a fresh stat of ``target``.
+    os.chmod(path, 0o600)
+    assert not perms.private_mode_info(path, info)
+    fake = os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, os.getuid() + 1, 0, 0, 0, 0, 0))
+    assert not perms.owned_info(path, fake)
+    assert not perms.owned_info(path, fake, effective=True)
+
+
+@pytest.mark.posix_only(reason="real and effective uids only differ on POSIX")
+def test_owned_info_effective_compares_the_effective_uid(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    info = path.lstat()
+    monkeypatch.setattr(perms, "current_euid", lambda: info.st_uid + 1)
+    assert perms.owned_info(path, info)
+    assert not perms.owned_info(path, info, effective=True)
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_info_helpers_reject_everyone_write(tmp_path) -> None:
+    import ntsecuritycon
+    import win32security
+
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    perms.make_private(path, directory=False)
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION)
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    world = win32security.CreateWellKnownSid(win32security.WinWorldSid)
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_READ, world)
+    win32security.SetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION, None, None, dacl, None)
+    info = path.lstat()
+    assert not perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)  # read-only grant
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_WRITE, world)
+    win32security.SetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION, None, None, dacl, None)
+    assert not perms.no_foreign_write_info(path, path.lstat())
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_info_helpers_fail_closed_for_missing_paths(tmp_path) -> None:
+    path = tmp_path / "gone"
+    path.write_bytes(b"")
+    info = path.lstat()
+    path.unlink()
+    assert not perms.owned_info(path, info)
+    assert not perms.private_mode_info(path, info)
+    assert not perms.no_foreign_write_info(path, info)
