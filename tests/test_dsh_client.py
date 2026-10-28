@@ -8,9 +8,11 @@ import os
 import httpx
 import pytest
 
+from cc_remote.platform import perms
 from cc_remote.wrapper.dsh_client import (
     DshClient, DshConnection, DshError, local_origin, native_session_id,
 )
+from tests.platform_assertions import grant_foreign_read
 
 ORIGIN = "http://127.0.0.1:3080"
 TOKEN = "a" * 43
@@ -98,10 +100,10 @@ def test_connection_repr_and_file_do_not_expose_control_token(tmp_path):
     path.write_text(json.dumps({"schema": 1, "origin": ORIGIN, "token": TOKEN}))
     path.chmod(0o600)
     assert DshConnection.load(path) == connection
-    path.chmod(0o644)
+    grant_foreign_read(path)
     with pytest.raises(DshError):
         DshConnection.load(path)
-    path.chmod(0o600)
+    perms.make_private(path, directory=False)
     link = tmp_path / "link"
     link.symlink_to(path)
     with pytest.raises(DshError):

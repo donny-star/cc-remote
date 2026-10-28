@@ -1009,7 +1009,7 @@ def test_exact_zombie_daemon_updater_gets_sigterm_only(monkeypatch, tmp_path):
     monkeypatch.setattr(
         daemon_module, "_darwin_process_info", lambda pid: processes.get(pid))
     monkeypatch.setattr(
-        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+        daemon_module, "process_owner_uid", lambda _pid: current_uid())
     monkeypatch.setattr(
         daemon_module, "_darwin_process_state", lambda _pid: "Z+")
 

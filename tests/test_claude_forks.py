@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ from cc_remote.wrapper.claude_forks import (
     claude_fork_marker,
     find_claude_fork,
 )
+from tests.platform_assertions import assert_private_file
 
 
 def _begin(journal: ClaudeForkJournal, request: str = "request-1"):
@@ -27,7 +27,7 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
 
     assert intent["status"] == "intent"
     assert intent["marker"] == "cc-remote-fork:request-1"
-    assert stat.S_IMODE((tmp_path / "claude-forks.json").stat().st_mode) == 0o600
+    assert_private_file(tmp_path / "claude-forks.json")
     assert journal.claim_submission("request-1") is True
     assert journal.claim_submission("request-1") is False
     assert journal.mark_uncertain("request-1")["status"] == "uncertain"

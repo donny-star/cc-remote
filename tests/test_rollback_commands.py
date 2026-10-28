@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -13,6 +12,7 @@ from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
     RollbackJournalError,
 )
+from tests.platform_assertions import assert_private_file
 
 
 def _codex_result(
@@ -65,8 +65,8 @@ def test_rollback_journal_survives_restart_without_reclaiming_submission(
         "num_turns": 1,
         "checkpoint_id": None,
     }
-    assert stat.S_IMODE((tmp_path / "rollback-commands.json").stat().st_mode) == 0o600
-    assert stat.S_IMODE((tmp_path / "rollback-commands.lock").stat().st_mode) == 0o600
+    assert_private_file(tmp_path / "rollback-commands.json")
+    assert_private_file(tmp_path / "rollback-commands.lock")
     assert journal.mark_submitted("browser-1", "cmd-1") is True
 
     reloaded = RollbackCommandJournal(tmp_path)
