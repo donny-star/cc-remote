@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from cc_remote.platform import locks
+from cc_remote.platform import files as platform_files, locks
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 
@@ -364,12 +364,7 @@ def migrate_codex_checkpoint_profiles(
                         sort_keys=True,
                     ).encode("utf-8"),
                 )
-                manifest_directory_fd = os.open(
-                    manifest_path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(manifest_directory_fd)
-                finally:
-                    os.close(manifest_directory_fd)
+                platform_files.fsync_directory(manifest_path.parent)
                 session_id = target_session_id
                 durable_revision = profile_revision
                 migrated += 1
@@ -385,11 +380,7 @@ def migrate_codex_checkpoint_profiles(
                     "Checkpoint profile migration target already exists")
             os.replace(stage, target)
         if staged:
-            directory_fd = os.open(repository_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(repository_dir)
     return migrated
 
 

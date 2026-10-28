@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
+from cc_remote.platform import files as platform_files
 from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
@@ -269,11 +270,7 @@ def _prepare_profile_standalone(
                 pass
             return False
         try:
-            directory_fd = os.open(destination.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(destination.parent)
         except OSError as exc:
             # The atomic replacement is already visible. A directory-fsync
             # failure weakens crash durability but must not make callers retry

@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Callable, Optional
 
+from cc_remote.platform import files as platform_files
+
 
 _SCHEMA_VERSION = 3
 _FILENAME = "codex-turn-leases.json"
@@ -291,12 +293,8 @@ class CodexTurnLeaseStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.replace(temporary, self.path)
+            platform_files.fsync_directory(self.path.parent)
         finally:
             if fd >= 0:
                 os.close(fd)

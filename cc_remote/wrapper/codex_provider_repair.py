@@ -29,6 +29,8 @@ import sqlite3
 import stat
 from typing import Any, Iterable, Optional
 
+from cc_remote.platform import files as platform_files
+
 
 CANONICAL_OPENAI_PROVIDER_ID = "openai"
 HTTP_COMPAT_PROVIDER_ID = "cc_remote_openai_http"
@@ -472,12 +474,8 @@ def _write_journal(
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    os.replace(temp, path)
-    directory = os.open(journal_dir, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    platform_files.replace(temp, path)
+    platform_files.fsync_directory(journal_dir)
     return path
 
 

@@ -23,6 +23,7 @@ import threading
 import time
 from uuid import uuid4
 
+from cc_remote.platform import files as platform_files
 from cc_remote.platform.identity import current_uid
 
 
@@ -505,13 +506,9 @@ class CodexClientMessageStore:
                 except OSError:
                     pass
                 raise
-            os.replace(temporary, self.path)
+            platform_files.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(self.path.parent)
         except Exception as exc:
             try:
                 temporary.unlink()
