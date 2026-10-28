@@ -1,19 +1,15 @@
-"""Same-user Unix socket server for persistent Claude Code PTYs."""
+"""Same-user local endpoint server for persistent Claude Code PTYs."""
 
 from __future__ import annotations
 
 import asyncio
-import ctypes
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-import socket
-import stat
-import struct
 from typing import Any
 import uuid
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import ipc
 
 from .paths import default_socket_path
 from .protocol import (
@@ -37,6 +33,7 @@ from .session import (
 
 MAX_SOCKET_PATH_BYTES = 103
 MAX_CLIENTS = 64
+CLOSE_TIMEOUT_SECONDS = 3.0
 
 
 class BrokerSecurityError(RuntimeError):
@@ -54,35 +51,6 @@ class BrokerConfig:
     control_store_path: str | None = None
 
 
-def _peer_uid(sock: Any) -> int:
-    """Return an AF_UNIX peer uid on Linux or macOS, failing closed elsewhere."""
-    if hasattr(socket, "SO_PEERCRED"):
-        try:
-            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-            _pid, uid, _gid = struct.unpack("3i", credentials)
-            return int(uid)
-        except (AttributeError, OSError, struct.error) as exc:
-            raise BrokerSecurityError("cannot read Unix peer credentials") from exc
-
-    # macOS and the BSDs expose getpeereid(3), though Python does not wrap it.
-    libc = ctypes.CDLL(None, use_errno=True)
-    getpeereid = getattr(libc, "getpeereid", None)
-    if getpeereid is None:
-        raise BrokerSecurityError("Unix peer credentials are unsupported")
-    uid = ctypes.c_uint()
-    gid = ctypes.c_uint()
-    getpeereid.argtypes = (
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_uint),
-        ctypes.POINTER(ctypes.c_uint),
-    )
-    getpeereid.restype = ctypes.c_int
-    if getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
-        error = ctypes.get_errno()
-        raise BrokerSecurityError(f"getpeereid failed: errno {error}")
-    return int(uid.value)
-
-
 def _prepare_parent(path: str) -> Path:
     if not path or "\x00" in path:
         raise BrokerSecurityError("broker socket path is invalid")
@@ -92,44 +60,15 @@ def _prepare_parent(path: str) -> Path:
             f"broker socket path exceeds {MAX_SOCKET_PATH_BYTES} bytes",
         )
     target = Path(path).expanduser().absolute()
-    parent = target.parent
     try:
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = parent.lstat()
-    except OSError as exc:
-        raise BrokerSecurityError(f"cannot prepare broker socket directory: {exc}") from exc
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise BrokerSecurityError("broker socket parent must be a real directory")
-    if info.st_uid != current_uid():
-        raise BrokerSecurityError("broker socket directory must be owned by the current uid")
-    if stat.S_IMODE(info.st_mode) & 0o077:
-        raise BrokerSecurityError("broker socket directory must not be accessible by other users")
+        ipc.ensure_private_directory(target.parent)
+    except ipc.UnsafeEndpointError as exc:
+        raise BrokerSecurityError(f"broker socket {exc}") from exc
     return target
 
 
-def _remove_stale_socket(path: Path) -> None:
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
-        raise BrokerSecurityError("refusing to replace a non-owned or non-socket path")
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        probe.settimeout(0.2)
-        probe.connect(str(path))
-    except (ConnectionRefusedError, FileNotFoundError):
-        path.unlink()
-    except OSError as exc:
-        raise BrokerSecurityError(f"cannot verify existing broker socket: {exc}") from exc
-    else:
-        raise BrokerSecurityError(f"broker is already running at {path}")
-    finally:
-        probe.close()
-
-
 class BrokerServer:
-    """Owns Claude PTYs and exposes only an authenticated local Unix socket."""
+    """Owns Claude PTYs and exposes only an authenticated same-user local endpoint."""
 
     def __init__(self, config: BrokerConfig | None = None):
         self.config = config or BrokerConfig()
@@ -142,9 +81,9 @@ class BrokerServer:
                 or str(Path(self.config.socket_path).with_name("session-controls.json"))
             ),
         )
-        self._server: asyncio.AbstractServer | None = None
-        self._socket_identity: tuple[int, int] | None = None
+        self._server: ipc.IpcServer | None = None
         self._connections: set[asyncio.StreamWriter] = set()
+        self._closing = False
 
     @property
     def socket_path(self) -> str:
@@ -155,34 +94,13 @@ class BrokerServer:
             return
         target = _prepare_parent(self.config.socket_path)
         self.manager.load_control_store()
-        _remove_stale_socket(target)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)
+        self._closing = False  # a closed broker may start again
         try:
-            listener.bind(str(target))
-        except BaseException:
-            listener.close()
-            raise
-        finally:
-            os.umask(old_umask)
-        try:
-            os.chmod(target, 0o600)
-            info = target.lstat()
-            if info.st_uid != current_uid() or stat.S_IMODE(info.st_mode) != 0o600:
-                raise BrokerSecurityError("broker socket permissions are not 0600")
-            self._socket_identity = (info.st_dev, info.st_ino)
-            listener.listen(socket.SOMAXCONN)
-            listener.setblocking(False)
-            self._server = await asyncio.start_unix_server(
-                self._handle_client, sock=listener,
-            )
-        except BaseException:
-            listener.close()
-            try:
-                target.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            self._server = await ipc.start_server(target, self._handle_client)
+        except ipc.AlreadyRunningError as exc:
+            raise BrokerSecurityError(f"broker is already running at {target}") from exc
+        except ipc.UnsafeEndpointError as exc:
+            raise BrokerSecurityError(str(exc)) from exc
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -212,15 +130,14 @@ class BrokerServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ) -> None:
-        peer_socket = writer.get_extra_info("socket")
-        try:
-            if peer_socket is None or _peer_uid(peer_socket) != current_uid():
-                writer.close()
-                await writer.wait_closed()
-                return
-        except BrokerSecurityError:
+        if self._closing:
+            # The endpoint admitted this peer after close() took its snapshot
+            # of the clients; it must never reach a closing manager.
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, BrokenPipeError):
+                pass
             return
         if len(self._connections) >= MAX_CLIENTS:
             await self._send_error(writer, "client_limit", "too many broker clients")
@@ -442,22 +359,35 @@ class BrokerServer:
             session.unsubscribe(subscription)
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        for writer in tuple(self._connections):
-            writer.close()
-        await asyncio.gather(
-            *(writer.wait_closed() for writer in tuple(self._connections)),
-            return_exceptions=True,
-        )
-        self._connections.clear()
-        await self.manager.close()
-        target = Path(self.config.socket_path).expanduser().absolute()
+        self._closing = True
+        server = self._server
         try:
-            info = target.lstat()
-        except FileNotFoundError:
-            return
-        if self._socket_identity == (info.st_dev, info.st_ino):
-            target.unlink()
+            if server is not None:
+                # Withdraws the endpoint, then stops listening. A failed
+                # withdrawal is raised only after the clients and sessions are
+                # closed, and self._server stays set so a later close() retries.
+                server.close()
+                self._server = None
+        finally:
+            # Since Python 3.12 Server.wait_closed() also waits for every open
+            # connection, so clients are dropped first. That cuts an in-flight
+            # one-shot reply, as before 3.12; callers treat broker_disconnected
+            # as recoverable. A peer still proving itself is closed by the
+            # endpoint's own handshake deadline, or by _handle_client once it
+            # is admitted; nothing may hold the shutdown past this bound.
+            for writer in tuple(self._connections):
+                writer.close()
+            closing = [writer.wait_closed() for writer in tuple(self._connections)]
+            if server is not None:
+                closing.append(server.wait_closed())
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*closing, return_exceptions=True),
+                    CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            for writer in tuple(self._connections):
+                writer.close()  # whatever slipped in during the wait
+            self._connections.clear()
+            await self.manager.close()

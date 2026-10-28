@@ -126,7 +126,9 @@ def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]   
 class InputReader:
     def __init__(self, fd: int)
     async def read(self) -> bytes      # b"" at EOF
-DETACHED_CREATIONFLAGS: int   # Windows DETACHED_PROCESS, POSIX 0: auto-started servers leave the caller's console
+DETACHED_CREATIONFLAGS: int   # Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, POSIX 0: auto-started servers leave the caller's console and Job
+JOB_BREAKAWAY_CREATIONFLAG: int   # Windows CREATE_BREAKAWAY_FROM_JOB, POSIX 0: dropped on retry when the Job forbids breakaway
+def watch_break(callback: Callable[[], None]) -> Callable[[], None]   # Windows Ctrl+Break during an attach; POSIX no-op
 ```
 
 ---
@@ -1315,8 +1317,10 @@ def test_terminal_size_honours_columns_and_lines(monkeypatch):
 def test_detached_servers_leave_the_launching_console():
     import subprocess
 
-    expected = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+    breakaway = subprocess.CREATE_BREAKAWAY_FROM_JOB if IS_WINDOWS else 0
+    expected = subprocess.CREATE_NO_WINDOW | breakaway if IS_WINDOWS else 0
     assert pty.DETACHED_CREATIONFLAGS == expected
+    assert pty.JOB_BREAKAWAY_CREATIONFLAG == breakaway
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -1358,7 +1362,11 @@ _READER_STOP_SECONDS = 2.0
 _RESIZE_POLL_SECONDS = 0.25
 # An auto-started server must not die with the console that launched it.
 # POSIX needs nothing here: start_new_session already leaves the terminal.
-DETACHED_CREATIONFLAGS = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+# Windows: a console of its own without a window (not DETACHED_PROCESS, see
+# decision 6), outside the launcher's Job; retried inside the Job on refusal.
+JOB_BREAKAWAY_CREATIONFLAG = subprocess.CREATE_BREAKAWAY_FROM_JOB if IS_WINDOWS else 0
+DETACHED_CREATIONFLAGS = (
+    subprocess.CREATE_NO_WINDOW | JOB_BREAKAWAY_CREATIONFLAG if IS_WINDOWS else 0)
 
 if IS_WINDOWS:
     import ctypes
@@ -2703,7 +2711,11 @@ Expected：PR 创建成功；`gh pr checks --repo donny-star/cc-remote <number> 
 6. **broker 自动拉起时加 `DETACHED_PROCESS`**（controller 已接受）：否则关闭发起 `claude-remote` 的终端窗口会连带结束
    broker，与 POSIX `start_new_session` 语义不符。评审改为由 `pty.DETACHED_CREATIONFLAGS` 提供（POSIX 为 0），
    不在 `cli.py` 里写 `getattr(subprocess, "DETACHED_PROCESS", 0)` 这种隐式平台分支。评审实测 `DETACHED_PROCESS`
-   进程里能正常创建 ConPTY。
+   进程里能正常创建 ConPTY。**最终取值（Task 7 与收尾修复）**：Windows 为 `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`，
+   不再用 `DETACHED_PROCESS`——venv 的 `python.exe` 是会重新拉起真解释器的启动器，无控制台的启动器会让真解释器
+   新开一个可见控制台窗口（关掉它就会结束 broker）；`CREATE_NO_WINDOW` 给 broker 一个自己的隐藏控制台。
+   `CREATE_BREAKAWAY_FROM_JOB` 让 broker 脱离发起终端所在的 kill-on-close Job（IDE 终端、CI、计划任务）；
+   该 Job 不允许脱离时 `CreateProcess` 报 `PermissionError`，`cli.py` 去掉 `pty.JOB_BREAKAWAY_CREATIONFLAG` 重试一次。
 7. **测试里的假 Claude 改为转义回显**（`OUT<` + `unicode_escape` + `>`），并用 `_echoed` 拼接：ConPTY 会把一次写入拆成
    多次读，也会吞掉它自己请求的焦点报告（`ESC[O`/`ESC[I`，评审复测属实，`test_conpty_consumes_focus_reports` 记录该
    行为），焦点用例改为在报告后附带普通字节来证明帧被串行处理。已知影响：Windows 上被托管的 Claude TUI 收不到焦点事件。
@@ -2713,4 +2725,4 @@ Expected：PR 创建成功；`gh pr checks --repo donny-star/cc-remote <number> 
    释放，期间 conhost 与漏网后代一直存活。之后的 `write`/`resize` 抛 `OSError`，`PTYSession` 原本就对已退出会话把它们
    视为 `pty_closed` 或忽略。
 9. **`resolve_executable` 也拒绝 `claude-remote.cmd/.bat/.exe`**（评审新增，Task 5）：P5 的启动器带扩展名，原来只比对
-   裸名 `claude-remote`。
+   裸名 `claude-remote`。收尾修复再加 `.com/.ps1`（不区分大小写）。

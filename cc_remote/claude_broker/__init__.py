@@ -3,7 +3,7 @@
 This package is deliberately separate from :mod:`cc_remote.tui`.  It never
 installs or impersonates a ``claude`` executable: the broker owns a PTY and
 executes the real Claude Code binary inside it, while ``claude-remote`` clients
-attach over a same-user Unix-domain socket.
+attach over a same-user local endpoint (a Unix-domain socket on POSIX).
 """
 
 from importlib import import_module

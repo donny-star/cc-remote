@@ -5,41 +5,34 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-import errno
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import stat
-import struct
 import subprocess
 import time
 from typing import Callable, Literal
 import uuid
 
 from cc_remote.claude_paths import claude_projects_dir
-from cc_remote.platform import IS_WINDOWS
+from cc_remote.platform import IS_WINDOWS, procs, pty
 
 from .control_store import ControlStore, ControlStoreError
-
-if not IS_WINDOWS:  # PTY broker is POSIX-only until sub-project 3 ports it to ConPTY
-    import fcntl
-    import termios
 
 
 log = logging.getLogger(__name__)
 
 
-OUTPUT_CHUNK_BYTES = 64 * 1024
 DEFAULT_HISTORY_BYTES = 2 * 1024 * 1024
 MAX_HISTORY_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_SESSIONS = 32
 HARD_MAX_SESSIONS = 64
 SUBSCRIBER_QUEUE_FRAMES = 256
 INPUT_QUEUE_FRAMES = 64
+WRITER_STOP_TIMEOUT_SECONDS = 2.0
 TERMINAL_COMPOSING_IDLE_SECONDS = 30.0
 MAX_CLAUDE_ARGS = 128
 MAX_ARG_BYTES = 16 * 1024
@@ -73,6 +66,11 @@ _PERMISSION_OUTPUT_PATTERNS = (
     ("default", re.compile(r"\bmanual mode(?: on)?\b", re.IGNORECASE)),
 )
 _CONTROL_OUTPUT_TAIL_CHARS = 16 * 1024
+# Extensions a Windows launcher of claude-remote may carry (PATHEXT-style).
+_LAUNCHER_EXTENSIONS = frozenset({".bat", ".cmd", ".com", ".exe", ".ps1"})
+# Claude Code's project key on Windows: every character other than
+# [A-Za-z0-9] of the cwd becomes a dash (drive colon, separators, dots).
+_WINDOWS_PROJECT_KEY_RE = re.compile(r"[^A-Za-z0-9]")
 _FORBIDDEN_CLAUDE_ARGS = frozenset({
     "--session-id", "--resume", "-r", "--continue", "-c", "--fork-session",
 })
@@ -298,12 +296,22 @@ def resolve_executable(value: str) -> str:
         raise SessionError("bad_claude_binary", "Claude executable is not an executable file")
     # The public wrapper must never recurse into itself.  A real official binary
     # may be a native executable or a script named `claude`; only our distinct
-    # wrapper name is forbidden here.
-    if os.path.basename(candidate) == "claude-remote":
+    # wrapper name is forbidden here (Windows launchers carry an extension).
+    name = os.path.basename(candidate)
+    stem, extension = os.path.splitext(name)
+    if name == "claude-remote" or (
+            stem.lower() == "claude-remote" and extension.lower() in _LAUNCHER_EXTENSIONS):
         raise SessionError(
             "bad_claude_binary", "refusing to launch claude-remote as Claude Code",
         )
     return candidate
+
+
+def _project_key(cwd: str) -> str:
+    """Claude Code's ``~/.claude/projects`` directory name for ``cwd``."""
+    if IS_WINDOWS:
+        return _WINDOWS_PROJECT_KEY_RE.sub("-", cwd)
+    return cwd.replace(os.sep, "-")
 
 
 def validate_cwd(value: str | None) -> str:
@@ -362,35 +370,12 @@ def validate_resume_id(value: object) -> str:
     return canonical
 
 
-def _process_start_ticks(pid: int) -> int:
-    """Return a stable process-incarnation token on Linux and macOS.
-
-    Linux exposes the kernel start tick in ``/proc``.  macOS has no equivalent
-    cheap stdlib API, so a monotonic timestamp captured immediately after spawn
-    serves the same PID-reuse guard when combined with the broker generation.
-    """
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        # The comm field may contain spaces and parentheses.  Fields after its
-        # final ')' start at stat field 3; starttime is field 22.
-        return int(raw[raw.rfind(")") + 2:].split()[19])
-    except (OSError, ValueError, IndexError):
-        return time.monotonic_ns()
-
-
-def _child_setup() -> None:
-    """Make the slave side the child's controlling terminal."""
-    os.setsid()
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-
-
 class PTYSession:
     def __init__(
         self,
         *,
         session_id: str,
-        process: subprocess.Popen[bytes],
-        master_fd: int,
+        terminal: pty.PtyProcess,
         cwd: str,
         kind: Literal["new", "resume"],
         resume_id: str | None,
@@ -405,14 +390,13 @@ class PTYSession:
         auto_compact: str | None,
     ):
         self.id = session_id
-        self.process = process
-        self.master_fd = master_fd
+        self.terminal = terminal
         self.cwd = cwd
         self.kind = kind
         self.resume_id = resume_id
         self.generation = generation
         self.revision = 0
-        self.start_ticks = _process_start_ticks(process.pid)
+        self.start_ticks = terminal.start_ticks
         self.created_at = time.time()
         self.exited_at: float | None = None
         self.returncode: int | None = None
@@ -432,7 +416,6 @@ class PTYSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wait_task: asyncio.Task[None] | None = None
         self._transcript_watch_task: asyncio.Task[None] | None = None
-        self._reader_active = False
         self._closed = False
         self._on_change = on_change
         self._on_control_change = on_control_change
@@ -466,42 +449,20 @@ class PTYSession:
     ) -> "PTYSession":
         (model, effort, permission_mode, bypass_allowed,
          auto_compact) = _launch_controls(args)
-        master_fd, slave_fd = os.openpty()
-        try:
-            # Claude starts before a client necessarily attaches.  Give its TUI
-            # a sane initial geometry instead of the platform's 0x0 PTY default;
-            # the first attached terminal replaces this immediately.
-            fcntl.ioctl(
-                slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0),
-            )
-            env = os.environ.copy()
-            env["CLAUDE_REMOTE_BROKER"] = "1"
-            if not env.get("TERM") or env.get("TERM") == "dumb":
-                env["TERM"] = "xterm-256color"
-            # The broker owns the outer lifecycle; an inherited marker from a
-            # shell tool launched by Claude must not make the real child reject
-            # itself as an accidental nested invocation.
-            env.pop("CLAUDECODE", None)
-            process = subprocess.Popen(
-                [executable, *args],
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=cwd,
-                env=env,
-                close_fds=True,
-                preexec_fn=_child_setup,
-            )
-        except BaseException:
-            os.close(master_fd)
-            raise
-        finally:
-            os.close(slave_fd)
-        os.set_blocking(master_fd, False)
+        env = os.environ.copy()
+        env["CLAUDE_REMOTE_BROKER"] = "1"
+        if not env.get("TERM") or env.get("TERM") == "dumb":
+            env["TERM"] = "xterm-256color"
+        # The broker owns the outer lifecycle; an inherited marker from a
+        # shell tool launched by Claude must not make the real child reject
+        # itself as an accidental nested invocation.
+        env.pop("CLAUDECODE", None)
+        # Claude starts before a client necessarily attaches.  Give its TUI a
+        # sane initial geometry; the first attached terminal replaces it.
+        terminal = pty.spawn([executable, *args], cwd=cwd, env=env, rows=24, cols=80)
         return cls(
             session_id=session_id,
-            process=process,
-            master_fd=master_fd,
+            terminal=terminal,
             cwd=cwd,
             kind=kind,
             resume_id=resume_id,
@@ -520,8 +481,7 @@ class PTYSession:
         if self._loop is not None:
             return
         self._loop = asyncio.get_running_loop()
-        self._loop.add_reader(self.master_fd, self._on_readable)
-        self._reader_active = True
+        self.terminal.start(self._on_output)
         self._writer_task = asyncio.create_task(self._write_loop())
         self._wait_task = asyncio.create_task(self._wait_for_exit())
         self._transcript_watch_task = asyncio.create_task(
@@ -534,7 +494,7 @@ class PTYSession:
     def metadata(self) -> dict[str, object]:
         return {
             "id": self.id,
-            "pid": self.process.pid,
+            "pid": self.terminal.pid,
             "start_ticks": self.start_ticks,
             "cwd": self.cwd,
             "kind": self.kind,
@@ -620,21 +580,7 @@ class PTYSession:
                 subscription.overflowed = True
                 self.unsubscribe(subscription)
 
-    def _on_readable(self) -> None:
-        try:
-            data = os.read(self.master_fd, OUTPUT_CHUNK_BYTES)
-        except BlockingIOError:
-            return
-        except OSError as exc:
-            # BSD and Linux PTYs commonly report EIO once the slave closes.
-            if exc.errno in (errno.EIO, errno.EBADF):
-                self._remove_reader()
-                return
-            self._remove_reader()
-            return
-        if not data:
-            self._remove_reader()
-            return
+    def _on_output(self, data: bytes) -> None:
         self._observe_control_output(data)
         self._append_history(data)
         self._broadcast(SessionEvent("output", data))
@@ -697,33 +643,26 @@ class PTYSession:
             self._set_runtime_control("effort", effort_match.group(1).lower())
 
 
-    def _remove_reader(self) -> None:
-        if self._reader_active and self._loop is not None:
-            self._loop.remove_reader(self.master_fd)
-            self._reader_active = False
-
     async def _wait_for_exit(self) -> None:
-        # Keep the standalone broker single-threaded.  PTY spawning performs a
-        # tiny controlling-terminal pre-exec step; avoiding executor threads
-        # prevents later session spawns from hitting fork/preexec deadlocks.
-        while True:
-            returncode = self.process.poll()
-            if returncode is not None:
-                break
-            await asyncio.sleep(0.05)
-        # Drain bytes that became readable immediately before wait() completed.
-        while True:
+        try:
+            returncode = await self.terminal.wait()
+        except OSError as exc:
+            # A broken exit poll (ConPTY) must not leave the session running
+            # forever: report it exited with an unknown status (1).
+            log.warning("PTY exit wait for session %s failed: %s", self.id, exc)
+            # stop()/close() skip an exited session, so kill the tree now or a
+            # resume could run a second Claude on the same transcript.
             try:
-                data = os.read(self.master_fd, OUTPUT_CHUNK_BYTES)
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-            if not data:
-                break
-            self._append_history(data)
-            self._broadcast(SessionEvent("output", data))
-        self._remove_reader()
+                self.terminal.kill_group(procs.SIGKILL)
+            except (ProcessLookupError, OSError) as kill_exc:
+                log.warning("PTY kill for session %s failed: %s", self.id, kill_exc)
+            returncode = 1
+        else:
+            # Drain bytes that became readable immediately before wait() completed.
+            for data in self.terminal.drain():
+                self._append_history(data)
+                self._broadcast(SessionEvent("output", data))
+        self.terminal.stop_reading()
         self.returncode = returncode
         self.exited_at = time.time()
         self._set_terminal_composing(False)
@@ -892,9 +831,10 @@ class PTYSession:
                 self._transcript_path_cache = None
 
         # Claude's normal project key is the absolute cwd with separators
-        # replaced by dashes. Prefer that exact path so the 100 ms watcher does
-        # not repeatedly walk every project directory.
-        direct = root / self.cwd.replace(os.sep, "-") / f"{self.id}.jsonl"
+        # replaced by dashes (on Windows every non-alphanumeric character).
+        # Prefer that exact path so the 100 ms watcher does not repeatedly
+        # walk every project directory.
+        direct = root / _project_key(self.cwd) / f"{self.id}.jsonl"
         try:
             resolved = direct.resolve(strict=True)
             if root in resolved.parents and resolved.is_file():
@@ -1436,30 +1376,10 @@ class PTYSession:
                     self._set_writer_busy(False)
 
     async def _write_bytes(self, data: bytes) -> None:
-        view = memoryview(data)
-        while view:
-            try:
-                written = os.write(self.master_fd, view)
-            except BlockingIOError:
-                await self._wait_writable()
-                continue
-            except OSError as exc:
-                raise SessionError("pty_closed", f"PTY input failed: {exc}") from exc
-            view = view[written:]
-
-    async def _wait_writable(self) -> None:
-        assert self._loop is not None
-        ready = self._loop.create_future()
-
-        def mark_ready() -> None:
-            if not ready.done():
-                ready.set_result(None)
-
-        self._loop.add_writer(self.master_fd, mark_ready)
         try:
-            await ready
-        finally:
-            self._loop.remove_writer(self.master_fd)
+            await self.terminal.write(data)
+        except OSError as exc:
+            raise SessionError("pty_closed", f"PTY input failed: {exc}") from exc
 
     def resize(self, rows: int, cols: int, xpixel: int = 0, ypixel: int = 0) -> None:
         if not all(isinstance(value, int) for value in (rows, cols, xpixel, ypixel)):
@@ -1469,11 +1389,7 @@ class PTYSession:
         if not (0 <= xpixel <= 65535 and 0 <= ypixel <= 65535):
             raise SessionError("bad_resize", "terminal pixel dimensions are invalid")
         try:
-            fcntl.ioctl(
-                self.master_fd,
-                termios.TIOCSWINSZ,
-                struct.pack("HHHH", rows, cols, xpixel, ypixel),
-            )
+            self.terminal.resize(rows, cols, xpixel, ypixel)
         except OSError as exc:
             if self.running:
                 raise SessionError("pty_closed", f"PTY resize failed: {exc}") from exc
@@ -1482,7 +1398,7 @@ class PTYSession:
         if not self.running:
             return
         try:
-            os.killpg(self.process.pid, signal.SIGTERM)
+            self.terminal.kill_group(procs.SIGTERM)
         except ProcessLookupError:
             assert self._wait_task is not None
             await self._wait_task
@@ -1494,7 +1410,7 @@ class PTYSession:
         except asyncio.TimeoutError:
             pass
         try:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            self.terminal.kill_group(procs.SIGKILL)
         except ProcessLookupError:
             pass
         await self._wait_task
@@ -1503,24 +1419,35 @@ class PTYSession:
         if self._closed:
             return
         self._closed = True
-        if stop and self.running:
-            await self.stop(grace_seconds=0.5)
+        try:
+            if stop and self.running:
+                await self.stop(grace_seconds=0.5)
+        finally:
+            # A failed stop still releases the terminal; its error follows.
+            await self._teardown()
+
+    async def _teardown(self) -> None:
         if self._compose_timer is not None:
             self._compose_timer.cancel()
             self._compose_timer = None
-        if self._writer_task is not None and not self._writer_task.done():
-            self._writer_task.cancel()
-            await asyncio.gather(self._writer_task, return_exceptions=True)
+        writer = self._writer_task
+        if writer is not None and not writer.done():
+            writer.cancel()
+            # A Windows PTY write runs on a worker thread that neither
+            # cancellation nor close() can interrupt; never wait for it past
+            # this bound. The bound is on waiting: a stuck write keeps its
+            # pseudo console until it returns.
+            await asyncio.wait({writer}, timeout=WRITER_STOP_TIMEOUT_SECONDS)
         if (self._transcript_watch_task is not None
                 and not self._transcript_watch_task.done()):
             self._transcript_watch_task.cancel()
             await asyncio.gather(
                 self._transcript_watch_task, return_exceptions=True)
-        self._remove_reader()
-        try:
-            os.close(self.master_fd)
-        except OSError:
-            pass
+        self.terminal.close()
+        if writer is not None and not writer.done():
+            log.warning(
+                "PTY writer for session %s did not stop within %.1fs",
+                self.id, WRITER_STOP_TIMEOUT_SECONDS)
 
 
 class SessionManager:
