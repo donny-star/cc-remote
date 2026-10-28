@@ -24,6 +24,7 @@ from cc_remote.wrapper.codex_delegation import (
     normalize_codex_delegation_item, parse_codex_delegation,
 )
 
+from cc_remote.platform import IS_WINDOWS, executables
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
     MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
@@ -39,6 +40,8 @@ from cc_remote.wrapper.process_scan import (
     darwin_process_snapshot,
     process_command,
     process_command_environment_value,
+    win32_process_info,
+    win32_process_snapshot,
 )
 
 MAX_FDS_PER_PROCESS = 8192
@@ -399,7 +402,7 @@ def _codex_resume_sids(
     """
     if not args or b"resume" not in args:
         return set()
-    command_names = {arg.rsplit(b"/", 1)[-1] for arg in args[:2]}
+    command_names = {executables.command_name(arg) for arg in args[:2]}
     if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
         return set()
     resume_at = args.index(b"resume")
@@ -437,7 +440,7 @@ def _is_interactive_codex_tui(
     """Recognize a native Codex TUI without treating helper commands as one."""
     if tty_nr == 0 or not args:
         return False
-    command_names = {arg.rsplit(b"/", 1)[-1] for arg in args[:2]}
+    command_names = {executables.command_name(arg) for arg in args[:2]}
     if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
         return False
     return not any(
@@ -465,7 +468,7 @@ def _fold_npm_tui_launchers(
     children: dict[int, list[DarwinProcessInfo]] = {}
     for row in rows:
         _identity, ppid, tty_nr, args = row
-        if (args and args[0].rsplit(b"/", 1)[-1] in {b"codex", b"codex.exe"}
+        if (args and executables.command_name(args[0]) in {b"codex", b"codex.exe"}
                 and _is_interactive_codex_tui(args, tty_nr)):
             children.setdefault(ppid, []).append(row)
 
@@ -473,9 +476,9 @@ def _fold_npm_tui_launchers(
     for parent in rows:
         identity, _ppid, tty_nr, args = parent
         if (len(args) < 2
-                or args[0].rsplit(b"/", 1)[-1] not in {
+                or executables.command_name(args[0]) not in {
                     b"node", b"nodejs", b"node.exe"}
-                or args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+                or executables.command_name(args[1]) not in {b"codex", b"codex.js"}
                 or not _is_interactive_codex_tui(args, tty_nr)):
             continue
         candidates = children.get(identity.pid, [])
@@ -517,7 +520,7 @@ def _is_owned_npm_app_server_child(
     identity, ppid, tty_nr, args = child
     root = own_roots.get(ppid)
     if (root is None or tty_nr != 0 or not args
-            or args[0].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.exe"}
+            or executables.command_name(args[0]) not in {b"codex", b"codex.exe"}
             or args[1:3] not in {
                 (b"app-server", b"proxy"), (b"app-server", b"--stdio")}):
         return False
@@ -526,9 +529,9 @@ def _is_owned_npm_app_server_child(
         return False
     parent_identity, _parent_ppid, parent_tty, parent_args = parent
     if (parent_identity != root or parent_tty != 0 or len(parent_args) < 3
-            or parent_args[0].rsplit(b"/", 1)[-1] not in {
+            or executables.command_name(parent_args[0]) not in {
                 b"node", b"nodejs", b"node.exe"}
-            or parent_args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+            or executables.command_name(parent_args[1]) not in {b"codex", b"codex.js"}
             or identity.start_ticks < root.start_ticks
             or args[1:] != parent_args[2:]):
         return False
@@ -759,6 +762,86 @@ def _darwin_writable_rollout_holders(
     return scan
 
 
+_CODEX_COMMANDS = frozenset({b"codex", b"codex.exe", b"codex.js"})
+
+
+def _win32_writable_rollout_holders(
+    paths: Mapping[str, str],
+    own_processes: Iterable[ProcessIdentity],
+    *,
+    process_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
+    read_process: Callable[[int], DarwinProcessInfo | None] | None = None,
+) -> HolderScan:
+    """Attribute rollouts to foreign Codex processes from argv on Windows.
+
+    Windows has no cheap way to list another process's open handles, so the
+    writable-FD evidence of Linux/macOS is unavailable. A foreign Codex
+    process naming a watched thread id or rollout file in argv owns it; an
+    interactive ``codex resume SID`` TUI is logical evidence, as elsewhere.
+    Exactly the wrapper-owned processes and the native server behind a
+    wrapper-owned npm launcher are excluded; model-spawned tools are scanned.
+    """
+    result = {sid: set() for sid in paths}
+    passive = {sid: set() for sid in paths}
+    private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
+    client_proxies: dict[ProcessIdentity, int] = {}
+    sid_by_arg = {sid.encode(): sid for sid in paths}
+    rollout_names = {
+        sid: os.fsencode(os.path.basename(path))
+        for sid, path in paths.items() if path
+    }
+    snapshot = process_snapshot or win32_process_snapshot()
+    reader = read_process or win32_process_info
+    processes, complete = snapshot
+    own = set(own_processes)
+    own_roots = {identity.pid: identity for identity in own}
+    for row in processes:
+        if row[0] not in own and _is_owned_npm_app_server_child(
+            row, own_roots, read_process=reader,
+        ):
+            own.add(row[0])
+    for identity, _ppid, tty_nr, args in processes:
+        if identity in own or not args:
+            continue
+        if not {executables.command_name(arg) for arg in args[:2]} & _CODEX_COMMANDS:
+            continue
+        interactive_tui = _is_interactive_codex_tui(args, tty_nr)
+        if _is_app_server_proxy(args, tty_nr) or interactive_tui:
+            client_proxies[identity] = identity.start_ticks
+        if interactive_tui:
+            for sid in _codex_resume_sids(args, sid_by_arg):
+                result[sid].add(identity)
+                logical[sid].add(identity)
+        matched: set[str] = set()
+        for arg in args:
+            sid = sid_by_arg.get(arg)
+            if sid is not None:
+                matched.add(sid)
+                continue
+            for watched, name in rollout_names.items():
+                if name and name in arg:
+                    matched.add(watched)
+        if interactive_tui:
+            matched.difference_update(_codex_resume_sids(args, sid_by_arg))
+        for sid in matched:
+            result[sid].add(identity)
+            if _is_passive_app_server(Path(), tty_nr, args):
+                passive[sid].add(identity)
+                if not _is_managed_shared_app_server(args):
+                    private[sid].add(identity)
+    scan = HolderScan(
+        result, complete, passive, client_proxies, private,
+        logical_holders=logical,
+        darwin_snapshot=snapshot,
+    )
+    _fold_npm_tui_launchers(
+        scan, (row for row in processes if row[0] not in own),
+        read_process=reader,
+    )
+    return scan
+
+
 def writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity] = (),
@@ -775,6 +858,9 @@ def writable_rollout_holders(
     """
     if sys.platform == "darwin" and proc_root == "/proc":
         return _darwin_writable_rollout_holders(
+            paths, own_processes, process_snapshot=darwin_snapshot)
+    if IS_WINDOWS and proc_root == "/proc":
+        return _win32_writable_rollout_holders(
             paths, own_processes, process_snapshot=darwin_snapshot)
 
     by_inode: dict[tuple[int, int], set[str]] = {}

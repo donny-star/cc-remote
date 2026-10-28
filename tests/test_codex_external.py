@@ -116,14 +116,16 @@ def test_codex_app_server_proxy_socket_requires_one_absolute_socket(
         )
         return codex_app_server_proxy_socket(identity)
 
-    expected = str(Path("/tmp/codex-stack.sock").resolve())
+    # A rooted path is absolute on Windows only once it has a drive.
+    sock = os.fsencode(os.path.abspath("/tmp/codex-stack.sock"))
+    expected = str(Path(os.fsdecode(sock)).resolve())
     assert socket_for((
         b"/usr/local/bin/codex", b"app-server", b"proxy",
-        b"--sock", b"/tmp/codex-stack.sock",
+        b"--sock", sock,
     )) == expected
     assert socket_for((
         b"codex", b"app-server", b"proxy",
-        b"--sock=/tmp/codex-stack.sock",
+        b"--sock=" + sock,
     )) == expected
     for args in (
         None,
@@ -156,13 +158,14 @@ def test_codex_app_server_client_socket_routes_implicit_profile_home(
         ),
     )
 
-    default_home = "/Users/test/.codex"
+    # A rooted path is absolute on Windows only once it has a drive.
+    default_home = os.path.abspath("/Users/test/.codex")
     assert codex_app_server_client_socket(
         identity, default_codex_home=default_home,
     ) == (True, str(Path(default_home, "app-server-control",
                          "app-server-control.sock").resolve()))
 
-    home = "/Volumes/Stack/.codex"
+    home = os.path.abspath("/Volumes/Stack/.codex")
     assert codex_app_server_client_socket(
         identity, default_codex_home=default_home,
     ) == (True, str(Path(home, "app-server-control",
@@ -187,7 +190,7 @@ def test_codex_app_server_client_socket_routes_implicit_profile_home(
         identity, default_codex_home=default_home,
     ) == (False, None)
 
-    socket_with_spaces = "/Volumes/Muggle SSD/codex socket.sock"
+    socket_with_spaces = os.path.abspath("/Volumes/Muggle SSD/codex socket.sock")
     args = (
         b"/usr/local/bin/codex", b"app-server", b"proxy", b"--sock",
         os.fsencode(socket_with_spaces),
@@ -457,6 +460,7 @@ class _CodexSdk:
         self._owned.add(turn_id)
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_writable_holder_matches_inode_and_excludes_own_process(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
@@ -476,6 +480,7 @@ def test_writable_holder_matches_inode_and_excludes_own_process(tmp_path):
     assert scan.holders == {"sid": {ProcessIdentity(101, 1001)}}
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_writable_holder_uses_inode_not_path_text(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
@@ -491,6 +496,7 @@ def test_writable_holder_uses_inode_not_path_text(tmp_path):
     assert scan.holders["sid"] == {ProcessIdentity(201, 2001)}
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_headless_app_server_holder_is_classified_passive(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
@@ -516,6 +522,7 @@ def test_headless_app_server_holder_is_classified_passive(tmp_path):
     assert scan.private_holders["sid"] == {ProcessIdentity(211, 2101)}
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
@@ -710,6 +717,7 @@ def test_machine_merges_exact_tui_proxy_binding(monkeypatch):
     asyncio.run(go())
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     rollout = tmp_path / "rollout.jsonl"
@@ -738,6 +746,7 @@ def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     assert tui.exists()
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc writable-FD scan")
 def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
     target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
@@ -844,6 +853,7 @@ def test_codex_resume_logical_holder_clears_when_process_exits(tmp_path):
     assert second.passive_holders[sid] == set()
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc cwd and start-time scan")
 @pytest.mark.parametrize("npm_launcher", [False, True])
 def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path, npm_launcher):
     target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
@@ -888,6 +898,7 @@ def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path, npm_launche
     assert set(scan.client_proxies) == {identity}
 
 
+@pytest.mark.posix_only(reason="asserts the Linux /proc cwd and start-time scan")
 def test_plain_codex_tui_snapshot_binding_fails_closed_when_ambiguous(tmp_path):
     first = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     second = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
@@ -2644,3 +2655,68 @@ def test_interrupt_during_second_final_preflight_never_starts_query(monkeypatch)
         assert ctx.state == "idle"
 
     asyncio.run(go())
+
+
+def _row(pid, ppid, args, start=100):
+    from cc_remote.wrapper.process_scan import ProcessIdentity, win32_tty
+
+    args = tuple(args)
+    return ProcessIdentity(pid, start), ppid, win32_tty(args), args
+
+
+def _win32_scan(paths, rows, own=()):
+    from cc_remote.wrapper import codex_external
+
+    by_pid = {row[0].pid: row for row in rows}
+    return codex_external._win32_writable_rollout_holders(
+        paths, own, process_snapshot=(rows, True), read_process=by_pid.get)
+
+
+def test_win32_scan_binds_resume_tui_as_logical_holder(tmp_path):
+    rollout = tmp_path / "rollout-2026-10-27T00-00-00-sid-1.jsonl"
+    rollout.write_text("{}\n")
+    tui = _row(20, 1, [b"C:/npm/codex.exe", b"resume", b"sid-1"])
+    scan = _win32_scan({"sid-1": str(rollout)}, [tui])
+    assert scan.complete is True
+    assert scan.holders["sid-1"] == {tui[0]}
+    assert scan.logical_holders["sid-1"] == {tui[0]}
+    assert tui[0] in scan.client_proxies
+
+
+def test_win32_scan_ignores_non_codex_processes_naming_the_rollout(tmp_path):
+    rollout = tmp_path / "rollout-x-sid-1.jsonl"
+    rollout.write_text("{}\n")
+    editor = _row(21, 1, [b"C:/Windows/notepad.exe", os.fsencode(rollout)])
+    scan = _win32_scan({"sid-1": str(rollout)}, [editor])
+    assert scan.holders["sid-1"] == set()
+
+
+def test_win32_scan_excludes_wrapper_owned_npm_server(tmp_path):
+    rollout = tmp_path / "rollout-x-sid-1.jsonl"
+    rollout.write_text("{}\n")
+    launcher = _row(30, 1, [b"C:/nodejs/node.exe", b"C:/npm/codex.js",
+                            b"app-server", b"--stdio", b"sid-1"], start=100)
+    native = _row(31, 30, [b"C:/npm/codex.exe", b"app-server", b"--stdio", b"sid-1"],
+                  start=101)
+    scan = _win32_scan({"sid-1": str(rollout)}, [launcher, native], own=(launcher[0],))
+    assert scan.holders["sid-1"] == set()
+
+
+def test_win32_scan_marks_foreign_headless_server_passive(tmp_path):
+    rollout = tmp_path / "rollout-x-sid-1.jsonl"
+    rollout.write_text("{}\n")
+    server = _row(40, 1, [b"C:/npm/codex.exe", b"app-server", b"--stdio",
+                          os.fsencode(rollout)])
+    scan = _win32_scan({"sid-1": str(rollout)}, [server])
+    assert scan.holders["sid-1"] == {server[0]}
+    assert scan.passive_holders["sid-1"] == {server[0]}
+    assert scan.private_holders["sid-1"] == {server[0]}
+
+
+def test_win32_scan_reports_incomplete_snapshot(tmp_path):
+    from cc_remote.wrapper import codex_external
+
+    scan = codex_external._win32_writable_rollout_holders(
+        {"sid-1": str(tmp_path / "r.jsonl")}, (), process_snapshot=([], False),
+        read_process=lambda _pid: None)
+    assert scan.complete is False

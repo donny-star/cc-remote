@@ -16,8 +16,17 @@ from tests.test_codex_external import _codex_log_db, _fake_fd, _fake_process
 from tests.test_codex_profiles import _machine as _multi_profile_machine
 from tests.test_multisession import _mk_machine
 
+# The fake procfs drives the Linux /proc backend, which Windows cannot run
+# (no O_ACCMODE, no procfs cwd/start-time semantics); the Darwin variant is
+# pure snapshot + lsof parsing and runs everywhere.
+SCAN_BACKENDS = [
+    pytest.param("linux", marks=pytest.mark.posix_only(
+        reason="asserts the Linux /proc writable-FD scan")),
+    "darwin",
+]
 
-@pytest.fixture(params=["linux", "darwin"])
+
+@pytest.fixture(params=SCAN_BACKENDS)
 def npm_app_server_scan(tmp_path, monkeypatch, request):
     rollout = tmp_path / "watched.jsonl"
     rollout.write_text("", encoding="utf-8")
@@ -30,13 +39,15 @@ def npm_app_server_scan(tmp_path, monkeypatch, request):
     def add(identity, ppid, args, *, tty=0, writer=False):
         row = (identity, ppid, tty, args)
         rows.append(row)
-        proc = _fake_process(
-            proc_root, identity.pid, identity.start_ticks, ppid=ppid,
-            tty=tty, cmdline=tuple(os.fsdecode(arg) for arg in args),
-        )
         if writer:
-            _fake_fd(proc, 7, rollout, os.O_WRONLY)
             writers.append(identity.pid)
+        if request.param == "linux":
+            proc = _fake_process(
+                proc_root, identity.pid, identity.start_ticks, ppid=ppid,
+                tty=tty, cmdline=tuple(os.fsdecode(arg) for arg in args),
+            )
+            if writer:
+                _fake_fd(proc, 7, rollout, os.O_WRONLY)
         return row
 
     monkeypatch.setattr(
@@ -258,7 +269,7 @@ def test_npm_child_exclusion_accepts_verified_node_and_native_names(node, binary
         child, {launcher.pid: launcher}, read_process=current.get) is True
 
 
-@pytest.fixture(params=["linux", "darwin"])
+@pytest.fixture(params=SCAN_BACKENDS)
 def npm_process_scan(tmp_path, monkeypatch, request):
     paths = {}
     for sid in ("owned", "unrelated"):
@@ -272,13 +283,14 @@ def npm_process_scan(tmp_path, monkeypatch, request):
         (native, launcher.pid, 1, (b"/opt/npm/vendor/codex/codex",)),
     ]
     proc_root = tmp_path / "proc"
-    for identity, ppid, tty, args in rows:
-        _fake_process(
-            proc_root, identity.pid, identity.start_ticks, ppid=ppid,
-            tty=tty, cmdline=tuple(arg.decode() for arg in args),
-        )
     rollout = tmp_path / "owned.jsonl"
-    _fake_fd(proc_root / str(native.pid), 7, rollout, os.O_WRONLY)
+    if request.param == "linux":
+        for identity, ppid, tty, args in rows:
+            _fake_process(
+                proc_root, identity.pid, identity.start_ticks, ppid=ppid,
+                tty=tty, cmdline=tuple(arg.decode() for arg in args),
+            )
+        _fake_fd(proc_root / str(native.pid), 7, rollout, os.O_WRONLY)
     stat = rollout.stat()
 
     monkeypatch.setattr(

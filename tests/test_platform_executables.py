@@ -147,3 +147,14 @@ def test_signal_after_loop_closed_is_ignored(monkeypatch) -> None:
     finally:
         uninstall()
     assert stdlib_signal.getsignal(stdlib_signal.SIGINT) is original
+
+
+@pytest.mark.parametrize("arg", [b"codex", b"/usr/bin/codex", b"./codex"])
+def test_command_name_takes_the_last_posix_component(arg) -> None:
+    assert executables.command_name(arg) == b"codex"
+
+
+@pytest.mark.windows_only(reason="backslash separators and case folding are Windows path rules")
+def test_command_name_handles_windows_paths() -> None:
+    assert executables.command_name(b"C:\\Program Files\\nodejs\\node.EXE") == b"node.exe"
+    assert executables.command_name(b"C:/npm/node_modules/@openai/codex/bin/codex.js") == b"codex.js"

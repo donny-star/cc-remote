@@ -50,3 +50,18 @@ def command_for(path: str) -> list[str]:
         return [node, str(base.joinpath(*match["target"].split("\\")))]
     log.warning("unrecognized command shim; running through cmd.exe", path=path)
     return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", path]
+
+
+_WINDOWS_SEPARATORS = re.compile(rb"[\\/]")
+
+
+def command_name(arg: bytes) -> bytes:
+    """The executable name in one argv element, comparable across platforms.
+
+    POSIX keeps the historical ``rsplit(b"/")`` exactly. Windows paths use
+    either separator and are case-insensitive, so they are split on both and
+    lower-cased (``...\\node.EXE`` -> ``node.exe``).
+    """
+    if not IS_WINDOWS:
+        return arg.rsplit(b"/", 1)[-1]
+    return _WINDOWS_SEPARATORS.split(arg)[-1].lower()
