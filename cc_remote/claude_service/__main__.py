@@ -23,26 +23,35 @@ async def serve(directory: Path, *, stop: asyncio.Event | None = None) -> None:
         path = directory / "service.sock"
         service = Service(directory)
         server = await ipc.start_server(path, service.connection)
-        identity = process_identity(os.getpid())
-        state = {
-            "pid": os.getpid(), "start_ticks": identity.start_ticks if identity else None,
-            "source": str(Path(__file__).resolve().parents[2]),
-            "socket": str(path), "protocol": 1,
-        }
         descriptor = directory / "service.json"
-        fd = files.open_nofollow(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as out:
-            json.dump(state, out)
-        stopped = stop if stop is not None else asyncio.Event()
-        uninstall = signals.install_shutdown_handler(asyncio.get_running_loop(), stopped.set)
+        uninstall = None
         try:
+            identity = process_identity(os.getpid())
+            state = {
+                "pid": os.getpid(), "start_ticks": identity.start_ticks if identity else None,
+                "source": str(Path(__file__).resolve().parents[2]),
+                "socket": str(path), "protocol": 1,
+            }
+            fd = files.open_nofollow(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as out:
+                json.dump(state, out)
+            stopped = stop if stop is not None else asyncio.Event()
+            uninstall = signals.install_shutdown_handler(asyncio.get_running_loop(), stopped.set)
             await stopped.wait()
         finally:
-            uninstall()
-            server.close()
-            await server.wait_closed()
-            await asyncio.gather(*(session.close() for session in service.sessions.values()))
-            descriptor.unlink(missing_ok=True)
+            # The shutdown handler stays installed until cleanup is done, so a
+            # second stop signal only re-sets the event instead of aborting it.
+            try:
+                try:
+                    server.close()
+                finally:
+                    await server.wait_closed()
+                    await asyncio.gather(
+                        *(session.close() for session in service.sessions.values()))
+                    descriptor.unlink(missing_ok=True)
+            finally:
+                if uninstall is not None:
+                    uninstall()
     finally:
         os.close(lock_fd)
 

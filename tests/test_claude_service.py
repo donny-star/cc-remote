@@ -34,7 +34,7 @@ def test_private_socket_registration_and_explicit_override(tmp_path, monkeypatch
     monkeypatch.setenv("CC_REMOTE_CLAUDE_SERVICE_SOCKET", "")
     assert _claude_service_socket() == ""
     monkeypatch.delenv("CC_REMOTE_CLAUDE_SERVICE_SOCKET")
-    registration.chmod(0o644)
+    share_with_everyone(registration)
     with pytest.raises(ValueError):
         _claude_service_socket()
     registration.unlink()
