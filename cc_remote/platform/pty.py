@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import functools
 import os
 import shutil
 import stat
@@ -47,6 +48,7 @@ DETACHED_CREATIONFLAGS = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
 if IS_WINDOWS:
     import ctypes
     import msvcrt
+    from ctypes import wintypes
 else:
     import fcntl
     import termios
@@ -681,7 +683,9 @@ class RawTerminal:
     input with line/echo/Ctrl+C processing disabled when it carries the
     keyboard, so keys reach the remote TUI as the same byte sequences.
     Neither touches a pipe or a file. Whatever was changed is restored on
-    every exit, including a failure part-way through entering.
+    every exit, including a failure part-way through entering: each undo is
+    registered before its change, so no interrupt can fall between the two
+    (restoring an unchanged setting is harmless).
     """
 
     def __init__(self, stdin_fd: int, stdout_fd: int, *, keyboard: bool):
@@ -696,9 +700,9 @@ class RawTerminal:
                 self._enter_windows()
             elif self._keyboard and os.isatty(self._stdin_fd):
                 original = termios.tcgetattr(self._stdin_fd)
-                tty.setraw(self._stdin_fd)
                 self._restore.append(lambda: termios.tcsetattr(
                     self._stdin_fd, termios.TCSAFLUSH, original))
+                tty.setraw(self._stdin_fd)
         except BaseException:
             self.__exit__()
             raise
@@ -709,18 +713,18 @@ class RawTerminal:
         if output is not None:
             output_mode = _console_mode(output)
             code_page = _console_output_cp()
+            self._restore.append(lambda: _set_console_mode(output, output_mode))
             _set_console_mode(output, output_mode | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
                               | _DISABLE_NEWLINE_AUTO_RETURN)
-            self._restore.append(lambda: _set_console_mode(output, output_mode))
-            _set_console_output_cp(_UTF8_CODE_PAGE)
             self._restore.append(lambda: _set_console_output_cp(code_page))
+            _set_console_output_cp(_UTF8_CODE_PAGE)
         console_input = _console_handle(self._stdin_fd) if self._keyboard else None
         if console_input is not None:
             input_mode = _console_mode(console_input)
             raw = input_mode & ~(_ENABLE_PROCESSED_INPUT | _ENABLE_LINE_INPUT
                                  | _ENABLE_ECHO_INPUT)
-            _set_console_mode(console_input, raw | _ENABLE_VIRTUAL_TERMINAL_INPUT)
             self._restore.append(lambda: _set_console_mode(console_input, input_mode))
+            _set_console_mode(console_input, raw | _ENABLE_VIRTUAL_TERMINAL_INPUT)
 
     def __exit__(self, *_exc: object) -> None:
         while self._restore:
@@ -732,7 +736,13 @@ class RawTerminal:
 
 
 def terminal_size(fd: int) -> tuple[int, int, int, int]:
-    """``(rows, cols, xpixel, ypixel)`` of the terminal on ``fd`` (24x80 default)."""
+    """``(rows, cols, xpixel, ypixel)`` of the terminal on ``fd`` (24x80 default).
+
+    Windows ignores ``fd``: the size is ``shutil.get_terminal_size()``, i.e.
+    exported COLUMNS/LINES win (a frozen size the resize poll never sees
+    change), else the process's stdout screen buffer, else 80x24 when stdout
+    is redirected even if stdin is a console.
+    """
     if IS_WINDOWS:
         # A console input handle has no geometry; the process's screen buffer
         # (stdout) does, and shutil also honours COLUMNS/LINES overrides.
@@ -751,8 +761,9 @@ def terminal_size(fd: int) -> tuple[int, int, int, int]:
 def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]:
     """Call ``callback`` on the running loop when the terminal on ``fd`` resizes.
 
-    POSIX uses SIGWINCH; Windows has none, so it polls every 250 ms. Returns
-    an ``unwatch()`` callable.
+    POSIX uses SIGWINCH; Windows has none, so it polls every 250 ms. A
+    callback that raises is logged and the watch goes on, on both. Returns an
+    ``unwatch()`` callable.
     """
     loop = asyncio.get_running_loop()
     if not IS_WINDOWS:
@@ -771,33 +782,163 @@ def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]:
             current = terminal_size(fd)
             if current != last:
                 last = current
-                callback()
+                try:
+                    callback()
+                except Exception:
+                    _log.exception("resize_callback_failed")
 
     task = loop.create_task(poll())
     return task.cancel
+
+
+_KEY_EVENT = 0x0001
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+_CONSOLE_POLL_MS = 100
+_CONSOLE_RECORDS = 64
+_CTRL_PRESSED = 0x0004 | 0x0008  # RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED
+_VK_SPACE = 0x20
+_VK_2 = 0x32
+_VK_MENU = 0x12
+# (key down, repeat count, virtual key, UTF-16 code unit, control key state)
+_ConsoleKey = tuple[bool, int, int, int, int]
+
+
+@functools.lru_cache(maxsize=None)
+def _console_input_api() -> tuple[Any, Any]:
+    """kernel32 with prototypes for the console input calls, and INPUT_RECORD."""
+    class KeyEventRecord(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown", wintypes.BOOL), ("wRepeatCount", wintypes.WORD),
+            ("wVirtualKeyCode", wintypes.WORD), ("wVirtualScanCode", wintypes.WORD),
+            ("UnicodeChar", wintypes.WORD), ("dwControlKeyState", wintypes.DWORD),
+        ]
+
+    class Event(ctypes.Union):
+        # MOUSE_EVENT_RECORD is the largest member (16 bytes).
+        _fields_ = [("KeyEvent", KeyEventRecord), ("_size", ctypes.c_byte * 16)]
+
+    class InputRecord(ctypes.Structure):
+        _fields_ = [("EventType", wintypes.WORD), ("Event", Event)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetNumberOfConsoleInputEvents.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetNumberOfConsoleInputEvents.restype = wintypes.BOOL
+    kernel32.ReadConsoleInputW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(InputRecord), wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD))
+    kernel32.ReadConsoleInputW.restype = wintypes.BOOL
+    return kernel32, InputRecord
+
+
+def _wait_console_input(handle: int, timeout_ms: int) -> bool:
+    """Whether console input is queued, waiting up to ``timeout_ms``."""
+    kernel32, _record = _console_input_api()
+    result = kernel32.WaitForSingleObject(handle, timeout_ms)
+    if result == _WAIT_OBJECT_0:
+        return True
+    if result == _WAIT_TIMEOUT:
+        return False
+    raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _read_console_input(handle: int) -> list[_ConsoleKey]:
+    """Take the input records already queued; never waits for more.
+
+    Only the key events are returned: focus, mouse, menu and buffer-size
+    events are consumed and dropped.
+    """
+    kernel32, record = _console_input_api()
+    queued = wintypes.DWORD()
+    if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(queued)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not queued.value:
+        return []
+    records = (record * min(queued.value, _CONSOLE_RECORDS))()
+    read = wintypes.DWORD()
+    if not kernel32.ReadConsoleInputW(handle, records, len(records), ctypes.byref(read)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return [(bool(key.bKeyDown), key.wRepeatCount, key.wVirtualKeyCode, key.UnicodeChar,
+             key.dwControlKeyState)
+            for key in (item.Event.KeyEvent for item in records[:read.value]
+                        if item.EventType == _KEY_EVENT)]
+
+
+def _key_text(key: _ConsoleKey) -> str:
+    """The characters a console key event types (VT input: escape sequences too)."""
+    down, repeat, virtual_key, unit, control = key
+    if not unit:
+        # NUL has no character of its own: it is Ctrl+Space or Ctrl+@ (Ctrl+2).
+        typed_nul = down and control & _CTRL_PRESSED and virtual_key in (_VK_SPACE, _VK_2)
+        return "\0" * max(repeat, 1) if typed_nul else ""
+    if not down and virtual_key != _VK_MENU:
+        return ""  # a key-up; but Alt+numpad delivers its character on Alt's
+    return chr(unit) * max(repeat, 1)
+
+
+class _ConsoleKeyDecoder:
+    """Console key events -> UTF-8, holding a high surrogate until its pair."""
+
+    def __init__(self) -> None:
+        self._high = ""
+
+    def feed(self, keys: list[_ConsoleKey]) -> bytes:
+        text = self._high + "".join(_key_text(key) for key in keys)
+        self._high = ""
+        if text and "\ud800" <= text[-1] <= "\udbff":
+            text, self._high = text[:-1], text[-1]
+        # Join surrogate pairs; a stray unpaired one still encodes.
+        text = text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+        return text.encode("utf-8", "surrogatepass")
 
 
 class InputReader:
     """Read chunks of keyboard input from ``fd`` without blocking the loop.
 
     POSIX waits for readiness with ``add_reader``. Windows reads on a daemon
-    thread (it never holds up interpreter exit); a console is read with
-    ReadConsoleW so input arrives as UTF-8. ``read`` returns b"" at EOF.
+    thread (it never holds up interpreter exit). ``read`` returns b"" at EOF.
+
+    A Windows console is read as raw key events (meant for use inside
+    ``RawTerminal``): the thread waits on the console handle and takes only
+    input already queued, so it is never blocked inside a read. Keys arrive
+    as UTF-8 with VT sequences; every byte, 0x1a (Ctrl+Z) included, is a key,
+    and EOF is only a console error or a closed handle. Pipes and files are
+    read with a blocking ``os.read``, which ends at their EOF.
+
+    ``close()`` stops reading and enqueues nothing more; cancel a pending
+    ``read()`` yourself. On a Windows console, once ``close()`` returns no
+    read is in flight or will be issued, so the next key reaches the
+    console's next reader. A pipe read already blocked in ``os.read`` cannot
+    be interrupted (non-interactive input): its data is dropped, and the
+    thread ends at that read's return.
     """
 
     def __init__(self, fd: int):
         self._fd = fd
         self._queue: asyncio.Queue[bytes] | None = None
+        self._stop = threading.Event()
+        # Held around each console read and enqueue: close() waits it out.
+        self._lock = threading.Lock()
 
     async def read(self) -> bytes:
         if not IS_WINDOWS:
             return await self._read_posix()
+        if self._stop.is_set():
+            return b""
         if self._queue is None:
             self._queue = asyncio.Queue()
             threading.Thread(
                 target=self._pump, args=(asyncio.get_running_loop(), self._queue),
                 name="stdin-reader", daemon=True).start()
         return await self._queue.get()
+
+    def close(self) -> None:
+        """Stop reading (idempotent); see the class docstring."""
+        with self._lock:
+            self._stop.set()
 
     async def _read_posix(self) -> bytes:
         mode = os.fstat(self._fd).st_mode
@@ -818,25 +959,47 @@ class InputReader:
             loop.remove_reader(self._fd)
 
     def _pump(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes]) -> None:
-        import io
-
-        console = None
-        if _console_handle(self._fd) is not None:
-            console = io._WindowsConsoleIO(self._fd, "rb", closefd=False)  # type: ignore[attr-defined]
+        console = _console_handle(self._fd)
+        if console is not None:
+            self._pump_console(console, loop, queue)
+            return
         while True:
             try:
-                if console is not None:
-                    data = console.read(READ_CHUNK_BYTES) or b""
-                else:
-                    data = os.read(self._fd, READ_CHUNK_BYTES)
+                data = os.read(self._fd, READ_CHUNK_BYTES)
             except OSError:
                 data = b""
+            with self._lock:
+                if self._stop.is_set() or not self._deliver(loop, queue, data) or not data:
+                    return
+
+    def _pump_console(self, console: int, loop: asyncio.AbstractEventLoop,
+                      queue: asyncio.Queue[bytes]) -> None:
+        decoder = _ConsoleKeyDecoder()
+        while not self._stop.is_set():
             try:
-                loop.call_soon_threadsafe(queue.put_nowait, data)
-            except RuntimeError:  # loop closed
+                ready = _wait_console_input(console, _CONSOLE_POLL_MS)
+                with self._lock:
+                    if self._stop.is_set():
+                        return
+                    if not ready:
+                        continue
+                    data = decoder.feed(_read_console_input(console))
+                    if data and not self._deliver(loop, queue, data):
+                        return
+            except OSError:
+                with self._lock:
+                    if not self._stop.is_set():
+                        self._deliver(loop, queue, b"")
                 return
-            if not data:
-                return
+
+    @staticmethod
+    def _deliver(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes],
+                 data: bytes) -> bool:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, data)
+        except RuntimeError:  # loop closed
+            return False
+        return True
 
 
 __all__ = [

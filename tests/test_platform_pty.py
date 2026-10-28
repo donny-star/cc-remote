@@ -668,7 +668,10 @@ async def main():
         reader = pty.InputReader(0)
         received = b""
         while not received.endswith(b"\r"):
-            received += await reader.read()
+            chunk = await reader.read()
+            if not chunk:
+                break
+            received += chunk
         os.write(1, b"GOT " + received.hex().encode() + b"\n")
         await asyncio.wait_for(resized.wait(), 10)
         rows, cols, _x, _y = pty.terminal_size(0)
@@ -694,9 +697,13 @@ async def test_raw_terminal_input_and_resize_inside_a_real_terminal(tmp_path):
     try:
         terminal.start(output)
         await output.until(lambda data: b"RAW raw=1 size=24x80" in data)
-        for chunk in (b"a", "中".encode(), b"\x03", b"\x1b[A", b"\r"):
+        # ^Z alone and mid-chunk, NUL (Ctrl+Space) and an astral emoji are keys too.
+        for chunk in (b"a", "中".encode(), b"\x03", b"\x1b[A", b"\x1a", b"x\x1ay", b"\x00",
+                      "😀".encode(), b"\r"):
             await terminal.write(chunk)
-        await output.until(lambda data: b"GOT 61e4b8ad031b5b410d" in data)
+        await output.until(lambda data: re.search(rb"GOT [0-9a-f]*\r?\n", data) is not None)
+        assert re.search(rb"GOT ([0-9a-f]*)", output.data).group(1) == (
+            b"61" b"e4b8ad" b"03" b"1b5b41" b"1a" b"781a79" b"00" b"f09f9880" b"0d")
         terminal.resize(30, 100)
         await output.until(lambda data: b"RESIZED size=30x100" in data)
         assert await asyncio.wait_for(terminal.wait(), 10) == 0
@@ -707,14 +714,59 @@ async def test_raw_terminal_input_and_resize_inside_a_real_terminal(tmp_path):
     assert b"AFTER raw=0" in data
 
 
+CLOSE_CHILD = r'''
+import asyncio
+import os
+
+from cc_remote.platform import pty
+
+
+async def main():
+    with pty.RawTerminal(0, 1, keyboard=True):
+        reader = pty.InputReader(0)
+        os.write(1, b"RAW\n")
+        first = await reader.read()
+        getattr(reader, "close", lambda: None)()
+    os.write(1, b"FIRST " + first.hex().encode() + b" CLOSED\n")
+    line = os.read(0, 64)
+    os.write(1, b"COOKED " + line.hex().encode() + b"\n")
+
+
+asyncio.run(main())
+'''
+
+
+@pytest.mark.asyncio
+async def test_a_closed_reader_leaves_the_next_keys_to_the_console(tmp_path):
+    script = tmp_path / "close_child.py"
+    script.write_text(CLOSE_CHILD, encoding="utf-8")
+    output = _Collector()
+    terminal = pty.spawn([sys.executable, str(script)], cwd=str(tmp_path),
+                         env={**os.environ, "PYTHONPATH": str(ROOT)})
+    try:
+        terminal.start(output)
+        await output.until(lambda data: b"RAW" in data)
+        await terminal.write(b"a")
+        await output.until(lambda data: b"FIRST 61 CLOSED" in data)
+        for chunk in (b"x", b"y", b"\r"):
+            await terminal.write(chunk)
+        await output.until(lambda data: re.search(rb"COOKED [0-9a-f]+\r?\n", data) is not None)
+        assert await asyncio.wait_for(terminal.wait(), 10) == 0
+    finally:
+        terminal.close()
+    # The whole line, x included: no read of the closed reader was left behind.
+    expected = b"78790d0a" if IS_WINDOWS else b"78790a"
+    assert re.search(rb"COOKED ([0-9a-f]+)", output.data).group(1) == expected
+
+
 @pytest.mark.asyncio
 async def test_input_reader_and_raw_terminal_accept_pipes():
     read_fd, write_fd = os.pipe()
     try:
         os.write(write_fd, b"piped")
-        os.close(write_fd)
-        write_fd = -1
-        with pty.RawTerminal(read_fd, read_fd, keyboard=True):
+        with pty.RawTerminal(read_fd, write_fd, keyboard=True):
+            os.close(write_fd)
+            write_fd = -1
             reader = pty.InputReader(read_fd)
             assert await asyncio.wait_for(reader.read(), 5) == b"piped"
             assert await asyncio.wait_for(reader.read(), 5) == b""
@@ -828,6 +880,25 @@ def test_a_mirror_leaves_the_keyboard_alone(monkeypatch):
     console.assert_restored()
 
 
+@pytest.mark.windows_only(reason="exercises the Windows console modes")
+@pytest.mark.parametrize("handle", ["out", "in"])
+def test_an_interrupt_right_after_a_mode_change_still_restores_it(monkeypatch, handle):
+    console = _FakeConsole(monkeypatch)
+    set_mode = console._set_mode
+
+    def interrupted(target: str, mode: int) -> None:
+        set_mode(target, mode)
+        if target == handle and mode != (_FakeConsole.INPUT if target == "in" else _FakeConsole.OUTPUT):
+            monkeypatch.setattr(pty, "_set_console_mode", set_mode)
+            raise KeyboardInterrupt  # lands after the change, before the next statement
+
+    monkeypatch.setattr(pty, "_set_console_mode", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        with pty.RawTerminal(0, 1, keyboard=True):
+            pytest.fail("entered despite the interrupt")
+    console.assert_restored()
+
+
 @pytest.mark.posix_only(reason="exercises termios raw mode")
 @pytest.mark.parametrize("escape", [None, _Escape, asyncio.CancelledError, KeyboardInterrupt])
 def test_termios_is_restored_on_every_exit(monkeypatch, escape):
@@ -870,6 +941,37 @@ async def test_watch_resize_polls_until_unwatched(monkeypatch):
     assert not resized.is_set()
 
 
+@pytest.mark.windows_only(reason="Windows has no SIGWINCH and polls the size")
+@pytest.mark.asyncio
+async def test_a_failing_resize_callback_is_logged_and_polling_goes_on(monkeypatch, caplog):
+    sizes = [(24, 80, 0, 0)]
+    monkeypatch.setattr(pty, "terminal_size", lambda fd: sizes[-1])
+    monkeypatch.setattr(pty, "_RESIZE_POLL_SECONDS", 0.01)
+    calls: list[tuple[int, int, int, int]] = []
+    resized = asyncio.Event()
+
+    def callback() -> None:
+        calls.append(sizes[-1])
+        if len(calls) == 1:
+            raise RuntimeError("resize handler failed")
+        resized.set()
+
+    unwatch = pty.watch_resize(0, callback)
+    try:
+        await asyncio.sleep(0.05)  # the poller has taken its first size
+        sizes.append((30, 100, 0, 0))
+        async with asyncio.timeout(5):
+            while not calls:
+                await asyncio.sleep(0.01)
+        sizes.append((40, 120, 0, 0))
+        await asyncio.wait_for(resized.wait(), 5)
+    finally:
+        unwatch()
+    assert calls == [(30, 100, 0, 0), (40, 120, 0, 0)]
+    assert any("resize_callback_failed" in record.getMessage() and record.exc_info
+               for record in caplog.records)
+
+
 @pytest.mark.windows_only(reason="the Windows reader is a thread")
 @pytest.mark.asyncio
 async def test_the_input_thread_ends_at_eof():
@@ -884,4 +986,113 @@ async def test_the_input_thread_ends_at_eof():
             assert loop.time() < deadline, "stdin reader thread outlived EOF"
             await asyncio.sleep(0.02)
     finally:
+        os.close(read_fd)
+
+
+def _key(char: str, *, down: bool = True, repeat: int = 1, vk: int = 0,
+         state: int = 0) -> tuple[bool, int, int, int, int]:
+    """A console KEY_EVENT as ``(down, repeat, virtual key, UTF-16 unit, control state)``."""
+    return down, repeat, vk, ord(char), state
+
+
+class _FakeConsoleInput:
+    """Console input on fake handle "in" (fd 0): batches of key records, or an error."""
+
+    def __init__(self, monkeypatch, batches) -> None:
+        self.batches = list(batches)
+        self.reads = 0
+        monkeypatch.setattr(pty, "_console_handle", lambda fd: "in" if fd == 0 else None)
+        monkeypatch.setattr(pty, "_wait_console_input", self._wait)
+        monkeypatch.setattr(pty, "_read_console_input", self._read)
+
+    def _wait(self, handle: str, timeout_ms: int) -> bool:
+        assert handle == "in"
+        time.sleep(0.005)
+        return True
+
+    def _read(self, handle: str):
+        assert handle == "in"
+        self.reads += 1
+        batch = self.batches.pop(0) if self.batches else []
+        if isinstance(batch, BaseException):
+            raise batch
+        return batch
+
+
+def _new_reader_threads(before: set[threading.Thread]) -> list[threading.Thread]:
+    return [thread for thread in threading.enumerate()
+            if thread.name == "stdin-reader" and thread not in before]
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console reader")
+@pytest.mark.asyncio
+async def test_console_keys_arrive_as_utf8_and_only_an_error_is_eof(monkeypatch):
+    console = _FakeConsoleInput(monkeypatch, [
+        [_key("a"), _key("\x1a")],                                   # ^Z is a key, not EOF
+        [_key("x"), _key("\x1a"), _key("y")],
+        [_key("\ud83d")],                                            # 😀 split across two reads
+        [_key("\ude00"), _key("\u4e2d")],
+        [_key("b", repeat=3), _key("b", down=False, vk=0x42)],        # a held key, its key-up
+        [_key("\0", vk=0x10), _key("\0", down=False, vk=0x26)],      # Shift alone, Up's key-up
+        [_key("\0", vk=0x12, state=0x2), _key("\u00e9", down=False, vk=0x12)],  # Alt+numpad
+        [_key("\0", vk=0x20, state=0x8), _key("\0", vk=0x32, state=0x18)],      # Ctrl+Space, Ctrl+@
+        OSError(6, "The handle is invalid"),
+    ])
+    reader = pty.InputReader(0)
+    chunks = []
+    while True:
+        chunk = await asyncio.wait_for(reader.read(), 5)
+        chunks.append(chunk)
+        if not chunk:
+            break
+    assert chunks == [b"a\x1a", b"x\x1ay", "😀中".encode(), b"bbb", "é".encode(), b"\0\0", b""]
+    assert console.batches == []
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console reader")
+@pytest.mark.asyncio
+async def test_close_leaves_no_console_read_behind(monkeypatch):
+    console = _FakeConsoleInput(monkeypatch, [[_key("a")]])
+    before = set(threading.enumerate())
+    reader = pty.InputReader(0)
+    assert await asyncio.wait_for(reader.read(), 5) == b"a"
+    [thread] = _new_reader_threads(before)
+    reader.close()
+    reads = console.reads
+    console.batches.append([_key("x")])
+    await asyncio.sleep(0.2)
+    assert console.reads == reads, "the console was read after close()"
+    thread.join(5)
+    assert not thread.is_alive()
+    assert reader._queue.empty()
+    reader.close()  # idempotent
+    assert await asyncio.wait_for(reader.read(), 5) == b""
+
+
+@pytest.mark.windows_only(reason="the Windows reader is a thread")
+@pytest.mark.parametrize("source", ["console", "pipe"])
+def test_the_input_thread_ends_when_its_loop_is_closed(monkeypatch, source):
+    before = set(threading.enumerate())
+    read_fd, write_fd = os.pipe()
+    try:
+        if source == "console":
+            console = _FakeConsoleInput(monkeypatch, [])
+            reader = pty.InputReader(0)
+        else:
+            reader = pty.InputReader(read_fd)
+        loop = asyncio.new_event_loop()
+        task = loop.create_task(reader.read())
+        loop.run_until_complete(asyncio.sleep(0.1))
+        [thread] = _new_reader_threads(before)
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        loop.close()
+        if source == "console":
+            console.batches.append([_key("x")])
+        else:
+            os.write(write_fd, b"late")
+        thread.join(5)
+        assert not thread.is_alive(), "the reader outlived its closed loop"
+    finally:
+        os.close(write_fd)
         os.close(read_fd)
