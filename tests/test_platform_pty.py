@@ -292,3 +292,38 @@ async def test_a_cmd_shim_runs_inside_conpty(tmp_path):
         assert _args(data) == ["--session-id", "x"]
     finally:
         await _finish(terminal)
+
+
+class _IdleConPty:
+    """A pseudo console whose child exited while the reader sat between reads."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.cancels = 0
+
+    def isalive(self) -> bool:
+        return False
+
+    def get_exitstatus(self) -> int:
+        return 3
+
+    def read(self, blocking: bool = False) -> str:
+        return ""
+
+    def cancel_io(self) -> bool:
+        import winpty
+
+        self.cancels += 1
+        raise winpty.WinptyError("nothing in flight")
+
+
+@pytest.mark.windows_only(reason="pywinpty's cancel_io fails when no read is in flight")
+@pytest.mark.asyncio
+async def test_wait_survives_cancel_io_with_no_read_in_flight():
+    console = _IdleConPty()
+    terminal = pty._WindowsPty(console)
+    terminal.start(lambda chunk: None)
+    assert await asyncio.wait_for(terminal.wait(), 10) == 3
+    assert console.cancels >= 1
+    terminal.close()
+    assert await _conpty_threads_gone(terminal.pid)

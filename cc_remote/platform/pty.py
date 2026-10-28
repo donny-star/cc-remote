@@ -367,7 +367,10 @@ class _WindowsPty(PtyProcess):
         # cancel_io only cancels a read already in flight; repeat until the
         # reader observed either the cancellation or the stop flag.
         while not done.done() and time.monotonic() < deadline:
-            self._terminal.cancel_io()
+            try:
+                self._terminal.cancel_io()
+            except Exception:  # WinptyError: the reader is between two reads
+                pass
             await asyncio.wait({done}, timeout=0.05)
 
     def drain(self) -> list[bytes]:
