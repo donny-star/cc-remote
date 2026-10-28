@@ -26,6 +26,7 @@ from __future__ import annotations
 import errno
 import functools
 import os
+import time
 import warnings
 from os import PathLike
 from typing import Iterator
@@ -135,6 +136,29 @@ def lock_path(directory: StrPath, name: str) -> str:
         return os.path.join(directory, name)
     parent, base = os.path.split(os.path.normpath(directory))
     return os.path.join(parent, f".{base}.{name}")
+
+
+def open_lock(
+    directory: StrPath, name: str, flags: int, mode: int = 0o600, *,
+    attempts: int = 20, delay: float = 0.01,
+) -> int:
+    """``os.open`` of :func:`lock_path` that rides out a concurrent discard.
+
+    POSIX opens once, as before. On Windows a :func:`discard_lock` that is
+    deleting the unused file makes opens fail with ``PermissionError`` until
+    it completes, so those are retried ``attempts`` times ``delay`` apart.
+    """
+    path = lock_path(directory, name)
+    if not IS_WINDOWS:
+        return os.open(path, flags, mode)
+    for attempt in range(attempts):
+        try:
+            return os.open(path, flags, mode)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+    raise ValueError("attempts must be at least 1")
 
 
 def discard_lock(directory: StrPath, name: str) -> None:
@@ -284,4 +308,4 @@ class DirHandle:
         self.close()
 
 
-__all__ = ["DirHandle", "discard_lock", "lock_path"]
+__all__ = ["DirHandle", "discard_lock", "lock_path", "open_lock"]

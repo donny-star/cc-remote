@@ -241,7 +241,7 @@ def cleanup_codex_checkpoint_session(
         try:
             lock_flags = os.O_RDWR | os.O_CREAT
             lock_flags |= getattr(os, "O_NOFOLLOW", 0)
-            lock_fd = os.open(dirs.lock_path(candidate, "journal.lock"), lock_flags, 0o600)
+            lock_fd = dirs.open_lock(candidate, "journal.lock", lock_flags, 0o600)
             locks.flock(lock_fd, locks.LOCK_EX)
             tombstone = candidate.with_name(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
@@ -477,7 +477,8 @@ class CodexCheckpointJournal:
     def _locked(self) -> Iterator[None]:
         self._ensure_open()
         self.session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = dirs.open_lock(
+            self.session_dir, "journal.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             locks.flock(fd, locks.LOCK_EX)
             yield

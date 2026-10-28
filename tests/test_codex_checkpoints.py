@@ -764,3 +764,28 @@ def test_cleanup_removes_journals_holding_read_only_git_objects(tmp_path):
             assert cleanup_codex_checkpoint_session(state, session_id) == 1
         assert not journal.session_dir.exists()
         assert not journal.lock_path.exists()
+
+
+@pytest.mark.windows_only(reason="only Windows discards a sibling lock file")
+def test_journal_lock_open_rides_out_a_concurrent_discard(tmp_path):
+    import threading
+
+    from cc_remote.platform import dirs
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "lock-race")
+    stop = threading.Event()
+
+    def discard_forever():
+        while not stop.is_set():
+            dirs.discard_lock(journal.session_dir, "journal.lock")
+
+    discarder = threading.Thread(target=discard_forever)
+    discarder.start()
+    try:
+        for _ in range(2000):
+            with journal._locked():
+                pass
+    finally:
+        stop.set()
+        discarder.join()

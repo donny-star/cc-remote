@@ -391,3 +391,31 @@ def test_discard_lock_is_a_no_op_on_posix(tmp_path) -> None:
     marker.write_text("")
     dirs.discard_lock(tmp_path / "abc", "journal.lock")
     assert marker.exists()
+
+
+@pytest.mark.windows_only(reason="POSIX opens the lock once, as before")
+def test_open_lock_retries_a_lasting_permission_error_a_bounded_number_of_times(
+        tmp_path, monkeypatch) -> None:
+    from cc_remote.platform import dirs
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(dirs.time, "sleep", sleeps.append)
+    session = tmp_path / "abc"
+    os.mkdir(dirs.lock_path(session, "journal.lock"))  # opening a directory is denied
+    with pytest.raises(PermissionError):
+        dirs.open_lock(session, "journal.lock", os.O_RDWR | os.O_CREAT,
+                       attempts=3, delay=0.5)
+    assert sleeps == [0.5, 0.5]
+
+
+def test_open_lock_opens_the_lock_path(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    session = tmp_path / "abc"
+    session.mkdir()
+    fd = dirs.open_lock(session, "journal.lock", os.O_RDWR | os.O_CREAT)
+    try:
+        assert os.path.exists(dirs.lock_path(session, "journal.lock"))
+    finally:
+        os.close(fd)
+    dirs.discard_lock(session, "journal.lock")
