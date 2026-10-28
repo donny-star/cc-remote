@@ -1,3 +1,4 @@
 -r requirements-common.txt
 claude-agent-sdk==0.2.157
 Pillow==12.3.0
+pywinpty==3.1.0 ; sys_platform == "win32"
