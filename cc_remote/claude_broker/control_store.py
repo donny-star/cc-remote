@@ -45,16 +45,19 @@ class ControlStore:
         self._loaded = True
         try:
             info = self.path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or not perms.owned_by_current_user(self.path)
+                    or not perms.is_private(self.path)
+                    or info.st_size > MAX_STORE_BYTES):
+                raise ControlStoreError("Claude control store is not a private regular file")
+            text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return
-        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or not perms.owned_by_current_user(self.path)
-                or not perms.is_private(self.path)
-                or info.st_size > MAX_STORE_BYTES):
-            raise ControlStoreError("Claude control store is not a private regular file")
+            return  # missing, or removed while it was being checked
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ControlStoreError("Claude control store is unreadable") from exc
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
             raise ControlStoreError("Claude control store is unreadable") from exc
         raw_sessions = payload.get("sessions") if isinstance(payload, dict) else None
         if (not isinstance(payload, dict)
@@ -109,7 +112,9 @@ class ControlStore:
     def _write(self) -> None:
         parent = self.path.parent
         info = parent.lstat()
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+        # A Windows junction lstat()s as a plain directory: check the
+        # reparse point itself, not only S_ISLNK.
+        if (not stat.S_ISDIR(info.st_mode) or files.is_reparse_point(parent)
                 or not perms.owned_by_current_user(parent)
                 or not perms.is_private(parent)):
             raise ControlStoreError("Claude control store directory is unsafe")

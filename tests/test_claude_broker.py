@@ -1558,6 +1558,60 @@ def test_control_store_round_trips_privately_and_rejects_a_shared_file(tmp_path:
         broker_session_module.ControlStore(str(path)).load()
 
 
+@pytest.mark.parametrize("vanishes_during", ["owner-check", "read"])
+def test_a_control_store_deleted_while_loading_counts_as_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, vanishes_during: str,
+):
+    directory = tmp_path / "broker"
+    directory.mkdir()
+    perms.make_private(directory, directory=True)
+    path = directory / "session-controls.json"
+    sid = str(uuid.uuid4())
+    broker_session_module.ControlStore(str(path)).update(sid, model="claude-fable-5")
+    real_owned, real_private = perms.owned_by_current_user, perms.is_private
+
+    def owned(target):
+        if vanishes_during == "owner-check":
+            path.unlink(missing_ok=True)
+        return real_owned(target)
+
+    def private(target):
+        result = real_private(target)
+        if vanishes_during == "read":
+            path.unlink(missing_ok=True)
+        return result
+
+    monkeypatch.setattr(perms, "owned_by_current_user", owned)
+    monkeypatch.setattr(perms, "is_private", private)
+    store = broker_session_module.ControlStore(str(path))
+    assert store.get(sid) == {}
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """A junction on Windows (needs no symlink privilege), a symlink elsewhere."""
+    if IS_WINDOWS:
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True, capture_output=True)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_control_store_refuses_a_linked_directory(tmp_path: Path):
+    target = tmp_path / "real"
+    target.mkdir()
+    perms.make_private(target, directory=True)
+    link = tmp_path / "linked"
+    _link_directory(link, target)
+    try:
+        store = broker_session_module.ControlStore(str(link / "session-controls.json"))
+        with pytest.raises(broker_session_module.ControlStoreError, match="directory is unsafe"):
+            store.update(str(uuid.uuid4()), model="claude-fable-5")
+        assert list(target.iterdir()) == []
+    finally:
+        os.rmdir(link) if IS_WINDOWS else link.unlink()
+
+
 @pytest.mark.asyncio
 async def test_cli_keyboard_attachment_forwards_piped_stdin(monkeypatch: pytest.MonkeyPatch):
     read_fd, write_fd = os.pipe()
