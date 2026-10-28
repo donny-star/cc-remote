@@ -252,6 +252,20 @@ def _publish(temporary: Path, target: Path, attempts: int = 10) -> None:
             time.sleep(min(0.02 * (2 ** attempt), 0.5))
 
 
+def _withdraw(target: Path, attempts: int = 10) -> None:
+    """Unlink a published endpoint, riding out brief sharing violations."""
+    for attempt in range(attempts):
+        try:
+            target.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != _SHARING_VIOLATION or attempt == attempts - 1:
+                raise
+            time.sleep(min(0.02 * (2 ** attempt), 0.5))
+
+
 # --- peer authentication ------------------------------------------------------
 
 def _mac(token: bytes, label: bytes, first: bytes, second: bytes) -> bytes:
@@ -487,11 +501,13 @@ class IpcServer:
     """An ``asyncio`` server plus the endpoint path it published."""
 
     def __init__(self, server: asyncio.AbstractServer, path: Path,
-                 identity: tuple[int, int], guard: _Guard):
+                 identity: tuple[int, int], guard: _Guard,
+                 endpoint: Endpoint | None = None):
         self._server = server
         self._path = path
         self._identity = identity
         self._guard = guard
+        self._endpoint = endpoint
         self._removed = False
 
     @property
@@ -509,24 +525,51 @@ class IpcServer:
         """Withdraw the endpoint if it is still ours, then stop listening.
 
         Withdrawing first means the recorded port is never released while the
-        record still names it and its owner is alive.
+        record still names it and its owner is alive. The listener stops even
+        when withdrawing fails; that failure is raised afterwards.
         """
-        if not self._removed:
-            self._removed = True
-            try:
-                info = self._path.lstat()
-            except FileNotFoundError:
-                info = None
-            if info is not None and (info.st_dev, info.st_ino) == self._identity:
-                with contextlib.suppress(FileNotFoundError):
-                    self._path.unlink()
-        self._server.close()
+        try:
+            if not self._removed:
+                self._removed = True
+                if self._still_ours():
+                    _withdraw(self._path)
+        finally:
+            self._server.close()
+
+    def _still_ours(self) -> bool:
+        try:
+            info = self._path.lstat()
+        except FileNotFoundError:
+            return False
+        if (info.st_dev, info.st_ino) == self._identity:
+            return True
+        if self._endpoint is None:
+            return False
+        # Not every Windows volume reports a stable file id. A record with this
+        # server's port and token can only be the one it published.
+        try:
+            return read_endpoint(self._path) == self._endpoint
+        except OSError:
+            return False
 
     async def wait_closed(self) -> None:
         await self._server.wait_closed()
 
     async def serve_forever(self) -> None:
-        await self._server.serve_forever()
+        """Serve until cancelled or closed; every exit withdraws the endpoint."""
+        serving = asyncio.ensure_future(self._server.serve_forever())
+        try:
+            # Awaiting serving directly would let asyncio's own cancellation
+            # handling close the port while the record still names it.
+            await asyncio.wait({serving})
+        finally:
+            try:
+                self.close()
+            finally:
+                await asyncio.wait({serving})
+                if not serving.cancelled():
+                    serving.exception()  # retrieved here, re-raised below
+        serving.result()
 
     async def __aenter__(self) -> IpcServer:
         return self
@@ -681,14 +724,14 @@ async def _windows_start_server(target: Path, handler: Handler, limit: int) -> I
             start_time = _process_start_time(os.getpid())
             if start_time is None:
                 raise OSError("cannot read this process's start time")
-            identity = write_endpoint(target, Endpoint(
-                port=listener.getsockname()[1], token=token,
-                pid=os.getpid(), start_time=start_time))
+            endpoint = Endpoint(port=listener.getsockname()[1], token=token,
+                                pid=os.getpid(), start_time=start_time)
+            identity = write_endpoint(target, endpoint)
         except BaseException:
             server.close()
             await server.wait_closed()
             raise
-    return IpcServer(server, target, identity, guard)
+    return IpcServer(server, target, identity, guard, endpoint)
 
 
 async def _windows_open(target: Path, limit: int, timeout: float,
@@ -717,9 +760,18 @@ async def _windows_open(target: Path, limit: int, timeout: float,
     return reader, writer
 
 
-def _recv_exactly(sock: socket.socket, size: int) -> bytes:
+def _settimeout_until(sock: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(errno.ETIMEDOUT, "endpoint handshake timed out")
+    sock.settimeout(remaining)
+
+
+def _recv_exactly(sock: socket.socket, size: int, deadline: float) -> bytes:
     data = bytearray()
     while len(data) < size:
+        # A per-call timeout alone would let a dribbling peer stall forever.
+        _settimeout_until(sock, deadline)
         chunk = sock.recv(size - len(data))
         if not chunk:
             raise AuthenticationError("endpoint closed during the handshake")
@@ -736,13 +788,16 @@ def _windows_connect_sync(target: Path, timeout: float) -> socket.socket:
         raise ConnectionRefusedError(
             errno.ECONNREFUSED, "endpoint is not accepting connections") from exc
     try:
+        deadline = time.monotonic() + timeout
         client_nonce = secrets.token_bytes(NONCE_BYTES)
+        _settimeout_until(sock, deadline)
         sock.sendall(client_nonce)
-        reply = _recv_exactly(sock, NONCE_BYTES + MAC_BYTES)
+        reply = _recv_exactly(sock, NONCE_BYTES + MAC_BYTES, deadline)
         server_nonce, server_mac = reply[:NONCE_BYTES], reply[NONCE_BYTES:]
         if not hmac.compare_digest(
                 server_mac, _mac(endpoint.token, b"srv", client_nonce, server_nonce)):
             raise AuthenticationError("endpoint did not prove the shared token")
+        _settimeout_until(sock, deadline)
         sock.sendall(_mac(endpoint.token, b"cli", server_nonce, client_nonce))
         sock.settimeout(None)
     except AuthenticationError:

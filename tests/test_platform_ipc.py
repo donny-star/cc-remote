@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import errno
 import hashlib
 import hmac
 import json
@@ -1377,3 +1378,120 @@ async def test_start_over_a_dead_owners_silent_port_fits_the_readiness_budget(en
             assert await _ping(endpoint_path) == b"PING"
     finally:
         await _stop(listener)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_cancelling_serve_forever_withdraws_the_endpoint_before_the_port(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    stop_listening = server._server.close
+    seen = []
+
+    def close_listener():
+        seen.append(endpoint_path.exists())
+        stop_listening()
+
+    server._server.close = close_listener
+    serving = asyncio.ensure_future(server.serve_forever())
+    assert await _ping(endpoint_path) == b"PING"
+    serving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await serving
+    await server.wait_closed()
+    assert seen and not any(seen)
+    assert not endpoint_path.exists()
+    async with await ipc.start_server(endpoint_path, _echo):
+        assert await _ping(endpoint_path) == b"PING"
+
+
+def _fail_endpoint_unlink(monkeypatch, path: Path, errors: list) -> list:
+    """Raise ``errors`` in turn from unlinking ``path``, then really unlink it."""
+    calls = []
+    real_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == path:
+            calls.append(1)
+            if errors:
+                raise errors.pop(0)
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    return calls
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_close_retries_a_sharing_violation_on_the_endpoint(endpoint_path, monkeypatch):
+    server = await ipc.start_server(endpoint_path, _echo)
+    calls = _fail_endpoint_unlink(monkeypatch, endpoint_path, [
+        OSError(errno.EACCES, "sharing violation", None, 32)])
+    server.close()
+    await server.wait_closed()
+    assert len(calls) == 2
+    assert not endpoint_path.exists()
+    assert not server.is_serving()
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_close_stops_listening_before_raising_a_withdrawal_failure(
+        endpoint_path, monkeypatch):
+    server = await ipc.start_server(endpoint_path, _echo)
+    port = ipc.read_endpoint(endpoint_path).port
+    calls = _fail_endpoint_unlink(monkeypatch, endpoint_path, [
+        OSError(errno.EACCES, "access denied", None, 5)])
+    with pytest.raises(PermissionError, match="access denied"):
+        server.close()
+    assert len(calls) == 1
+    assert not server.is_serving()
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=3).close()
+    await asyncio.wait_for(server.wait_closed(), 2)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_sync_handshake_timeout_bounds_the_whole_handshake(endpoint_path):
+    accepted = []
+
+    async def dribble(reader, writer):
+        accepted.append(writer)
+        await reader.readexactly(ipc.NONCE_BYTES)
+        for _ in range(ipc.NONCE_BYTES + ipc.MAC_BYTES):
+            writer.write(os.urandom(1))
+            await writer.drain()
+            await asyncio.sleep(0.3)
+
+    listener, port = await _listen(dribble)
+    _record(endpoint_path, port, os.urandom(32))
+    try:
+        started = time.monotonic()
+        with pytest.raises(ipc.AuthenticationError):
+            await asyncio.wait_for(
+                asyncio.to_thread(ipc.connect_sync, endpoint_path, timeout=1), 5)
+        assert time.monotonic() - started < 1.5
+    finally:
+        for writer in accepted:
+            writer.transport.abort()
+        await _stop(listener)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_close_withdraws_its_own_record_when_the_file_id_differs(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    server._identity = (-1, -1)
+    server.close()
+    await server.wait_closed()
+    assert not endpoint_path.exists()
+
+    server = await ipc.start_server(endpoint_path, _echo)
+    published = ipc.read_endpoint(endpoint_path)
+    endpoint_path.unlink()
+    other = dataclasses.replace(published, token=os.urandom(32))
+    ipc.write_endpoint(endpoint_path, other)
+    server._identity = (-1, -1)
+    server.close()
+    await server.wait_closed()
+    assert ipc.read_endpoint(endpoint_path) == other
