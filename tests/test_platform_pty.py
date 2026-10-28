@@ -404,6 +404,7 @@ def test_kill_group_without_a_job_reports_a_child_that_just_exited_gone(monkeypa
     terminal.close()
 
 
+@pytest.mark.windows_only(reason="the exit status outliving a released pseudo console is ConPTY's")
 @pytest.mark.asyncio
 async def test_poll_and_wait_after_close_report_the_real_exit_status(tmp_path):
     output = _Collector()
@@ -499,6 +500,67 @@ async def test_concurrent_writes_keep_their_order():
         assert console.written == ["a", "b", "c"]
     finally:
         terminal.close()
+
+
+@pytest.mark.windows_only(reason="ConPTY writes run on worker threads")
+@pytest.mark.asyncio
+async def test_a_cancelled_write_still_precedes_the_next_one():
+    console = _FakeConPty()
+    started = threading.Event()
+    release = threading.Event()
+
+    def held_write(text: str) -> int:
+        if text == "a":
+            started.set()
+            release.wait(5)
+        console.written.append(text)
+        return 0
+
+    console.write = held_write
+    terminal = pty._WindowsPty(console)
+    try:
+        first = asyncio.create_task(terminal.write(b"a"))
+        assert await asyncio.to_thread(started.wait, 5)
+        first.cancel()  # its worker thread keeps writing "a"
+        second = asyncio.create_task(terminal.write(b"b"))
+        await asyncio.sleep(0.2)
+        assert console.written == []  # "b" waits behind the unfinished "a"
+        release.set()
+        await asyncio.wait_for(second, 5)
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert console.written == ["a", "b"]
+    finally:
+        release.set()
+        terminal.close()
+
+
+_NTSTATUS_EXIT = "import os; os._exit(-1073741510)"  # STATUS_CONTROL_C_EXIT
+
+
+@pytest.mark.windows_only(reason="Windows exit codes are DWORDs")
+@pytest.mark.asyncio
+async def test_an_ntstatus_exit_code_is_reported_unsigned_either_way(tmp_path):
+    # pywinpty answers while it holds the console...
+    terminal = pty.spawn([sys.executable, "-c", _NTSTATUS_EXIT], cwd=str(tmp_path),
+                         env=dict(os.environ))
+    terminal.start(lambda chunk: None)
+    assert await asyncio.wait_for(terminal.wait(), 10) == 0xC000013A
+    # ...and the process handle once the console is gone, in the same form.
+    interpreter = getattr(sys, "_base_executable", sys.executable)
+    child = subprocess.Popen([interpreter, "-c", "import sys; sys.stdin.read(); " + _NTSTATUS_EXIT],
+                             stdin=subprocess.PIPE)
+    try:
+        released = pty._WindowsPty(_FakeConPty(child.pid))
+        released.close()
+        child.stdin.close()
+        assert await asyncio.wait_for(released.wait(), 10) == 0xC000013A
+        assert child.wait(10) == 0xC000013A  # Popen's form
+    finally:
+        child.kill()
+        child.wait()
+    assert await _conpty_threads_gone(terminal.pid)
+    assert await _conpty_threads_gone(released.pid)
 
 
 class _RecordingJob:

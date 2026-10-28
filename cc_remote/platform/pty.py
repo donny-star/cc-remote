@@ -4,6 +4,15 @@ The broker hosts official Claude Code TUIs in pseudo-terminals: POSIX uses
 ``openpty`` with a new session and controlling terminal; Windows uses ConPTY
 through pywinpty. ``claude-remote`` attaches the user's own terminal in raw
 mode: termios on POSIX, console modes with VT input/output on Windows.
+
+Windows process trees: each ConPTY child joins its own Job so ``kill_group``
+ends the whole tree. pywinpty starts the child itself and cannot start it
+suspended, so a descendant spawned before the Job assignment (microseconds)
+escapes the Job; releasing the pseudo console still ends every process
+attached to it. After ``wait()`` (which calls ``close()``) the Job is released
+too, so ``kill_group`` no longer reaches descendants that detached from the
+console (``CREATE_NO_WINDOW`` / ``DETACHED_PROCESS``). Both are residuals of
+the kind a POSIX child that escapes with ``setsid()`` leaves.
 """
 from __future__ import annotations
 
@@ -277,7 +286,12 @@ def _windows_job(pid: int) -> Any | None:
 
 
 def _process_handle(pid: int) -> Any | None:
-    """Our own handle on the child: its exit status outlives the pseudo console."""
+    """Our own handle on the child: its exit status outlives the pseudo console.
+
+    The ``_WindowsPty`` (and, after ``close()``, its ``_ClosedTerminal``) keeps
+    it for its whole lifetime; pywin32 closes it when the object is garbage
+    collected. Until then it also keeps the pid from being reused.
+    """
     import pywintypes
     import win32api
 
@@ -397,7 +411,9 @@ class _WindowsPty(PtyProcess):
             except Exception as exc:  # WinptyError
                 raise OSError(f"ConPTY poll failed: {exc}") from exc
             if not alive:
-                self._returncode = 1 if status is None else int(status)
+                # Exit codes are DWORDs; report them unsigned, as Popen does
+                # (0xC000013A, not -1073741510), whichever source answered.
+                self._returncode = 1 if status is None else int(status) & 0xFFFFFFFF
         return self._returncode
 
     async def wait(self) -> int:
@@ -445,8 +461,14 @@ class _WindowsPty(PtyProcess):
             text = self._decoder.decode(data)
             if not text:
                 return  # an incomplete UTF-8 sequence waits for its next bytes
+            # The worker thread cannot be stopped: a cancelled caller keeps the
+            # lock until it finished, so the next write cannot overtake it.
+            writing = asyncio.ensure_future(asyncio.to_thread(self._terminal.write, text))
             try:
-                await asyncio.to_thread(self._terminal.write, text)
+                await asyncio.shield(writing)
+            except asyncio.CancelledError:
+                await _outlast(writing)
+                raise
             except Exception as exc:  # WinptyError
                 raise OSError(f"ConPTY write failed: {exc}") from exc
 
@@ -511,6 +533,8 @@ class _ClosedTerminal:
 
     The child's own process handle still reports whether it runs and its real
     exit status; without one (it could not be opened) it counts as exited.
+    The handle is the ``_WindowsPty``'s and is closed when both are garbage
+    collected.
     """
 
     def __init__(self, process: Any | None = None):
@@ -547,6 +571,17 @@ class _ClosedTerminal:
 
     def set_size(self, cols: int, rows: int) -> None:
         raise OSError("pseudo console is closed")
+
+
+async def _outlast(future: asyncio.Future[Any]) -> None:
+    """Wait for ``future`` to finish, however often the waiter is cancelled."""
+    while not future.done():
+        try:
+            await asyncio.wait({future})
+        except asyncio.CancelledError:
+            pass
+    if not future.cancelled():
+        future.exception()  # retrieved: the caller reports its cancellation instead
 
 
 def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | None,
