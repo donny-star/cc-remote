@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
 import socket
-import stat
 import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -16,7 +17,6 @@ import pytest
 import pytest_asyncio
 
 import cc_remote.claude_broker.cli as broker_cli
-import cc_remote.claude_broker.server as broker_server_module
 import cc_remote.claude_broker.session as broker_session_module
 from cc_remote.claude_broker.cli import _claude_args, _parser
 from cc_remote.claude_broker.client import (
@@ -37,18 +37,17 @@ from cc_remote.claude_broker.server import (
     BrokerConfig,
     BrokerSecurityError,
     BrokerServer,
-    _peer_uid,
 )
 from cc_remote.claude_broker.session import (
     PTYSession, SessionError, _launch_controls, _model_from_command_stdout,
     _parse_context_markdown,
 )
-from cc_remote.platform import IS_WINDOWS, perms
+from cc_remote.platform import IS_WINDOWS, ipc, perms
 from cc_remote.protocol import (
     AnswerQuestion, AskUser, Model, Perm, SetEffort, SetModel, SetPerm,
 )
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
-from tests.ipc_helpers import share_with_everyone
+from tests.ipc_helpers import SHORT_TMP, share_with_everyone
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -153,7 +152,8 @@ def arg(name, default=None):
     return default
 
 sid = arg("--session-id") or arg("--resume")
-project = os.getcwd().replace(os.sep, "-")
+# Claude dashes separators and a Windows drive colon in the project key.
+project = os.getcwd().replace(os.sep, "-").replace(":", "-")
 directory = os.path.join(os.path.expanduser("~/.claude/projects"), project)
 os.makedirs(directory, exist_ok=True)
 transcript = os.path.join(directory, sid + ".jsonl")
@@ -289,7 +289,7 @@ while True:
 def short_socket_dir():
     # Darwin's sockaddr_un path is only 104 bytes; pytest's TMPDIR path is much
     # longer than a realistic XDG/home endpoint.
-    path = Path(tempfile.mkdtemp(prefix="ccrb-", dir="/tmp"))
+    path = Path(tempfile.mkdtemp(prefix="ccrb-", dir=SHORT_TMP))
     path.chmod(0o700)
     try:
         yield path
@@ -672,7 +672,7 @@ async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmat
     assert [event.model for event in transport.sent
             if isinstance(event, Model)] == ["claude-opus-4-1"]
     transcript = Path(os.path.expanduser(
-        f"~/.claude/projects/{str(project).replace(os.sep, '-')}/{sid}.jsonl"))
+        f"~/.claude/projects/{str(project).replace(os.sep, '-').replace(':', '-')}/{sid}.jsonl"))
     records = [json.loads(line) for line in transcript.read_text().splitlines()]
     permission_records = [
         record.get("permissionMode") for record in records
@@ -767,8 +767,7 @@ async def test_status_list_limits_and_forbidden_claude_flags(
     await server.start()
     client = BrokerClient(str(socket_path))
     try:
-        mode = stat.S_IMODE(socket_path.stat().st_mode)
-        assert mode == 0o600
+        assert perms.is_private(socket_path)
         status = await client.status()
         assert status["status"]["max_sessions"] == 1
         assert status["status"]["session_count"] == 0
@@ -831,6 +830,34 @@ async def test_second_server_and_unsafe_socket_path_are_rejected(
 
 
 @pytest.mark.asyncio
+async def test_close_completes_while_a_client_is_still_connected(
+    fake_claude: Path, short_socket_dir: Path,
+):
+    socket_path = short_socket_dir / "broker.sock"
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(socket_path), claude_binary=str(fake_claude),
+    ))
+    await server.start()
+    reader, writer = await ipc.open_connection(socket_path)
+    try:
+        for _ in range(500):
+            if server._connections:
+                break
+            await asyncio.sleep(0.01)
+        assert server._connections  # the idle client waits for its first frame
+        # Since Python 3.12 Server.wait_closed() also waits for open
+        # connections, so close() must drop its clients before waiting.
+        await asyncio.wait_for(server.close(), 5)
+        assert await asyncio.wait_for(reader.read(), 5) == b""
+        assert not socket_path.exists()
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_frame_header_limit_is_checked_before_payload_allocation():
     reader = asyncio.StreamReader()
     reader.feed_data(HEADER.pack(int(FrameType.INPUT), MAX_FRAME_BYTES + 1))
@@ -841,15 +868,33 @@ async def test_frame_header_limit_is_checked_before_payload_allocation():
         decode_json(b"[]")
 
 
-def test_peer_uid_and_default_socket_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+@pytest.mark.posix_only(reason="SO_PEERCRED/getpeereid is the POSIX same-user proof")
+def test_peer_uid_reads_the_connected_user():
     left, right = socket.socketpair()
     try:
-        assert _peer_uid(left) == os.getuid()
-        assert _peer_uid(right) == os.getuid()
+        assert ipc._peer_uid(left) == os.getuid()
+        assert ipc._peer_uid(right) == os.getuid()
     finally:
         left.close()
         right.close()
 
+
+def test_client_import_leaves_the_pty_host_unloaded():
+    # The wrapper imports the client; the PTY host (pywinpty) is broker-only.
+    probe = (
+        "import sys, cc_remote.claude_broker.client; "
+        "print([m for m in ('cc_remote.claude_broker.server', "
+        "'cc_remote.claude_broker.session', 'cc_remote.platform.pty', 'winpty') "
+        "if m in sys.modules])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    assert result.stdout.strip() == "[]"
+
+
+def test_default_socket_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv(SOCKET_ENV, raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     assert default_socket_path() == str(tmp_path / "cc-remote" / "claude-broker.sock")
@@ -971,6 +1016,7 @@ async def test_cli_new_freezes_the_invoking_process_cwd(
     assert json.loads(capsys.readouterr().out) == {"ok": True}
 
 
+@pytest.mark.requires_symlink(reason="the test resolves a symlinked cwd alias")
 @pytest.mark.asyncio
 async def test_cli_resume_normalizes_an_explicit_cwd_before_broker_request(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
@@ -1104,14 +1150,17 @@ async def test_cli_resume_reattaches_an_exact_running_broker_session(
     ]
 
 
+@pytest.mark.posix_only(reason="peer uid is the POSIX proof; Windows HMAC rejection is covered in test_platform_ipc")
 @pytest.mark.asyncio
 async def test_server_rejects_a_peer_uid_mismatch(
     broker, monkeypatch: pytest.MonkeyPatch,
 ):
     _server, client = broker
-    # The client completed its independent peer check with the real helper;
-    # patching only the server module then proves the accept side fails closed.
-    monkeypatch.setattr(broker_server_module, "_peer_uid", lambda _sock: os.getuid() + 1)
+    real = ipc._peer_uid
+    # Accepted sockets are bound to the endpoint path; the client side is not,
+    # so the client's own check still passes and only the accept side fails.
+    monkeypatch.setattr(
+        ipc, "_peer_uid", lambda sock: real(sock) + (1 if sock.getsockname() else 0))
     with pytest.raises(BrokerClientError) as rejected:
         await client.status()
     assert rejected.value.code == "broker_disconnected"
