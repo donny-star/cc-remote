@@ -83,6 +83,7 @@ class BrokerServer:
         )
         self._server: ipc.IpcServer | None = None
         self._connections: set[asyncio.StreamWriter] = set()
+        self._closing = False
 
     @property
     def socket_path(self) -> str:
@@ -128,6 +129,15 @@ class BrokerServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ) -> None:
+        if self._closing:
+            # The endpoint admitted this peer after close() took its snapshot
+            # of the clients; it must never reach a closing manager.
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, BrokenPipeError):
+                pass
+            return
         if len(self._connections) >= MAX_CLIENTS:
             await self._send_error(writer, "client_limit", "too many broker clients")
             writer.close()
@@ -348,25 +358,35 @@ class BrokerServer:
             session.unsubscribe(subscription)
 
     async def close(self) -> None:
+        self._closing = True
         server = self._server
-        if server is not None:
-            server.close()  # withdraws the endpoint, then stops listening
-            self._server = None
-        for writer in tuple(self._connections):
-            writer.close()
-        # Since Python 3.12 Server.wait_closed() also waits for every open
-        # connection, so clients are dropped first. A peer still proving
-        # itself is closed by the endpoint's own handshake deadline; nothing
-        # may hold the shutdown past this bound.
-        closing = [writer.wait_closed() for writer in tuple(self._connections)]
-        if server is not None:
-            closing.append(server.wait_closed())
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*closing, return_exceptions=True),
-                CLOSE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            pass
-        self._connections.clear()
-        await self.manager.close()
+            if server is not None:
+                # Withdraws the endpoint, then stops listening. A failed
+                # withdrawal is raised only after the clients and sessions are
+                # closed, and self._server stays set so a later close() retries.
+                server.close()
+                self._server = None
+        finally:
+            # Since Python 3.12 Server.wait_closed() also waits for every open
+            # connection, so clients are dropped first. That cuts an in-flight
+            # one-shot reply, as before 3.12; callers treat broker_disconnected
+            # as recoverable. A peer still proving itself is closed by the
+            # endpoint's own handshake deadline, or by _handle_client once it
+            # is admitted; nothing may hold the shutdown past this bound.
+            for writer in tuple(self._connections):
+                writer.close()
+            closing = [writer.wait_closed() for writer in tuple(self._connections)]
+            if server is not None:
+                closing.append(server.wait_closed())
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*closing, return_exceptions=True),
+                    CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            for writer in tuple(self._connections):
+                writer.close()  # whatever slipped in during the wait
+            self._connections.clear()
+            await self.manager.close()

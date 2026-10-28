@@ -126,6 +126,9 @@ class BrokerClient:
                 "broker_unavailable", f"broker is not running at {target}",
             ) from exc
         except (ipc.UnsafeEndpointError, ipc.AuthenticationError) as exc:
+            # On Windows a broker that dies mid-handshake (EOF, reset or the
+            # handshake timeout) cannot be told from a wrong peer, so it also
+            # lands here: the spec fails closed rather than report unavailable.
             raise BrokerClientError("unsafe_socket", str(exc)) from exc
         except OSError as exc:
             raise BrokerClientError("broker_unavailable", f"cannot connect to broker: {exc}") from exc

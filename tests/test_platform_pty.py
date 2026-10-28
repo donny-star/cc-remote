@@ -568,6 +568,38 @@ async def test_close_releases_a_cancelled_write_stuck_on_the_console():
         terminal.close()
 
 
+@pytest.mark.windows_only(reason="ConPTY writes run on worker threads")
+@pytest.mark.asyncio
+async def test_a_write_after_close_fails_while_an_abandoned_write_is_still_stuck():
+    console = _FakeConPty()
+    started = threading.Event()
+    release = threading.Event()
+
+    def stuck_write(text: str) -> int:
+        if text == "a":
+            started.set()
+            release.wait(30)
+        console.written.append(text)
+        return 0
+
+    console.write = stuck_write
+    terminal = pty._WindowsPty(console)
+    try:
+        writing = asyncio.create_task(terminal.write(b"a"))
+        assert await asyncio.to_thread(started.wait, 5)
+        writing.cancel()
+        terminal.close()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(writing, 2)
+        # "a" is still blocked on the real console; nothing may reach it now.
+        with pytest.raises(OSError):
+            await asyncio.wait_for(terminal.write(b"b"), 2)
+        assert console.written == []
+    finally:
+        release.set()
+        terminal.close()
+
+
 _STUCK_WRITE_SHUTDOWN = r"""
 import asyncio, os, sys, threading
 sys.path.insert(0, sys.argv[1])

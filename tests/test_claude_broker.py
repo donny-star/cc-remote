@@ -32,6 +32,7 @@ from cc_remote.claude_broker.protocol import (
     decode_json,
     encode_json,
     read_frame,
+    write_json,
 )
 from cc_remote.claude_broker.server import (
     BrokerConfig,
@@ -855,6 +856,144 @@ async def test_close_completes_while_a_client_is_still_connected(
         with contextlib.suppress(OSError):
             await writer.wait_closed()
         await server.close()
+
+
+async def _read_to_eof(reader: asyncio.StreamReader) -> bytes:
+    try:
+        return await asyncio.wait_for(reader.read(), 5)
+    except ConnectionError:
+        return b""  # a reset is the Windows form of the broker hanging up
+
+
+@pytest.mark.asyncio
+async def test_a_peer_admitted_while_closing_is_dropped_unserved(
+    fake_claude: Path, short_socket_dir: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    # The peer finishes proving itself only after close() has begun: the
+    # endpoint's guard hands it over late, past close()'s client snapshot.
+    admitted = asyncio.Event()
+    proven = asyncio.Event()
+    original = BrokerServer._handle_client
+
+    async def late_handshake(self, reader, writer):
+        admitted.set()
+        await proven.wait()
+        await original(self, reader, writer)
+
+    monkeypatch.setattr(BrokerServer, "_handle_client", late_handshake)
+    socket_path = short_socket_dir / "broker.sock"
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(socket_path), claude_binary=str(fake_claude),
+    ))
+    served: list[object] = []
+    serving: list[object] = []
+    original_dispatch = server._dispatch
+
+    async def dispatch(reader, writer, request):
+        served.append(request.get("op"))
+        serving.append(request)
+        try:
+            await original_dispatch(reader, writer, request)
+        finally:
+            serving.remove(request)
+
+    server._dispatch = dispatch
+    serving_at_manager_close: list[int] = []
+    original_manager_close = server.manager.close
+
+    async def manager_close():
+        serving_at_manager_close.append(len(serving))
+        await original_manager_close()
+
+    server.manager.close = manager_close
+    await server.start()
+    reader, writer = await ipc.open_connection(socket_path)
+    closing = None
+    try:
+        await asyncio.wait_for(admitted.wait(), 5)
+        closing = asyncio.create_task(server.close())
+        await asyncio.sleep(0)  # close() has begun
+        proven.set()
+        with contextlib.suppress(ConnectionError):
+            await write_json(writer, FrameType.COMMAND, {"op": "status"})
+        assert await _read_to_eof(reader) == b""
+        await asyncio.wait_for(closing, 5)
+        assert served == []
+        assert serving_at_manager_close == [0]
+        assert not server._connections
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        if closing is not None and not closing.done():
+            await asyncio.gather(closing, return_exceptions=True)
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_endpoint_withdrawal_still_closes_clients_and_sessions(
+    fake_claude: Path, short_socket_dir: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    socket_path = short_socket_dir / "broker.sock"
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(socket_path), claude_binary=str(fake_claude),
+    ))
+    manager_closes: list[int] = []
+    original_manager_close = server.manager.close
+
+    async def manager_close():
+        manager_closes.append(len(server._connections))
+        await original_manager_close()
+
+    server.manager.close = manager_close
+    await server.start()
+    real_withdraw = ipc._withdraw
+    withdrawals: list[Path] = []
+
+    def withdraw(target, *args, **kwargs):
+        withdrawals.append(target)
+        if len(withdrawals) == 1:
+            raise PermissionError(13, "sharing violation")
+        return real_withdraw(target, *args, **kwargs)
+
+    monkeypatch.setattr(ipc, "_withdraw", withdraw)
+    reader, writer = await ipc.open_connection(socket_path)
+    try:
+        for _ in range(500):
+            if server._connections:
+                break
+            await asyncio.sleep(0.01)
+        assert server._connections
+        with pytest.raises(PermissionError, match="sharing violation"):
+            await asyncio.wait_for(server.close(), 5)
+        assert await _read_to_eof(reader) == b""
+        assert manager_closes == [0]
+        assert socket_path.exists()  # the record is still published...
+        await asyncio.wait_for(server.close(), 5)  # ...so the retry withdraws it
+        assert len(withdrawals) == 2
+        assert not socket_path.exists()
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        monkeypatch.setattr(ipc, "_withdraw", real_withdraw)
+        with contextlib.suppress(OSError):
+            await server.close()
+
+
+@pytest.mark.asyncio
+async def test_a_shared_socket_directory_is_refused(
+    fake_claude: Path, short_socket_dir: Path,
+):
+    shared = short_socket_dir / "shared"
+    shared.mkdir()
+    share_with_everyone(shared)
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(shared / "broker.sock"), claude_binary=str(fake_claude),
+    ))
+    with pytest.raises(BrokerSecurityError, match="broker socket directory"):
+        await server.start()
+    assert not (shared / "broker.sock").exists()
 
 
 @pytest.mark.asyncio
