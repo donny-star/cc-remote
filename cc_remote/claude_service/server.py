@@ -23,10 +23,11 @@ from cc_remote.claude_permissions import native_permission_mode
 from cc_remote.claude_steering import (
     PendingSteers, background_end_ids, is_human_result, is_managed_input, steer_message,
 )
+from cc_remote.platform import perms
 
 from .wire import (
     ControllerLeaseConflict, decode_sdk, encode_sdk, private_directory,
-    read_frame, same_user, write_frame,
+    read_frame, write_frame,
 )
 
 MAX_SESSIONS = 64
@@ -43,7 +44,7 @@ async def _prompt_messages(messages: list[dict]):
 class Journal:
     def __init__(self, path: Path):
         self.db = sqlite3.connect(path)
-        os.chmod(path, 0o600)
+        perms.make_private(path, directory=False)
         self.db.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, ts REAL NOT NULL, payload TEXT NOT NULL)")
         self.seq = 0
         self.size = 0
@@ -576,9 +577,6 @@ class Service:
             return {**session.description(), "attached": True}
 
     async def connection(self, reader, writer) -> None:
-        if not same_user(writer):
-            writer.close()
-            return
         owner = object()
         send_lock = asyncio.Lock()
         tasks: set[asyncio.Task] = set()
