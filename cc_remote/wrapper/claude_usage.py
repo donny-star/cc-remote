@@ -10,12 +10,12 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import signal
 import stat
 import time
 
 from cc_remote.claude_profiles import ClaudeProfile
 from cc_remote.platform import perms
+from cc_remote.platform import executables, procs
 
 
 MAX_BYTES = 64 * 1024
@@ -101,10 +101,11 @@ class ClaudeUsageReader:
         ) if key in os.environ}
         process = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *command, stdin=asyncio.subprocess.PIPE,
+            process = await procs.create_subprocess_exec_group(
+                *executables.command_for(command[0]), *command[1:],
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                cwd=Path.home(), env=env, start_new_session=True,
+                cwd=Path.home(), env=env,
             )
             async def collect():
                 process.stdin.write(json.dumps({
@@ -132,7 +133,7 @@ class ClaudeUsageReader:
         finally:
             if process is not None and process.returncode is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    procs.killpg(process.pid, procs.SIGKILL)
                 except ProcessLookupError:
                     pass
                 await process.wait()

@@ -33,6 +33,7 @@ from cc_remote.wrapper.claude_transport import (
 from cc_remote.wrapper.codex_handle import _codex_env
 from cc_remote.wrapper.sdk import CLAUDE_WORK_TOOLS, SdkHandle
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
+from tests.platform_paths import native_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,7 +156,7 @@ async def test_claude_profiles_use_the_daily_cli_account_metadata(
     parent = dict(os.environ)
     profile = native if selected == "native" else other
     handle = SdkHandle(
-        WrapperConfig(claude_bin="/fake/claude"),
+        WrapperConfig(claude_bin=native_path("/fake/claude")),
         claude_config_dir=str(profile),
         isolate_account_env=True,
     )
@@ -250,7 +251,7 @@ async def test_account_isolated_transport_scrubs_only_its_child_environment(
         fake_open_process,
     )
     options = ClaudeAgentOptions(
-        cli_path="/fake/claude",
+        cli_path=native_path("/fake/claude"),
         env={
             "CLAUDE_CONFIG_DIR": "/profiles/company",
             "WRAPPER_TOKEN": "",

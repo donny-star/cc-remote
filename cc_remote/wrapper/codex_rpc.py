@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from cc_remote import __version__
 from cc_remote.wrapper.history_metrics import history_timed
+from cc_remote.platform import executables
 from cc_remote.wrapper.codex_runtime import (
     codex_env as _codex_env,
     resolve_codex_bin as _resolve_codex_bin,
@@ -110,9 +111,12 @@ async def codex_rpc(
         or isinstance(nofile_soft_limit, bool)
         or nofile_soft_limit < 1
         or nofile_soft_limit > _NOFILE_SOFT_MAX
-        or os.name != "posix"
     ):
         raise ValueError("invalid POSIX Codex RPC nofile limit")
+    if os.name != "posix":
+        # Windows has no RLIMIT_NOFILE and must not run Codex through
+        # rlimit_exec; the isolated child simply starts unwrapped.
+        nofile_soft_limit = None
 
     scope = _history_scope.get()
     # ContextVars propagate to child tasks. A speculative/background task must
@@ -168,7 +172,7 @@ async def codex_history_rpc_scope():
 async def _rpc_connection(cwd, codex_home, nofile_soft_limit=None):
     bin_path = await asyncio.to_thread(_resolve_codex_bin)
     workdir = os.path.realpath(os.path.expanduser(cwd or "~"))
-    app_server_argv = (bin_path, "app-server", "--stdio")
+    app_server_argv = (*executables.command_for(bin_path), "app-server", "--stdio")
     if nofile_soft_limit is not None:
         app_server_argv = (
             sys.executable,
@@ -297,7 +301,7 @@ async def codex_rpc_batch(
     workdir = os.path.realpath(os.path.expanduser(cwd or "~"))
     proc = await asyncio.wait_for(
         asyncio.create_subprocess_exec(
-            bin_path,
+            *executables.command_for(bin_path),
             "app-server",
             "--stdio",
             stdin=asyncio.subprocess.PIPE,

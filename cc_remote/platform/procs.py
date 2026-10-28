@@ -21,6 +21,10 @@ from cc_remote.platform import IS_WINDOWS
 
 SIGTERM = int(signal.SIGTERM)
 SIGKILL = int(getattr(signal, "SIGKILL", 9))
+# POSIX groups receive a catchable SIGTERM; on Windows every killpg is an
+# immediate TerminateJobObject, so callers that need a graceful exit must use
+# the engine's own protocol (close stdin, shutdown RPC) before killpg.
+SIGTERM_IS_GRACEFUL = not IS_WINDOWS
 
 if IS_WINDOWS:
     import ctypes
@@ -194,4 +198,4 @@ else:
     def killpg(pid: int, sig: int) -> None:
         os.killpg(pid, sig)
 
-__all__ = ["SIGKILL", "SIGTERM", "create_subprocess_exec_group", "killpg", "popen_group"]
+__all__ = ["SIGKILL", "SIGTERM", "SIGTERM_IS_GRACEFUL", "create_subprocess_exec_group", "killpg", "popen_group"]

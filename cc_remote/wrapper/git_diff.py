@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import stat
 from collections.abc import Awaitable, Callable
 
 from cc_remote.wrapper.preview_capabilities import PreviewCapability
+from cc_remote.platform import procs
 
 CommandRunner = Callable[[tuple[str, ...], int], Awaitable[str]]
 _TRUNCATED_MARKER = "[diff truncated at transport safety limit]"
@@ -295,11 +295,10 @@ async def bounded_process_output(
     timeout: float = 10.0,
 ) -> str:
     """Capture stdout to a hard byte limit and always reap the process group."""
-    proc = await asyncio.create_subprocess_exec(
+    proc = await procs.create_subprocess_exec_group(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=True,
     )
     assert proc.stdout is not None
     chunks: list[bytes] = []
@@ -331,9 +330,9 @@ async def bounded_process_output(
 
     timed_out = False
 
-    def stop_group(sig: signal.Signals) -> None:
+    def stop_group(sig: int) -> None:
         try:
-            os.killpg(proc.pid, sig)
+            procs.killpg(proc.pid, sig)
         except ProcessLookupError:
             pass
 
@@ -344,18 +343,18 @@ async def bounded_process_output(
         except asyncio.TimeoutError:
             timed_out = True
         if timed_out:
-            stop_group(signal.SIGKILL)
+            stop_group(procs.SIGKILL)
         elif truncated:
-            stop_group(signal.SIGTERM)
+            stop_group(procs.SIGTERM)
         try:
             await asyncio.wait_for(discard_stdout_and_wait(), timeout=2.0)
         except asyncio.TimeoutError:
-            stop_group(signal.SIGKILL)
+            stop_group(procs.SIGKILL)
             await discard_stdout_and_wait()
         reaped = True
     finally:
         if not reaped:
-            stop_group(signal.SIGKILL)
+            stop_group(procs.SIGKILL)
             await discard_stdout_and_wait()
     if timed_out:
         raise asyncio.TimeoutError("diff command exceeded its time limit")

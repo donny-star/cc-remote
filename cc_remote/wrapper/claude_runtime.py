@@ -15,6 +15,8 @@ import subprocess
 
 import claude_agent_sdk
 
+from cc_remote.platform import executables
+
 
 VERIFIED_SDK_VERSION = "0.2.157"
 MINIMUM_CLAUDE_CLI_VERSION = "2.1.263"
@@ -142,7 +144,7 @@ def probe_claude_cli_version(path: str) -> str:
     """Read a bounded semantic version from one resolved Claude executable."""
     try:
         result = subprocess.run(
-            [path, "--version"], capture_output=True, text=True,
+            [*executables.command_for(path), "--version"], capture_output=True, text=True,
             timeout=_CLI_VERSION_TIMEOUT, check=False,
         )
     except Exception as exc:

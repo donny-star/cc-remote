@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from cc_remote.claude_broker.paths import default_socket_path
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
-from cc_remote.platform import files as platform_files, perms
+from cc_remote.platform import executables, files as platform_files, perms
 
 try:
     from dotenv import load_dotenv
@@ -37,7 +37,7 @@ def _env(key: str, default: str = "") -> str:
 def _claude_bin() -> str:
     """Use the user's normal Claude Code install unless explicitly overridden."""
     configured = _env("CLAUDE_BIN", "").strip()
-    return configured or str(Path.home() / ".local/bin/claude")
+    return configured or executables.default_cli_path("claude")
 
 
 def _int(key: str, default: int) -> int:

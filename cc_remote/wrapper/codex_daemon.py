@@ -30,6 +30,7 @@ from typing import Any, Mapping, Optional
 from cc_remote.log import logger
 from cc_remote.platform import files as platform_files
 from cc_remote.platform import perms
+from cc_remote.platform import executables
 from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
@@ -118,7 +119,7 @@ def _run_command(
     home = env.get("HOME") or str(Path.home())
     if not os.path.isabs(home) or not os.path.isdir(home):
         return _CommandResult(127, b"", b"InvalidDaemonWorkingDirectory")
-    command_argv = argv
+    command_argv = (*executables.command_for(argv[0]), *argv[1:])
     lifecycle_command = os.name == "posix" and any(
         argv[index:index + 2] == ("app-server", "daemon")
         and argv[index + 2] in _HIGH_NOFILE_DAEMON_OPERATIONS
@@ -133,7 +134,7 @@ def _run_command(
             sys.executable,
             _RLIMIT_EXEC,
             str(_DAEMON_NOFILE_SOFT_LIMIT),
-            *argv,
+            *command_argv,
         )
     try:
         with barrier.launch() if mutates_daemon(argv) else nullcontext():

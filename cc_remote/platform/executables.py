@@ -34,7 +34,7 @@ def find(name: str, preferred: Iterable[Path] = ()) -> str | None:
 
 
 def command_for(path: str) -> list[str]:
-    if Path(path).suffix.lower() not in {".cmd", ".bat"}:
+    if not IS_WINDOWS or Path(path).suffix.lower() not in {".cmd", ".bat"}:
         return [path]
     shim = Path(path)
     base = shim.parent
@@ -50,6 +50,26 @@ def command_for(path: str) -> list[str]:
         return [node, str(base.joinpath(*match["target"].split("\\")))]
     log.warning("unrecognized command shim; running through cmd.exe", path=path)
     return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", path]
+
+
+def default_cli_path(name: str) -> str:
+    """The user's daily ``name`` CLI as an absolute path.
+
+    POSIX keeps the fixed ``~/.local/bin/<name>``. Windows prefers the native
+    installer's ``~/.local/bin/<name>.exe``, then a PATH install (an npm
+    ``.cmd`` shim is unwrapped when it launches one native executable), and
+    otherwise reports the native installer location.
+    """
+    if not IS_WINDOWS:
+        return str(Path.home() / ".local/bin" / name)
+    native = Path.home() / ".local" / "bin" / f"{name}.exe"
+    if native.is_file():
+        return str(native)
+    found = shutil.which(name)
+    if found:
+        command = command_for(found)
+        return command[0] if len(command) == 1 else found
+    return str(native)
 
 
 _WINDOWS_SEPARATORS = re.compile(rb"[\\/]")

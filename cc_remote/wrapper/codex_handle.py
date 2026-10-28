@@ -28,7 +28,6 @@ import json
 import os
 from pathlib import Path
 import re
-import signal
 import sys
 import time
 from collections import OrderedDict, deque
@@ -36,6 +35,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.platform import executables, procs
 from cc_remote.wrapper.token_usage import CodexUsageTracker
 from cc_remote.wrapper.btw_history import CodexBtwCompletions
 from cc_remote.protocol import (
@@ -2006,7 +2006,7 @@ class CodexHandle:
     async def _open_process(
         self, argv: list[str], codex_bin: str, *, daemon_proxy: bool,
     ) -> None:
-        process_argv = argv
+        process_argv = [*executables.command_for(argv[0]), *argv[1:]]
         if os.name == "posix" and not daemon_proxy:
             # A private stdio app-server owns archive recursion itself.  Raise
             # only that child so resident Work sessions and daemon-off Code
@@ -2015,9 +2015,9 @@ class CodexHandle:
                 sys.executable,
                 _RLIMIT_EXEC,
                 str(_APP_SERVER_NOFILE_SOFT_LIMIT),
-                *argv,
+                *process_argv,
             ]
-        proc = await asyncio.create_subprocess_exec(
+        proc = await procs.create_subprocess_exec_group(
             *process_argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -2026,13 +2026,12 @@ class CodexHandle:
             env=_profile_codex_env(codex_bin, self.codex_home),
             # JSONL and reassembled WebSocket messages share this hard ceiling.
             limit=_PROXY_MESSAGE_MAX,
-            start_new_session=(os.name == "posix"),
         )
         self.proc = proc
         self._using_daemon_proxy = daemon_proxy
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
-        self._process_group = proc.pid if os.name == "posix" else None
+        self._process_group = proc.pid
         self._clear_steer_user_identities()
         self._generation += 1
         generation = self._generation
@@ -4532,30 +4531,42 @@ class CodexHandle:
         if tasks or server_tasks:
             await asyncio.gather(*tasks, *server_tasks, return_exceptions=True)
         if proc is not None:
-            def stop(sig: signal.Signals, *, force: bool = False) -> None:
+            signal_names = {procs.SIGTERM: "SIGTERM", procs.SIGKILL: "SIGKILL"}
+
+            def stop(sig: int, *, force: bool = False) -> None:
                 try:
                     if process_group is not None:
-                        os.killpg(process_group, sig)
+                        procs.killpg(process_group, sig)
                     elif proc.returncode is None:
                         (proc.kill() if force else proc.terminate())
                 except ProcessLookupError:
                     pass
                 except Exception as exc:
                     log.warning("codex process stop failed",
-                                signal=sig.name, error=str(exc))
+                                signal=signal_names.get(sig, str(sig)), error=str(exc))
 
-            if proc.returncode is None:
-                stop(signal.SIGTERM)
+            if proc.returncode is None and not procs.SIGTERM_IS_GRACEFUL:
+                # Windows: SIGTERM would hard-kill the Job immediately. Let the
+                # app-server/proxy exit on stdin EOF first, as it does on POSIX
+                # after SIGTERM.
+                if proc.stdin is not None:
+                    proc.stdin.close()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=3.0)
                 except asyncio.TimeoutError:
-                    stop(getattr(signal, "SIGKILL", signal.SIGTERM), force=True)
+                    pass
+            if proc.returncode is None:
+                stop(procs.SIGTERM)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    stop(procs.SIGKILL, force=True)
                     await proc.wait()
             # For stdio this also cleans tool descendants.  For daemon mode the
             # process group contains only this connection's proxy; the shared
             # app-server was started independently by the official manager.
             if process_group is not None:
-                stop(signal.SIGKILL, force=True)
+                stop(procs.SIGKILL, force=True)
         self._using_daemon_proxy = False
         self._daemon_process_identity = None
         self._control_only_connection = False

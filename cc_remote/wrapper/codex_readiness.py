@@ -12,7 +12,6 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
-import signal
 import tempfile
 import time
 from typing import Any
@@ -25,6 +24,7 @@ from websockets.uri import parse_uri
 
 from cc_remote import __version__
 from cc_remote.platform.identity import current_euid
+from cc_remote.platform import executables, procs
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, socket_identity
 from cc_remote.wrapper.codex_service import DaemonIsolationError
 from cc_remote.wrapper.process_scan import process_identity
@@ -73,12 +73,11 @@ async def probe_config(socket_path: str) -> None:
 
 async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> None:
     """Initialize through the official raw WebSocket proxy, without a thread."""
-    process = await asyncio.create_subprocess_exec(
-        binary, "app-server", "proxy", "--sock", socket_path,
+    process = await procs.create_subprocess_exec_group(
+        *executables.command_for(binary), "app-server", "proxy", "--sock", socket_path,
         env=env, cwd=env.get("HOME") or str(Path.home()),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL, limit=256 * 1024,
-        start_new_session=True,
     )
     protocol = ClientProtocol(parse_uri("ws://localhost/"), max_size=256 * 1024)
 
@@ -142,7 +141,7 @@ async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> Non
         except TimeoutError:
             # Only this short-lived, thread-free probe is terminated.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                procs.killpg(process.pid, procs.SIGKILL)
             except ProcessLookupError:
                 pass
             await process.wait()

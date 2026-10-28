@@ -115,6 +115,7 @@ from cc_remote.codex_daemon_restart import (
 )
 from cc_remote.audio_preview import AUDIO_PREVIEW_MEDIA_TYPES, validate_audio_preview
 from cc_remote.log import logger
+from cc_remote.platform import procs
 from cc_remote.timed_tasks import TimedTaskStore
 from cc_remote.workspaces import (
     WORK_UPLOADS_MARKER,
@@ -26746,13 +26747,12 @@ class WrapperMachine:
 
     @classmethod
     def _run_office_conversion(cls, command: list[str]) -> None:
-        process = subprocess.Popen(
+        process = procs.popen_group(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
-            start_new_session=True,
             env={
                 "PATH": os.defpath,
                 "LANG": "C.UTF-8",
@@ -26763,7 +26763,7 @@ class WrapperMachine:
             return_code = process.wait(timeout=cls.OFFICE_PREVIEW_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as exc:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                procs.killpg(process.pid, procs.SIGKILL)
             finally:
                 process.wait()
             raise ValueError("Office 预览转换超时") from exc

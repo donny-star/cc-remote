@@ -26,6 +26,7 @@ from typing import Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.platform import executables
 from cc_remote.wrapper.codex_runtime import (
     codex_env as _codex_env,
     resolve_codex_bin as _resolve_codex_bin,
@@ -118,7 +119,7 @@ async def _rpc_model_list(codex_home: str | None = None) -> list[dict]:
     No thread, no turn, no tokens."""
     binp = await asyncio.to_thread(_resolve_codex_bin)
     proc = await asyncio.create_subprocess_exec(
-        binp, "app-server", "--stdio",
+        *executables.command_for(binp), "app-server", "--stdio",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

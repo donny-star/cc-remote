@@ -23,6 +23,7 @@ from typing import Literal, Optional
 from uuid import uuid4
 
 from cc_remote.platform import locks
+from cc_remote.platform import executables, procs
 
 
 _SCHEMA_VERSION = 2
@@ -272,7 +273,7 @@ def _run_official_restart(
         env["CODEX_HOME"] = selected_home
         kwargs["env"] = env
     return subprocess.run(
-        [codex_bin, "app-server", "daemon", "restart"],
+        [*executables.command_for(codex_bin), "app-server", "daemon", "restart"],
         text=True,
         capture_output=True,
         timeout=(
@@ -459,12 +460,11 @@ def schedule_managed_daemon_restart(
     )
     try:
         os.fchmod(log_fd, 0o600)
-        subprocess.Popen(
-            argv,
+        procs.popen_group(
+            [*executables.command_for(argv[0]), *argv[1:]],
             stdin=subprocess.DEVNULL,
             stdout=log_fd,
             stderr=log_fd,
-            start_new_session=True,
             close_fds=True,
         )
     except BaseException:

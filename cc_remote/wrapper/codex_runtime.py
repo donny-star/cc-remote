@@ -18,6 +18,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from cc_remote.log import logger
+from cc_remote.platform import executables
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 log = logger("cc_remote.wrapper.codex_runtime")
@@ -63,7 +64,7 @@ def codex_version(path: str) -> tuple[int, ...]:
     """Return ``codex --version`` as a tuple, or ``(-1,)`` when unusable."""
     try:
         result = subprocess.run(
-            [path, "--version"],
+            [*executables.command_for(path), "--version"],
             capture_output=True,
             text=True,
             timeout=_CODEX_VERSION_TIMEOUT,
