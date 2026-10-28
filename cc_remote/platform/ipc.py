@@ -10,27 +10,41 @@ crosses the socket.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import dataclasses
 import errno
 import functools
+import hashlib
+import hmac
 import json
 import os
 import secrets
+import socket
 import stat
+import struct
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from cc_remote.log import logger
 from cc_remote.platform import IS_WINDOWS, files, perms
 from cc_remote.platform.identity import current_uid
 
+Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 StrPath = str | os.PathLike[str]
 
+HANDSHAKE_TIMEOUT = 2.0
 ENDPOINT_VERSION = 1
 MAX_ENDPOINT_BYTES = 4096
 TOKEN_BYTES = 32
+NONCE_BYTES = 32
+MAC_BYTES = 32
+_FAILURE_LOG_INTERVAL = 60.0
 _SHARING_VIOLATION = 32
+
+log = logger("cc_remote.platform.ipc")
 
 
 class UnsafeEndpointError(PermissionError):
@@ -227,3 +241,105 @@ def _publish(temporary: Path, target: Path, attempts: int = 10) -> None:
             if getattr(exc, "winerror", None) != _SHARING_VIOLATION or attempt == attempts - 1:
                 raise
             time.sleep(min(0.02 * (2 ** attempt), 0.5))
+
+
+# --- peer authentication ------------------------------------------------------
+
+def _mac(token: bytes, label: bytes, first: bytes, second: bytes) -> bytes:
+    return hmac.new(token, label + first + second, hashlib.sha256).digest()
+
+
+async def _client_handshake(reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter, token: bytes) -> None:
+    client_nonce = secrets.token_bytes(NONCE_BYTES)
+    writer.write(client_nonce)
+    await writer.drain()
+    reply = await reader.readexactly(NONCE_BYTES + MAC_BYTES)
+    server_nonce, server_mac = reply[:NONCE_BYTES], reply[NONCE_BYTES:]
+    # Verify the server before sending anything derived from the token.
+    if not hmac.compare_digest(server_mac, _mac(token, b"srv", client_nonce, server_nonce)):
+        raise AuthenticationError("endpoint did not prove the shared token")
+    writer.write(_mac(token, b"cli", server_nonce, client_nonce))
+    await writer.drain()
+
+
+async def _server_handshake(reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter, token: bytes) -> bool:
+    client_nonce = await reader.readexactly(NONCE_BYTES)
+    server_nonce = secrets.token_bytes(NONCE_BYTES)
+    writer.write(server_nonce + _mac(token, b"srv", client_nonce, server_nonce))
+    await writer.drain()
+    proof = await reader.readexactly(MAC_BYTES)
+    return hmac.compare_digest(proof, _mac(token, b"cli", server_nonce, client_nonce))
+
+
+def _peer_uid(sock: socket.socket) -> int:
+    """Return an AF_UNIX peer uid on Linux or macOS, failing closed elsewhere."""
+    if hasattr(socket, "SO_PEERCRED"):
+        try:
+            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            _pid, uid, _gid = struct.unpack("3i", credentials)
+            return int(uid)
+        except (AttributeError, OSError, struct.error) as exc:
+            raise AuthenticationError("cannot read Unix peer credentials") from exc
+
+    import ctypes
+
+    # macOS and the BSDs expose getpeereid(3), though Python does not wrap it.
+    libc = ctypes.CDLL(None, use_errno=True)
+    getpeereid = getattr(libc, "getpeereid", None)
+    if getpeereid is None:
+        raise AuthenticationError("Unix peer credentials are unsupported")
+    uid = ctypes.c_uint()
+    gid = ctypes.c_uint()
+    getpeereid.argtypes = (
+        ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint))
+    getpeereid.restype = ctypes.c_int
+    if getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+        raise AuthenticationError(f"getpeereid failed: errno {ctypes.get_errno()}")
+    return int(uid.value)
+
+
+def _posix_peer_allowed(writer: asyncio.StreamWriter) -> bool:
+    sock = writer.get_extra_info("socket")
+    try:
+        return sock is not None and _peer_uid(sock) == current_uid()
+    except AuthenticationError:
+        return False
+
+
+class _Guard:
+    """Authenticate each accepted connection before ``handler`` sees it."""
+
+    def __init__(self, handler: Handler, path: Path, token: bytes | None = None):
+        self._handler = handler
+        self._path = path
+        self._token = token
+        self.failures = 0
+        self._last_log = float("-inf")
+
+    async def __call__(self, reader: asyncio.StreamReader,
+                       writer: asyncio.StreamWriter) -> None:
+        if self._token is None:
+            allowed = _posix_peer_allowed(writer)
+        else:
+            try:
+                allowed = await asyncio.wait_for(
+                    _server_handshake(reader, writer, self._token), HANDSHAKE_TIMEOUT)
+            except (OSError, EOFError, asyncio.TimeoutError):
+                allowed = False
+        if not allowed:
+            self._reject()
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            return
+        await self._handler(reader, writer)
+
+    def _reject(self) -> None:
+        self.failures += 1
+        now = time.monotonic()
+        if now - self._last_log >= _FAILURE_LOG_INTERVAL:
+            self._last_log = now
+            log.warning("local endpoint rejected an unauthenticated peer",
+                        endpoint=str(self._path), failures=self.failures)

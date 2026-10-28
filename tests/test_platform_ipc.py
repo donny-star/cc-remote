@@ -1,12 +1,17 @@
 """cc_remote.platform.ipc: same-user local endpoints."""
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
+import socket
 import stat
 import subprocess
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -281,3 +286,249 @@ def test_read_endpoint_refuses_a_symlink(tmp_path):
     link.symlink_to(real)
     with pytest.raises(ipc.UnsafeEndpointError, match="link"):
         ipc.read_endpoint(link)
+
+
+OTHER_TOKEN = bytes(range(1, 33))
+
+
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition was not reached in time")
+        await asyncio.sleep(0.01)
+
+
+async def _echo(reader, writer) -> None:
+    try:
+        while data := await reader.read(1024):
+            writer.write(data.upper())
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+async def _loopback(server_side):
+    """One loopback TCP connection whose accepting side runs ``server_side``."""
+    result = asyncio.get_running_loop().create_future()
+
+    async def accept(reader, writer):
+        try:
+            result.set_result(await server_side(reader, writer))
+        except BaseException as exc:  # surfaced to the test through ``result``
+            result.set_exception(exc)
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", server.sockets[0].getsockname()[1])
+    return server, reader, writer, result
+
+
+async def _shutdown(server, writer) -> None:
+    writer.close()
+    server.close()
+    await server.wait_closed()
+
+
+def test_mac_binds_direction_and_nonce_order():
+    first, second = os.urandom(32), os.urandom(32)
+    expected = hmac.new(TOKEN, b"srv" + first + second, hashlib.sha256).digest()
+    assert ipc._mac(TOKEN, b"srv", first, second) == expected
+    assert ipc._mac(TOKEN, b"cli", first, second) != expected
+    assert ipc._mac(TOKEN, b"srv", second, first) != expected
+
+
+@pytest.mark.asyncio
+async def test_handshake_proves_the_shared_token_both_ways():
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        await ipc._client_handshake(reader, writer, TOKEN)
+        assert await asyncio.wait_for(result, 2) is True
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_a_server_with_another_token():
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc._client_handshake(reader, writer, OTHER_TOKEN)
+        writer.close()
+        with pytest.raises(asyncio.IncompleteReadError):
+            await asyncio.wait_for(result, 2)
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_client_reveals_only_a_fresh_nonce_to_an_impostor():
+    async def impostor(reader, writer):
+        seen = await reader.readexactly(ipc.NONCE_BYTES)
+        writer.write(os.urandom(ipc.NONCE_BYTES + ipc.MAC_BYTES))
+        await writer.drain()
+        return seen + await reader.read()
+
+    server, reader, writer, result = await _loopback(impostor)
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc._client_handshake(reader, writer, TOKEN)
+        writer.close()
+        seen = await asyncio.wait_for(result, 2)
+    finally:
+        await _shutdown(server, writer)
+    assert len(seen) == ipc.NONCE_BYTES
+    assert TOKEN not in seen
+
+
+@pytest.mark.asyncio
+async def test_server_rejects_its_own_proof_reflected_back():
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        writer.write(os.urandom(ipc.NONCE_BYTES))
+        await writer.drain()
+        reply = await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        writer.write(reply[ipc.NONCE_BYTES:])
+        await writer.drain()
+        assert await asyncio.wait_for(result, 2) is False
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_rejects_a_replayed_client_proof():
+    """Bytes captured from a successful handshake are useless in a new one."""
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        client_nonce = os.urandom(ipc.NONCE_BYTES)
+        writer.write(client_nonce)
+        await writer.drain()
+        reply = await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        proof = ipc._mac(TOKEN, b"cli", reply[:ipc.NONCE_BYTES], client_nonce)
+        writer.write(proof)
+        await writer.drain()
+        assert await asyncio.wait_for(result, 2) is True
+    finally:
+        await _shutdown(server, writer)
+
+    server, reader, writer, result = await _loopback(
+        lambda r, w: ipc._server_handshake(r, w, TOKEN))
+    try:
+        writer.write(client_nonce)
+        await writer.drain()
+        fresh = await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        assert fresh[:ipc.NONCE_BYTES] != reply[:ipc.NONCE_BYTES]
+        writer.write(proof)
+        await writer.drain()
+        assert await asyncio.wait_for(result, 2) is False
+    finally:
+        await _shutdown(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_a_replayed_server_reply():
+    """A recorded server reply only proves the token for the nonce it answered."""
+    old_client_nonce = os.urandom(ipc.NONCE_BYTES)
+    old_server_nonce = os.urandom(ipc.NONCE_BYTES)
+    recorded = old_server_nonce + ipc._mac(TOKEN, b"srv", old_client_nonce, old_server_nonce)
+
+    async def replayer(reader, writer):
+        await reader.readexactly(ipc.NONCE_BYTES)
+        writer.write(recorded)
+        await writer.drain()
+        return await reader.read()
+
+    server, reader, writer, result = await _loopback(replayer)
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc._client_handshake(reader, writer, TOKEN)
+        writer.close()
+        # The client sent nothing after its nonce: no proof for the replayer.
+        assert await asyncio.wait_for(result, 2) == b""
+    finally:
+        await _shutdown(server, writer)
+
+
+async def _guarded(handler):
+    guard = ipc._Guard(handler, Path("endpoint"), TOKEN)
+    server = await asyncio.start_server(guard, "127.0.0.1", 0)
+    return guard, server, server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_guard_hands_authenticated_streams_to_the_handler():
+    guard, server, port = await _guarded(_echo)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await ipc._client_handshake(reader, writer, TOKEN)
+        writer.write(b"after")
+        await writer.drain()
+        assert await reader.readexactly(5) == b"AFTER"
+    finally:
+        await _shutdown(server, writer)
+    assert guard.failures == 0
+
+
+@pytest.mark.asyncio
+async def test_guard_rejects_a_bad_proof_without_calling_the_handler():
+    calls = []
+
+    async def handler(reader, writer):
+        calls.append(1)
+
+    guard, server, port = await _guarded(handler)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(os.urandom(ipc.NONCE_BYTES))
+        await writer.drain()
+        await reader.readexactly(ipc.NONCE_BYTES + ipc.MAC_BYTES)
+        writer.write(os.urandom(ipc.MAC_BYTES))
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        await _wait_until(lambda: guard.failures == 1)
+    finally:
+        await _shutdown(server, writer)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_guard_drops_a_silent_peer_after_the_handshake_timeout(monkeypatch):
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    guard, server, port = await _guarded(_echo)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        await _wait_until(lambda: guard.failures == 1)
+    finally:
+        await _shutdown(server, writer)
+
+
+def test_guard_rate_limits_its_rejection_log(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(ipc.log, "warning", lambda message, **fields: warnings.append(fields))
+    guard = ipc._Guard(_echo, Path("endpoint"), TOKEN)
+    for _ in range(3):
+        guard._reject()
+    assert guard.failures == 3
+    assert warnings == [{"endpoint": "endpoint", "failures": 1}]
+    guard._last_log -= ipc._FAILURE_LOG_INTERVAL
+    guard._reject()
+    assert warnings[-1] == {"endpoint": "endpoint", "failures": 4}
+
+
+@pytest.mark.posix_only(reason="SO_PEERCRED/getpeereid is the POSIX same-user proof")
+def test_peer_uid_reads_the_connected_user():
+    left, right = socket.socketpair()
+    try:
+        assert ipc._peer_uid(left) == os.getuid()
+        assert ipc._peer_uid(right) == os.getuid()
+    finally:
+        left.close()
+        right.close()
