@@ -247,7 +247,7 @@ def test_rollback_journal_atomic_replace_failure_preserves_previous_state(
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            journal_module.os,
+            journal_module.platform_files,
             "replace",
             lambda *_args: (_ for _ in ()).throw(OSError("disk failure")),
         )
