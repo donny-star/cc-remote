@@ -304,6 +304,21 @@ def short_socket_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
+@pytest.fixture
+def short_home():
+    """A short directory for a fake Claude's HOME and cwd.
+
+    The fake transcript lives at HOME/.claude/projects/<dashed cwd>/<sid>.jsonl,
+    which repeats the cwd: under a long --basetemp it crosses Windows MAX_PATH.
+    Resolved, as the broker resolves a session cwd (no 8.3 short names).
+    """
+    path = Path(os.path.realpath(tempfile.mkdtemp(prefix="ccrh-", dir=SHORT_TMP)))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest_asyncio.fixture
 async def broker(tmp_path: Path, fake_claude: Path, short_socket_dir: Path):
     socket_path = short_socket_dir / "broker.sock"
@@ -325,13 +340,13 @@ async def broker(tmp_path: Path, fake_claude: Path, short_socket_dir: Path):
     ids=["without-auto", "with-auto", "manual-default-alias"],
 )
 async def control_broker(
-    tmp_path: Path,
+    short_home: Path,
     control_fake_claude: Path,
     short_socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ):
-    home = tmp_path / "home"
+    home = short_home / "h"
     home.mkdir()
     _set_home(monkeypatch, home)
     supports_auto, reports_manual = request.param
@@ -369,12 +384,12 @@ async def _output_until(attachment, needle: bytes, timeout: float = 10.0) -> byt
 
 @pytest.mark.asyncio
 async def test_context_query_retries_one_ignored_startup_command(
-    tmp_path: Path,
+    short_home: Path,
     control_fake_claude: Path,
     short_socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    home = tmp_path / "retry-home"
+    home = short_home / "h"
     home.mkdir()
     _set_home(monkeypatch, home)
     monkeypatch.setenv("FAKE_CLAUDE_DROP_FIRST_CONTEXT", "1")
@@ -390,7 +405,7 @@ async def test_context_query_retries_one_ignored_startup_command(
     await server.start()
     client = BrokerClient(str(socket_path))
     try:
-        project = tmp_path / "retry-project"
+        project = short_home / "p"
         project.mkdir()
         created = await client.new(cwd=str(project))
         sid = created["session"]["id"]
@@ -405,12 +420,12 @@ async def test_context_query_retries_one_ignored_startup_command(
 
 @pytest.mark.asyncio
 async def test_model_control_confirms_changed_native_prompt_after_fresh_output(
-    tmp_path: Path,
+    short_home: Path,
     control_fake_claude: Path,
     short_socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    home = tmp_path / "model-confirm-home"
+    home = short_home / "h"
     home.mkdir()
     _set_home(monkeypatch, home)
     monkeypatch.setenv("FAKE_CLAUDE_UNKNOWN_MODEL_PROMPT", "1")
@@ -431,7 +446,7 @@ async def test_model_control_confirms_changed_native_prompt_after_fresh_output(
     await server.start()
     client = BrokerClient(str(socket_path))
     try:
-        project = tmp_path / "model-confirm-project"
+        project = short_home / "p"
         project.mkdir()
         created = await client.new(cwd=str(project))
         sid = created["session"]["id"]
@@ -621,7 +636,8 @@ async def test_terminal_focus_input_waits_for_remote_control_without_detaching(
     try:
         # Claude enables xterm focus reporting. Switching from the terminal to
         # Remote sends ESC[O at exactly the same time as a Remote control.
-        # ConPTY consumes the focus report it requested itself; the trailing bytes prove the frame was serialized, not rejected.
+        # ConPTY consumes the focus report it requested itself; the trailing
+        # bytes prove the frame was serialized, not rejected.
         await terminal.write(b"\x1b[Ofocus")
         await asyncio.sleep(0.05)
         status = await client.status(sid)
@@ -630,7 +646,9 @@ async def test_terminal_focus_input_waits_for_remote_control_without_detaching(
         session._control_in_progress = False
         session._control_lock.release()
 
-    assert b"focus" in _echoed(await _output_until(terminal, b"focus>"))
+    echoed = _echoed(await _output_until(terminal, b"focus>"))
+    # A POSIX pty passes the focus report itself through to Claude.
+    assert (b"focus" if IS_WINDOWS else b"\x1b[Ofocus") in echoed
     status = await client.status(sid)
     assert status["session"]["running"] is True
     assert status["session"]["keyboard_attached"] is True
@@ -640,10 +658,10 @@ async def test_terminal_focus_input_waits_for_remote_control_without_detaching(
 
 @pytest.mark.asyncio
 async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmation(
-    control_broker, tmp_path: Path,
+    control_broker, short_home: Path,
 ):
     _server, client, (_supports_auto, _reports_manual) = control_broker
-    project = tmp_path / "control-project"
+    project = short_home / "p"
     project.mkdir()
     created = await client.new(cwd=str(project))
     metadata = created["session"]
@@ -723,10 +741,10 @@ async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmat
 
 @pytest.mark.asyncio
 async def test_native_terminal_permission_footer_updates_broker_state(
-    control_broker, tmp_path: Path,
+    control_broker, short_home: Path,
 ):
     _server, client, (supports_auto, _reports_manual) = control_broker
-    project = tmp_path / "terminal-permission-project"
+    project = short_home / "p"
     project.mkdir()
     created = await client.new(cwd=str(project))
     sid = created["session"]["id"]
