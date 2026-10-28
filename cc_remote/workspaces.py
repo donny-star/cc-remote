@@ -22,7 +22,8 @@ from typing import Iterable, Literal, cast
 from uuid import uuid4
 
 from cc_remote.claude_paths import claude_config_dir
-from cc_remote.platform.identity import current_euid
+from cc_remote.platform import perms
+from cc_remote.platform.dirs import DirHandle
 
 
 Engine = Literal["claude", "codex"]
@@ -2031,35 +2032,26 @@ class WorkRegistry:
 
     @staticmethod
     def _is_managed_upload_root(path: Path) -> bool:
-        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-            return False
-        flags = (
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        directory_fd = marker_fd = -1
+        directory = None
+        marker_fd = -1
         try:
-            directory_fd = os.open(path, flags)
-            directory = os.fstat(directory_fd)
-            marker_fd = os.open(
-                WORK_UPLOADS_MARKER,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=directory_fd,
-            )
+            directory = DirHandle.open_root(path)
+            directory_info = os.fstat(directory.fd)
+            marker_fd = directory.open_file(WORK_UPLOADS_MARKER, os.O_RDONLY)
             marker = os.fstat(marker_fd)
             with os.fdopen(marker_fd, "rb", closefd=False) as stream:
                 payload = stream.read(len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+            owned = perms.owned_info(marker_fd, marker, effective=True)
         except OSError:
             return False
         finally:
-            for descriptor in (marker_fd, directory_fd):
-                if descriptor >= 0:
-                    os.close(descriptor)
-        return (stat.S_ISDIR(directory.st_mode)
+            if marker_fd >= 0:
+                os.close(marker_fd)
+            if directory is not None:
+                directory.close()
+        return (stat.S_ISDIR(directory_info.st_mode)
                 and stat.S_ISREG(marker.st_mode)
-                and marker.st_uid == current_euid()
+                and owned
                 and marker.st_nlink == 1
                 and payload == WORK_UPLOADS_MARKER_PAYLOAD)
 

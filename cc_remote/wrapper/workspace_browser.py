@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import stat
 
+from cc_remote.platform import files as platform_files
+from cc_remote.platform.dirs import DirHandle
+
 MAX_DIRECTORY_ENTRIES = 20_000
 
 
@@ -20,25 +23,25 @@ def browse_workspace(
     if os.path.commonpath([root, candidate]) != root:
         raise ValueError("请选择当前会话目录内的文件或文件夹")
     parts = Path(os.path.relpath(candidate, root)).parts
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(root, flags)
+    directory = DirHandle.open_root(root)
     try:
         for index, part in enumerate(parts):
-            info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            info = directory.lstat(part)
             if stat.S_ISREG(info.st_mode) and index == len(parts) - 1:
                 return {"root": root, "path": candidate, "kind": "file"}
-            if not stat.S_ISDIR(info.st_mode):
+            if not stat.S_ISDIR(info.st_mode) or platform_files.is_reparse_point(
+                    directory.child_path(part)):
                 raise ValueError("不支持打开符号链接或特殊文件")
-            child = os.open(part, flags, dir_fd=fd)
-            os.close(fd)
-            fd = child
-        info = os.fstat(fd)
+            child = directory.open_dir(part)
+            directory.close()
+            directory = child
+        info = os.fstat(directory.fd)
         current_revision = f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}"
         if offset and revision != current_revision:
             raise ValueError("目录已变化，请刷新后重新查看")
         entries = []
         scanned = 0
-        with os.scandir(fd) as iterator:
+        with directory.scandir() as iterator:
             for entry in iterator:
                 scanned += 1
                 if scanned > MAX_DIRECTORY_ENTRIES:
@@ -46,6 +49,7 @@ def browse_workspace(
                 if not hidden and entry.name.startswith("."):
                     continue
                 kind = ("directory" if entry.is_dir(follow_symlinks=False)
+                        and not entry.is_junction()
                         else "file" if entry.is_file(follow_symlinks=False)
                         else "unsupported")
                 entries.append({"name": entry.name,
@@ -61,4 +65,4 @@ def browse_workspace(
             "next_offset": offset + limit if offset + limit < len(entries) else None,
         }
     finally:
-        os.close(fd)
+        directory.close()
