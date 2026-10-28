@@ -11,9 +11,8 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-import stat
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import ipc
 
 MAX_PROMPT = 32_000
 MAX_FRAME = 256 * 1024
@@ -156,14 +155,11 @@ def make_server(call):
 
 
 async def rpc(path: Path, request: dict) -> dict:
-    info = path.lstat()
-    parent = path.parent.lstat()
-    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid()
-            or info.st_mode & 0o077 or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != current_uid() or parent.st_mode & 0o077):
-        raise ValueError("Message socket must be private and owned by this user")
     async with asyncio.timeout(45):
-        reader, writer = await asyncio.open_unix_connection(str(path), limit=MAX_FRAME)
+        try:
+            reader, writer = await ipc.open_connection(path, limit=MAX_FRAME)
+        except (ipc.UnsafeEndpointError, ipc.AuthenticationError) as exc:
+            raise ValueError("Message socket must be private and owned by this user") from exc
         try:
             writer.write(json.dumps(request, ensure_ascii=False).encode() + b"\n")
             await writer.drain()

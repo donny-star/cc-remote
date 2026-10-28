@@ -18,7 +18,7 @@ import sys
 import time
 
 from cc_remote import task_rpc
-from cc_remote.platform import locks
+from cc_remote.platform import files as platform_files, locks, procs
 from cc_remote.task_store import (
     DELIVERY_TRACK_SECONDS, OUTPUT_BYTES, TERMINAL, TaskStore, public_task, request_thread,
 )
@@ -40,7 +40,7 @@ def lock_worker(store):
     # Initialize / validate the private state directory before creating a lock.
     with store.db():
         pass
-    fd = os.open(store.root / "worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = platform_files.open_nofollow(store.root / "worker.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
     except BlockingIOError:
@@ -55,16 +55,26 @@ def ensure_worker(store):
         return
     # Pass the already-held lock through exec, so concurrent starts don't race
     # an idle worker's exit. The child keeps its immutable runtime cwd in use.
+    # Windows locks belong to the locking process and cannot be inherited, so
+    # there the lock is released and the worker takes it again itself.
+    handoff = os.name == "posix"
+    argv = [sys.executable, "-m", "cc_remote.async_tasks", "worker", "--codex-home", str(store.home)]
+    extra = {}
+    if handoff:
+        argv += ["--lock-fd", str(fd)]
+        extra["pass_fds"] = (fd,)
+    else:
+        os.close(fd)
     try:
-        subprocess.Popen(
-            [sys.executable, "-m", "cc_remote.async_tasks", "worker", "--codex-home",
-             str(store.home), "--lock-fd", str(fd)],
+        procs.popen_group(
+            argv,
             cwd=Path(__file__).resolve().parent.parent, env=sanitized_child_env(),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, pass_fds=(fd,),
+            **extra,
         )
     finally:
-        os.close(fd)
+        if handoff:
+            os.close(fd)
 
 
 async def execute(store, task):

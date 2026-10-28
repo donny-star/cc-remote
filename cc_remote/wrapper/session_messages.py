@@ -12,8 +12,7 @@ import stat
 from uuid import uuid4
 
 from cc_remote.log import logger
-from cc_remote.platform import locks
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, ipc, locks, perms
 from cc_remote.protocol import Error, Query
 from cc_remote.session_messages import (
     MAX_FRAME, envelope, make_server, reference, request_id, split_reference,
@@ -32,12 +31,13 @@ class MessageStore:
     def db(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_uid() or info.st_mode & 0o077:
+        if (not stat.S_ISDIR(info.st_mode) or not perms.owned_info(self.root, info)
+                or not perms.private_mode_info(self.root, info)):
             raise ValueError("Message state must be a private directory owned by this user")
         path = self.root / "receipts.sqlite3"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = platform_files.open_nofollow(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_uid != current_uid():
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or not perms.owned_info(fd, os.fstat(fd)):
                 raise ValueError("Invalid message store")
             os.fchmod(fd, 0o600)
         finally:
@@ -145,20 +145,17 @@ class SessionMessages:
             pass
         if len(os.fsencode(self.socket)) > 103:
             raise ValueError("Message socket path exceeds the platform limit")
-        self.lock_fd = os.open(self.store.root / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        self.lock_fd = platform_files.open_nofollow(
+            self.store.root / "server.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             lock_info = os.fstat(self.lock_fd)
-            if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != current_uid():
+            if not stat.S_ISREG(lock_info.st_mode) or not perms.owned_info(self.lock_fd, lock_info):
                 raise ValueError("Invalid message server lock")
             locks.flock(self.lock_fd, locks.LOCK_EX | locks.LOCK_NB)
             self.store.recover()
-            if self.socket.exists() or self.socket.is_symlink():
-                info = self.socket.lstat()
-                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != current_uid():
-                    raise ValueError("Refusing to replace an unrelated message socket")
-                self.socket.unlink()
-            self.server = await asyncio.start_unix_server(self._client, str(self.socket), limit=MAX_FRAME)
-            os.chmod(self.socket, 0o600)
+            # The lifetime lock is held, so any endpoint left at the path is a
+            # stale one from a dead server; ipc refuses unrelated files itself.
+            self.server = await ipc.start_server(self.socket, self._client, limit=MAX_FRAME)
             self.pump = asyncio.create_task(self._drain(), name="session-message-inbox")
         except BaseException:
             os.close(self.lock_fd)

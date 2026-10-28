@@ -16,8 +16,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cc_remote.platform import locks
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, locks, perms
 from cc_remote.viewer import ViewerSite, clean_path, load_sites, open_resource
 
 MAX_PAGES = 32
@@ -119,13 +118,13 @@ class ViewerPageStore:
 
     def _read(self):
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = platform_files.open_nofollow(self.path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError:
             return {}
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1
+            if (not stat.S_ISREG(info.st_mode) or not perms.owned_info(stream.fileno(), info)
+                    or not perms.private_mode_info(stream.fileno(), info) or info.st_nlink != 1
                     or info.st_size > MAX_STORE_BYTES):
                 raise ValueError("invalid page store")
             data = json.loads(stream.read(MAX_STORE_BYTES + 1))
@@ -149,11 +148,11 @@ class ViewerPageStore:
     @contextmanager
     def _edit(self):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        fd = platform_files.open_nofollow(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o600)
         with os.fdopen(fd, "rb") as lock:
             info = os.fstat(lock.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1):
+            if (not stat.S_ISREG(info.st_mode) or not perms.owned_info(lock.fileno(), info)
+                    or not perms.private_mode_info(lock.fileno(), info) or info.st_nlink != 1):
                 raise ValueError("invalid page store lock")
             locks.flock(lock, locks.LOCK_EX)
             data = self._read()
@@ -171,7 +170,7 @@ class ViewerPageStore:
                     output.write(encoded)
                     output.flush()
                     os.fsync(output.fileno())
-                os.replace(temporary, self.path)
+                platform_files.replace(temporary, self.path)
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)

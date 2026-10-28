@@ -19,8 +19,8 @@ from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cc_remote.platform import locks
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, locks, perms
+from cc_remote.platform.dirs import DirHandle
 
 CHUNK_SIZE = 64 * 1024
 PULL_WINDOW = 8
@@ -145,20 +145,21 @@ class ViewerSite(BaseModel):
                 "revision": self.revision, "script_origins": self.script_origins,
                 "urls": self.urls}
 
-    def open_root(self) -> int:
-        return os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    def open_root(self) -> DirHandle:
+        return DirHandle.open_root(self.root)
 
 
 def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
                max_bytes=64 * 1024) -> dict[str, ViewerSite]:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = platform_files.open_nofollow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return {}
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > max_bytes):
+        if (not stat.S_ISREG(info.st_mode) or not perms.owned_info(source.fileno(), info)
+                or not perms.private_mode_info(source.fileno(), info)
+                or info.st_nlink != 1 or info.st_size > max_bytes):
             raise ValueError("Viewer registry must be a private, bounded regular file")
         raw = source.read(max_bytes + 1)
     data = json.loads(raw)
@@ -175,11 +176,11 @@ def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
 def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 1024):
     """Serialize local registrations; readers only ever see a complete snapshot."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    lock_fd = platform_files.open_nofollow(str(path) + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o600)
     with os.fdopen(lock_fd, "r+b") as lock:
         info = os.fstat(lock.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
-                or info.st_mode & 0o077 or info.st_nlink != 1):
+        if (not stat.S_ISREG(info.st_mode) or not perms.owned_info(lock.fileno(), info)
+                or not perms.private_mode_info(lock.fileno(), info) or info.st_nlink != 1):
             raise ValueError("invalid Viewer registry lock")
         locks.flock(lock, locks.LOCK_EX)
         sites = load_sites(path, model=model, limit=limit, max_bytes=max_bytes)
@@ -199,7 +200,7 @@ def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 
                 output.write(encoded)
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary, path)
+            platform_files.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -211,22 +212,21 @@ def open_resource(site: ViewerSite, raw_path: str):
         raise PermissionError("resource is outside this publication")
     # Anchor every component to a verified directory FD; never follow symlinks,
     # including a swapped root, or reopen by path after validating it.
-    fd = site.open_root()
+    fd = -1
+    handle = site.open_root()
     try:
-        root = os.fstat(fd)
+        root = os.fstat(handle.fd)
         if (root.st_dev != site.root_device or root.st_ino != site.root_inode
-                or root.st_uid != current_uid()):
+                or not perms.owned_info(handle.fd, root)):
             raise PermissionError("publication root changed")
         parts = path.lstrip("/").split("/")
-        for index, part in enumerate(parts):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            if index < len(parts) - 1:
-                flags |= os.O_DIRECTORY
-            child = os.open(part, flags, dir_fd=fd)
-            os.close(fd)
-            fd = child
+        for part in parts[:-1]:
+            child = handle.open_dir(part)
+            handle.close()
+            handle = child
+        fd = handle.open_file(parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
+        if (not stat.S_ISREG(info.st_mode) or not perms.owned_info(fd, info)
                 or info.st_size > MAX_FILE_BYTES or info.st_nlink != 1):
             raise PermissionError("resource is not a bounded, privately owned regular file")
         stream = os.fdopen(fd, "rb")
@@ -235,6 +235,7 @@ def open_resource(site: ViewerSite, raw_path: str):
         mime = MIME_TYPES.get(suffix) or mimetypes.guess_type(path)[0] or "application/octet-stream"
         return stream, info, mime
     finally:
+        handle.close()
         if fd >= 0:
             os.close(fd)
 

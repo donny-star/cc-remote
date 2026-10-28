@@ -11,7 +11,8 @@ from pathlib import Path
 
 from pydantic import field_validator, model_validator
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import perms
+from cc_remote.platform.dirs import DirHandle
 from cc_remote.viewer import (
     SCRIPT_ORIGINS, ViewerSite, clean_path, edit_sites, load_sites,
 )
@@ -22,26 +23,26 @@ MAX_HOME_SITES = 128
 HOME_STORE_BYTES = 1024 * 1024
 
 
-def open_home_directory(home: Path, directory: Path, identity=None) -> int:
+def open_home_directory(home: Path, directory: Path, identity=None) -> DirHandle:
     relative = directory.relative_to(home)
     if any(p.startswith(".") for p in relative.parts):
         raise PermissionError("private directory")
-    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    handle = DirHandle.open_root(home)
     try:
-        info = os.fstat(fd)
-        if info.st_uid != current_uid() or identity and (info.st_dev, info.st_ino) != identity:
+        info = os.fstat(handle.fd)
+        if not perms.owned_info(handle.fd, info) or identity and (info.st_dev, info.st_ino) != identity:
             raise PermissionError("home directory changed")
         for part in relative.parts:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = child
-            if os.fstat(fd).st_uid != current_uid():
+            child = handle.open_dir(part)
+            handle.close()
+            handle = child
+            if not perms.owned_info(handle.fd, os.fstat(handle.fd)):
                 raise PermissionError("directory belongs to another user")
-        result, fd = fd, -1
+        result, handle = handle, None
         return result
     finally:
-        if fd >= 0:
-            os.close(fd)
+        if handle is not None:
+            handle.close()
 
 
 class HomeSite(ViewerSite):
@@ -75,7 +76,7 @@ class HomeSite(ViewerSite):
             raise ValueError("invalid automatic id")
         return self
 
-    def open_root(self) -> int:
+    def open_root(self) -> DirHandle:
         return open_home_directory(Path(self.home), Path(self.root),
                                    (self.home_device, self.home_inode))
 
@@ -107,11 +108,8 @@ class HomePages:
     def _publication(self, root: Path, entry: Path) -> HomeSite:
         root.relative_to(self.home)
         # Validate every directory via FDs before writing any discovery state.
-        fd = open_home_directory(self.home, root)
-        try:
-            info = os.fstat(fd)
-        finally:
-            os.close(fd)
+        with open_home_directory(self.home, root) as handle:
+            info = os.fstat(handle.fd)
         home_info = self.home.stat()
         path = clean_path("/" + entry.relative_to(root).as_posix())
         key = "auto-" + hashlib.sha256(str(root).encode()).hexdigest()[:32]

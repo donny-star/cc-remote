@@ -379,6 +379,13 @@ def _protected_socket_directory(uid: int) -> Path:
     return Path("/tmp").resolve() / f"codex-daemon-{uid}"
 
 
+def _owned_by(target: str | Path, info: os.stat_result, uid: int) -> bool:
+    """``st_uid == uid``, with the current user checked through the platform."""
+    if uid == current_uid():
+        return perms.owned_info(target, info)
+    return info.st_uid == uid
+
+
 def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, int, int]:
     """Validate a native listener, including Codex 0.156's protected alias.
 
@@ -391,10 +398,12 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
     parent = address.parent
     parent_info = parent.lstat()
     if (not address.is_absolute() or str(parent.resolve()) != str(parent)
-            or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != uid
-            or parent_info.st_mode & 0o022):
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or not _owned_by(parent, parent_info, uid)
+            or not perms.no_foreign_write_info(parent, parent_info)):
         raise ValueError("Codex socket parent is not private to its owner")
     info = address.lstat()
+    socket_path: Path = address
     if stat.S_ISLNK(info.st_mode):
         directory = _protected_socket_directory(uid)
         target = directory / hashlib.sha256(os.fsencode(address)).hexdigest()
@@ -405,8 +414,10 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
                 or stat.S_IMODE(directory_info.st_mode) != 0o700):
             raise ValueError("Codex protected socket directory is not private")
         info = target.lstat()
-    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid
-            or info.st_mode & 0o077):
+        socket_path = target
+    if (not platform_files.is_unix_socket(info)
+            or not _owned_by(socket_path, info, uid)
+            or not perms.private_mode_info(socket_path, info)):
         raise ValueError("Codex socket is not private to its owner")
     return info.st_dev, info.st_ino, info.st_ctime_ns
 
@@ -741,7 +752,9 @@ class CodexDaemonManager:
         self.mode = codex_daemon_mode(mode)
         self.socket_path = socket_path
         self.command_timeout = max(1.0, float(command_timeout))
-        self.require_shared = bool(require_shared)
+        # Windows has no shared-daemon capability (see capability()); requiring
+        # it would leave Codex with no transport instead of private stdio.
+        self.require_shared = bool(require_shared) and os.name == "posix"
         self.allow_restart = bool(allow_restart)
         self._lock = asyncio.Lock()
         self._capability_identity: Optional[tuple[object, ...]] = None

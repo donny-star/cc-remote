@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from cc_remote.platform import locks
+from cc_remote.platform import files as platform_files, locks
 
 
 def clean(value):
@@ -57,7 +57,7 @@ class TabStore:
         current = clean({"tabs": tabs, "active": active, "scope": list(scope)})
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_path = self.path.with_suffix(".lock")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = platform_files.open_nofollow(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(fd, "a") as lock:
             locks.flock(lock, locks.LOCK_EX)
             latest = self._read() or clean(None)
