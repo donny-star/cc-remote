@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.platform import files as platform_files
 from cc_remote.platform import locks
 from cc_remote.wrapper.child_env import (
     claude_profile_process_env,
@@ -983,12 +984,8 @@ def _atomic_update_json(path: Path, mutate) -> None:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-            dir_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            platform_files.replace(temp_name, path)
+            platform_files.fsync_directory(path.parent)
         finally:
             try:
                 os.unlink(temp_name)

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import sqlite3
 
+from cc_remote.platform import files as platform_files
 from cc_remote.wrapper.dsh_client import DshError
 
 
@@ -40,11 +41,7 @@ class DshMutationJournal:
                            "sid TEXT, result TEXT)")
                 yield db
             # Include the initial database's directory entry in durability.
-            fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            platform_files.fsync_directory(self.path.parent)
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise DshError("mutation_journal", "无法确认 DSH 操作记录，已停止自动执行。请检查设备状态。") from exc
 
