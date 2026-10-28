@@ -13,6 +13,8 @@ from claude_agent_sdk import ClaudeAgentOptions, PermissionResultAllow, ToolPerm
 
 from cc_remote.claude_service.client import RemoteClient
 from cc_remote.claude_service.server import Service
+from cc_remote.platform import IS_WINDOWS, ipc, perms, procs
+from tests.ipc_helpers import SHORT_TMP, share_with_everyone
 
 
 def test_private_socket_registration_and_explicit_override(tmp_path, monkeypatch):
@@ -71,11 +73,11 @@ class FakeClient:
 @contextlib.asynccontextmanager
 async def environment():
     # Darwin sockaddr_un is short; pytest's normal temp hierarchy exceeds it.
-    with tempfile.TemporaryDirectory(prefix="cc-sdk-", dir="/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="cc-sdk-", dir=SHORT_TMP) as root:
         directory = Path(root)
         service = Service(directory, factory=FakeClient)
         path = directory / "service.sock"
-        server = await asyncio.start_unix_server(service.connection, path)
+        server = await ipc.start_server(path, service.connection)
         clients = []
 
         async def attach(*, profile="primary", permission=None, mcp_server=None,
@@ -107,6 +109,36 @@ async def released(session):
     async with asyncio.timeout(2):
         while session.controller is not None:
             await asyncio.sleep(0.001)
+
+
+def test_service_directory_must_be_private_to_this_user(tmp_path):
+    directory = tmp_path / "service"
+    Service(directory, factory=FakeClient)
+    assert perms.is_private(directory)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    share_with_everyone(shared)
+    with pytest.raises(PermissionError, match="must be private"):
+        Service(shared, factory=FakeClient)
+
+
+@pytest.mark.asyncio
+async def test_service_journal_and_endpoint_are_private():
+    async with environment() as (service, attach):
+        client = await attach()
+        assert perms.is_private(service.sessions[client.id].journal_path)
+        assert perms.is_private(service.directory / "service.sock")
+
+
+def _is_service_process(reported: int, spawned: int) -> bool:
+    """A Windows venv python.exe is a launcher; the service is its child."""
+    if reported == spawned:
+        return True
+    if not IS_WINDOWS:
+        return False
+    from cc_remote.platform import win32_process
+
+    return (win32_process.parent_map() or {}).get(reported) == spawned
 
 
 def test_materialized_image_prompt_reaches_real_sdk_transport(tmp_path):
@@ -733,6 +765,7 @@ def test_real_controller_process_exit_leaves_service_and_accepted_work_alive():
 import asyncio, sys
 from pathlib import Path
 from cc_remote.claude_service.server import Service
+from cc_remote.platform import ipc
 from tests.test_claude_service import FakeClient
 class RunningClient(FakeClient):
     async def query(self, prompt):
@@ -743,7 +776,7 @@ class RunningClient(FakeClient):
         asyncio.create_task(finish())
 async def run():
     service = Service(Path(sys.argv[1]), factory=RunningClient)
-    server = await asyncio.start_unix_server(service.connection, sys.argv[2])
+    server = await ipc.start_server(sys.argv[2], service.connection)
     print('ready', flush=True)
     async with server:
         await server.serve_forever()
@@ -765,24 +798,27 @@ asyncio.run(run())
 """
 
     async def go():
-        with tempfile.TemporaryDirectory(prefix="cc-sdk-process-", dir="/tmp") as root:
+        with tempfile.TemporaryDirectory(prefix="cc-sdk-process-", dir=SHORT_TMP) as root:
             path = str(Path(root) / "service.sock")
-            service = await asyncio.create_subprocess_exec(
+            service = await procs.create_subprocess_exec_group(
                 sys.executable, "-c", service_code, root, path, stdout=asyncio.subprocess.PIPE)
             controller = None
             connection = Connection(path)
             try:
-                assert await asyncio.wait_for(service.stdout.readline(), 3) == b"ready\n"
-                controller = await asyncio.create_subprocess_exec(
+                # Windows children print text-mode CRLF line endings.
+                assert (await asyncio.wait_for(service.stdout.readline(), 3)).rstrip() == b"ready"
+                controller = await procs.create_subprocess_exec_group(
                     sys.executable, "-c", controller_code, path, stdout=asyncio.subprocess.PIPE)
-                assert await asyncio.wait_for(controller.stdout.readline(), 3) == b"accepted\n"
-                controller.kill()  # Only the process created by this test.
+                assert (await asyncio.wait_for(controller.stdout.readline(), 3)).rstrip() == b"accepted"
+                # Only the process tree created by this test (a Windows venv
+                # python.exe is a launcher whose child holds the connection).
+                procs.killpg(controller.pid, procs.SIGKILL)
                 await controller.wait()
                 await connection.connect()
                 descriptions = await connection.call("list")
                 assert len(descriptions) == 1
                 description = descriptions[0]
-                assert description["pid"] == service.pid
+                assert _is_service_process(description["pid"], service.pid)
                 assert service.returncode is None
                 assert description["turn"]["id"] == "only-query"
                 await connection.call("open", {
@@ -793,10 +829,10 @@ asyncio.run(run())
             finally:
                 await connection.disconnect()
                 if controller is not None and controller.returncode is None:
-                    controller.kill()
+                    procs.killpg(controller.pid, procs.SIGKILL)
                     await controller.wait()
                 if service.returncode is None:
-                    service.terminate()
+                    procs.killpg(service.pid, procs.SIGTERM)
                     await service.wait()
     asyncio.run(go())
 

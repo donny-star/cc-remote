@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from cc_remote.claude_steering import ClaudeSteerRejected
 from cc_remote.log import logger
+from cc_remote.platform import ipc
 
 from .wire import ControllerLeaseConflict, decode_sdk, encode_sdk, read_frame, write_frame
 
@@ -51,7 +52,7 @@ class Connection:
         self.pending: dict[str, asyncio.Future] = {}
 
     async def connect(self) -> None:
-        self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
+        self.reader, self.writer = await ipc.open_connection(self.socket_path)
         self.task = asyncio.create_task(self._read())
 
     async def _read(self) -> None:

@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import socket
 import struct
-import sys
 from pathlib import Path
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import ipc
 
 VERSION = 1
 MAX_FRAME = 32 * 1024 * 1024
@@ -38,21 +36,12 @@ async def write_frame(writer: asyncio.StreamWriter, value: dict) -> None:
     await writer.drain()
 
 
-def same_user(writer: asyncio.StreamWriter) -> bool:
-    sock = writer.get_extra_info("socket")
-    if sys.platform == "darwin":
-        # SOL_LOCAL / LOCAL_PEERCRED: xucred = version, uid, ngroups, groups.
-        cred = sock.getsockopt(0, 1, 80)
-        return struct.unpack_from("=I", cred, 4)[0] == current_uid()
-    cred = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-    return struct.unpack("3i", cred)[1] == current_uid()
-
-
 def private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = path.lstat()
-    if path.is_symlink() or info.st_uid != current_uid() or info.st_mode & 0o077:
-        raise PermissionError("Claude service directory must be private and owned by this user")
+    try:
+        ipc.ensure_private_directory(path)
+    except ipc.UnsafeEndpointError as exc:
+        raise PermissionError(
+            "Claude service directory must be private and owned by this user") from exc
 
 
 def encode_sdk(value):
