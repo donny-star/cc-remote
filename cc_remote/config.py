@@ -20,8 +20,7 @@ from urllib.parse import urlsplit
 from cc_remote.claude_broker.paths import default_socket_path
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
-from cc_remote.platform import perms
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, perms
 
 try:
     from dotenv import load_dotenv
@@ -159,13 +158,15 @@ def _claude_service_socket(key: str = "socket") -> str:
     directory = Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))).expanduser()
     path = directory / "claude-service.json"
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = platform_files.open_nofollow(path, os.O_RDONLY)
     except FileNotFoundError:
         return ""
     with os.fdopen(fd, "r") as source:
         info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != current_uid()
-                or info.st_mode & 0o077 or info.st_size > 4096):
+        if (not stat.S_ISREG(info.st_mode)
+                or not perms.owned_info(source.fileno(), info)
+                or not perms.private_mode_info(source.fileno(), info)
+                or info.st_size > 4096):
             raise ValueError("Claude service registration must be a private user-owned file")
         payload = json.loads(source.read(4097))
     if not isinstance(payload, dict) or not isinstance(payload.get("socket"), str):

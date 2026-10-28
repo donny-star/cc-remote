@@ -15,8 +15,7 @@ from uuid import UUID, uuid4
 from claude_agent_sdk import get_session_messages
 
 from cc_remote.claude_permissions import CLAUDE_PERMISSION_MODES
-from cc_remote.platform import files as platform_files
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, perms
 from cc_remote.wrapper.stream import (
     recover_claude_delayed_retry_tail,
     transcript_path,
@@ -523,8 +522,8 @@ class ClaudeControlStore:
         except FileNotFoundError:
             return {}
         if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != current_uid()
-                or stat.S_IMODE(info.st_mode) & 0o077
+                or not perms.owned_info(self.path, info)
+                or not perms.private_mode_info(self.path, info)
                 or info.st_size > _MAX_FILE_BYTES):
             raise ClaudeControlStoreError(
                 "Claude control store is not a private bounded file")
