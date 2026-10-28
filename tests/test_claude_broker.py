@@ -1036,7 +1036,14 @@ def test_client_import_leaves_the_pty_host_unloaded():
 def test_default_socket_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv(SOCKET_ENV, raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    assert default_socket_path() == str(tmp_path / "cc-remote" / "claude-broker.sock")
+    if IS_WINDOWS:
+        # MSYS2/Cygwin/WSL shells export an XDG_RUNTIME_DIR outside the
+        # profile, which the private-endpoint check would refuse.
+        home = tmp_path / "profile"
+        _set_home(monkeypatch, home)
+        assert default_socket_path() == str(home / ".cc-remote" / "claude-broker.sock")
+    else:
+        assert default_socket_path() == str(tmp_path / "cc-remote" / "claude-broker.sock")
     override = tmp_path / "override.sock"
     monkeypatch.setenv(SOCKET_ENV, str(override))
     assert default_socket_path() == str(override)
