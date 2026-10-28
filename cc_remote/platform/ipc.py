@@ -81,7 +81,11 @@ def ensure_private_directory(path: StrPath) -> Path:
         try:
             directory.mkdir(mode=0o700)
             created = True
-        except FileExistsError:
+        except OSError:
+            # pathlib's exist_ok: some filesystems report EACCES or EROFS
+            # rather than EEXIST for an existing leaf.
+            if not directory.is_dir():
+                raise
             created = False
         if IS_WINDOWS and created:
             # A new directory inherits its parent's ACEs; mode bits mean nothing

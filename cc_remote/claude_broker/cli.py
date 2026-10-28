@@ -6,15 +6,12 @@ import argparse
 import asyncio
 import json
 import os
-import signal
-import stat
-import struct
 import subprocess
 import sys
+from collections.abc import Callable
 from typing import Any
 
-from cc_remote.platform import IS_WINDOWS
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import ipc, procs, pty, signals
 
 from .client import BrokerClient, BrokerClientError
 from .paths import default_socket_path
@@ -22,10 +19,10 @@ from .protocol import FrameType
 from .server import BrokerConfig, BrokerSecurityError, BrokerServer
 from .session import DEFAULT_HISTORY_BYTES, DEFAULT_MAX_SESSIONS, SessionError
 
-if not IS_WINDOWS:  # PTY broker is POSIX-only until sub-project 3 ports it to ConPTY
-    import fcntl
-    import termios
-    import tty
+
+# A cold Windows start (venv launcher, pywin32 imports, an antivirus scan) can
+# take seconds; a broker that already exited ends the wait early.
+BROKER_READY_SECONDS = 10.0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -129,36 +126,6 @@ def _print_result(result: dict[str, Any], *, as_json: bool) -> None:
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
-def _terminal_size(fd: int) -> tuple[int, int, int, int]:
-    try:
-        raw = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-        rows, cols, xpixel, ypixel = struct.unpack("HHHH", raw)
-        if rows and cols:
-            return rows, cols, xpixel, ypixel
-    except OSError:
-        pass
-    return 24, 80, 0, 0
-
-
-async def _read_fd(fd: int) -> bytes:
-    mode = os.fstat(fd).st_mode
-    if stat.S_ISREG(mode):
-        return os.read(fd, 64 * 1024)
-    loop = asyncio.get_running_loop()
-    ready: asyncio.Future[None] = loop.create_future()
-
-    def mark_ready() -> None:
-        if not ready.done():
-            ready.set_result(None)
-
-    loop.add_reader(fd, mark_ready)
-    try:
-        await ready
-        return os.read(fd, 64 * 1024)
-    finally:
-        loop.remove_reader(fd)
-
-
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -170,15 +137,16 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
     attachment = await client.attach(session_id, keyboard=keyboard)
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
-    original_termios: list[Any] | None = None
     resize_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    signal_installed = False
+    broken = asyncio.Event()
+    unwatch: Callable[[], None] | None = None
+    # One reader per attach. It must be closed before the terminal leaves raw
+    # mode: on Windows a console read still in flight would otherwise swallow
+    # the user's next keystroke after claude-remote returns.
+    reader = pty.InputReader(stdin_fd) if attachment.keyboard else None
+    tasks: list[asyncio.Task[Any]] = []
 
-    if attachment.keyboard and os.isatty(stdin_fd):
-        original_termios = termios.tcgetattr(stdin_fd)
-        tty.setraw(stdin_fd)
-    elif keyboard and not attachment.keyboard:
+    if keyboard and not attachment.keyboard:
         os.write(sys.stderr.fileno(), b"claude-remote: attached as read-only mirror (keyboard is in use)\n")
 
     async def output_loop() -> int:
@@ -206,47 +174,68 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
                 )
 
     async def input_loop() -> None:
-        if not attachment.keyboard:
-            await asyncio.Future()
-        while True:
-            data = await _read_fd(stdin_fd)
+        while reader is not None:
+            data = await reader.read()
             if not data:
                 return
             await attachment.write(data)
+        await asyncio.Future()  # a mirror never ends on its own input
 
     async def resize_loop() -> None:
         while True:
             await resize_event.wait()
             resize_event.clear()
-            await attachment.resize(*_terminal_size(stdin_fd))
+            await attachment.resize(*pty.terminal_size(stdin_fd))
 
     try:
-        if os.isatty(stdin_fd):
-            await attachment.resize(*_terminal_size(stdin_fd))
-            try:
-                loop.add_signal_handler(signal.SIGWINCH, resize_event.set)
-                signal_installed = True
-            except (NotImplementedError, RuntimeError):
-                pass
-        output_task = asyncio.create_task(output_loop())
-        input_task = asyncio.create_task(input_loop())
-        resize_task = asyncio.create_task(resize_loop())
-        done, pending = await asyncio.wait(
-            {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        resize_task.cancel()
-        await asyncio.gather(*pending, resize_task, return_exceptions=True)
-        if output_task in done:
-            return await output_task
-        return 0  # stdin disconnected: detach, but leave Claude running
+        # Ctrl+Break (Windows) detaches instead of killing claude-remote, so
+        # the console is restored; it covers the whole raw-mode window.
+        unguard = pty.watch_break(broken.set)
+        try:
+            with pty.RawTerminal(stdin_fd, stdout_fd, keyboard=attachment.keyboard):
+                try:
+                    if os.isatty(stdin_fd):
+                        await attachment.resize(*pty.terminal_size(stdin_fd))
+                        unwatch = pty.watch_resize(stdin_fd, resize_event.set)
+                    output_task = asyncio.create_task(output_loop())
+                    input_task = asyncio.create_task(input_loop())
+                    break_task = asyncio.create_task(broken.wait())
+                    tasks = [output_task, input_task, break_task,
+                             asyncio.create_task(resize_loop())]
+                    done, _pending = await asyncio.wait(
+                        {output_task, input_task, break_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if output_task in done:
+                        return await output_task
+                    if break_task in done:
+                        return 130  # detach like an interrupt; Claude keeps running
+                    return 0  # stdin disconnected: detach, but leave Claude running
+                finally:
+                    # Synchronous, so no cancellation can skip it on the way out.
+                    if reader is not None:
+                        reader.close()
+                    if unwatch is not None:
+                        unwatch()
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            unguard()
     finally:
-        if signal_installed:
-            loop.remove_signal_handler(signal.SIGWINCH)
-        if original_termios is not None:
-            termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, original_termios)
         await attachment.close()
+
+
+def _install_shutdown_handler(callback: Callable[[], None]) -> Callable[[], None]:
+    """Hook process shutdown requests where the running loop supports it.
+
+    A loop without signal support (not the main thread, or a POSIX loop
+    without ``add_signal_handler``) simply runs without the hook, as before.
+    """
+    try:
+        return signals.install_shutdown_handler(asyncio.get_running_loop(), callback)
+    except (NotImplementedError, RuntimeError):
+        return lambda: None
 
 
 async def _serve(args: argparse.Namespace) -> int:
@@ -259,19 +248,11 @@ async def _serve(args: argparse.Namespace) -> int:
     await server.start()
     print(f"claude-remote broker listening on {server.socket_path}", file=sys.stderr)
     stopped = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    installed: list[signal.Signals] = []
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stopped.set)
-            installed.append(sig)
-        except (NotImplementedError, RuntimeError):
-            pass
+    uninstall = _install_shutdown_handler(stopped.set)
     try:
         await stopped.wait()
     finally:
-        for sig in installed:
-            loop.remove_signal_handler(sig)
+        uninstall()
         await server.close()
     return 0
 
@@ -292,38 +273,37 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
 
     target = os.path.abspath(os.path.expanduser(socket_path))
     parent = os.path.dirname(target)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    parent_info = os.lstat(parent)
-    if (parent_info.st_uid != current_uid()
-            or not stat.S_ISDIR(parent_info.st_mode)
-            or stat.S_IMODE(parent_info.st_mode) & 0o077):
+    try:
+        ipc.ensure_private_directory(parent)
+    except ipc.UnsafeEndpointError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and not isinstance(cause, ipc.UnsafeEndpointError):
+            # The directory could not be created at all: report why.
+            raise BrokerClientError(
+                "broker_start_failed",
+                f"cannot create the broker socket directory {parent}: {cause}",
+            ) from exc
         raise BrokerSecurityError(
-            "broker socket directory must be private and owned by the current uid")
+            f"broker socket directory must be private and owned by the current uid: {exc}",
+        ) from exc
     log_path = os.path.join(parent, "claude-broker.log")
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "cc_remote.claude_remote",
-                "--socket",
-                target,
-                "serve",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log_fd,
-            stderr=log_fd,
-            start_new_session=True,
-            close_fds=True,
+        broker = _spawn_broker(
+            [sys.executable, "-m", "cc_remote.claude_remote", "--socket", target, "serve"],
+            log_fd,
         )
     finally:
         os.close(log_fd)
 
-    deadline = asyncio.get_running_loop().time() + 3.0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + BROKER_READY_SECONDS
     last_error: BrokerClientError | None = None
-    while asyncio.get_running_loop().time() < deadline:
+    while loop.time() < deadline:
         await asyncio.sleep(0.05)
+        # Sampled before the check: a broker that lost a concurrent start
+        # exits, but only after the winner answers.
+        exited = broker.poll()
         try:
             await client.status()
             return
@@ -331,10 +311,38 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
             last_error = exc
             if exc.code not in {"broker_unavailable", "broker_disconnected"}:
                 raise
+        if exited is not None:
+            raise BrokerClientError(
+                "broker_start_failed",
+                f"broker exited with status {exited} before it became ready; see {log_path}",
+            )
     raise BrokerClientError(
         "broker_start_failed",
         f"broker did not become ready; see {log_path}: {last_error or 'timeout'}",
     )
+
+
+def _spawn_broker(argv: list[str], log_fd: int) -> subprocess.Popen:
+    def spawn(creationflags: int) -> subprocess.Popen:
+        return procs.popen_group(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=log_fd,
+            close_fds=True,
+            # Windows: a windowless console of its own, outside the launching
+            # terminal's Job, so closing that terminal cannot end the broker.
+            # POSIX gets 0, which subprocess accepts unchanged.
+            creationflags=creationflags,
+        )
+
+    try:
+        return spawn(pty.DETACHED_CREATIONFLAGS)
+    except PermissionError:
+        if not pty.JOB_BREAKAWAY_CREATIONFLAG:
+            raise
+        # The launching Job does not allow breakaway: stay inside it.
+        return spawn(pty.DETACHED_CREATIONFLAGS & ~pty.JOB_BREAKAWAY_CREATIONFLAG)
 
 
 async def async_main(argv: list[str] | None = None) -> int:

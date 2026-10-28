@@ -39,6 +39,25 @@ def test_ensure_private_directory_accepts_an_existing_private_directory(tmp_path
     assert ipc.ensure_private_directory(first) == first
 
 
+def test_ensure_private_directory_accepts_an_existing_directory_whatever_mkdir_reports(
+        tmp_path, monkeypatch):
+    existing = ipc.ensure_private_directory(tmp_path / "existing")
+    missing = (tmp_path / "missing").absolute()
+    real_mkdir = Path.mkdir
+
+    def denied(self, *args, **kwargs):
+        # Some filesystems report EACCES (not EEXIST) for an existing leaf.
+        if self in (existing, missing):
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+    assert ipc.ensure_private_directory(existing) == existing
+    with pytest.raises(ipc.UnsafeEndpointError, match="cannot be prepared"):
+        ipc.ensure_private_directory(missing)
+    assert not missing.exists()
+
+
 def test_ensure_private_directory_rejects_a_shared_directory(tmp_path):
     shared = ipc.ensure_private_directory(tmp_path / "shared")
     share_with_everyone(shared)
