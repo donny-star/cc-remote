@@ -276,10 +276,14 @@ def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
 
 
 def is_reparse_point(path: StrPath) -> bool:
-    """True when ``path`` itself is a link (POSIX) or any reparse point (Windows).
+    """True when ``path`` itself is a link (POSIX) or a reparse point (Windows).
 
-    Windows counts symlinks, junctions, AF_UNIX socket files and every other
-    reparse tag. Raises FileNotFoundError when ``path`` does not exist.
+    On Windows, name-surrogate reparse points (symlinks, junctions) and
+    AF_UNIX socket / AppExecLink files are always detected. Filter-managed
+    tags (cloud and dedup placeholders) may report False because ``os.lstat``
+    lets the filter resolve them, so do not use this to predict whether
+    :func:`open_nofollow` will succeed: call it and handle ``OSError``.
+    Raises FileNotFoundError when ``path`` does not exist.
     """
     info = os.lstat(path)
     if not IS_WINDOWS:
@@ -291,9 +295,16 @@ def open_nofollow(path: StrPath, flags: int, mode: int = 0o600) -> int:
     """Open a regular file without following a final link.
 
     POSIX adds ``O_NOFOLLOW | O_CLOEXEC``. Windows opens the reparse point
-    itself and refuses it with ``OSError(ELOOP)``; otherwise the descriptor is
-    the share-delete, binary one of :func:`open_with_share_delete` and
-    ``mode`` is ignored. Directories are not supported on Windows.
+    itself and refuses any reparse tag (file symlinks, OneDrive/dedup placeholders,
+    AF_UNIX socket files, AppExecLink) with ``OSError(ELOOP)``; otherwise the
+    descriptor is the share-delete, binary one of
+    :func:`open_with_share_delete`. Like POSIX ``O_NOFOLLOW``, only the last
+    path component is protected.
+
+    On Windows, directories, junctions and directory symlinks cannot be opened
+    and raise ``PermissionError`` rather than ELOOP; ``O_CREAT | O_EXCL`` on an
+    existing junction also raises ``PermissionError``. ``mode`` is ignored on
+    Windows: call :func:`cc_remote.platform.perms.make_private` after creating.
     """
     if not IS_WINDOWS:
         return os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)

@@ -51,6 +51,8 @@ if IS_WINDOWS:
     # Job already drained. A tombstoned pid answers ProcessLookupError forever
     # (until a new group reuses it): falling back to ``taskkill /T`` could hit
     # an unrelated tree that inherited the recycled pid.
+    # The creation times are reserved for a later identity check; killpg
+    # currently decides by membership only.
     _created: dict[int, int | None] = {}
     _tombstones: OrderedDict[int, int | None] = OrderedDict()
     # Bounded LRU: an evicted (very old) pid falls back to taskkill, which is
@@ -77,9 +79,9 @@ if IS_WINDOWS:
     def _prune_locked(keep: int) -> None:
         for pid, job in list(_jobs.items()):
             if pid != keep and _active_processes(job) == 0:
-                job.Close()
                 del _jobs[pid]
                 _bury_locked(pid)
+                job.Close()
 
     def _register(pid: int, job: Any, created: int | None) -> None:
         """Own ``job`` in the table first; pruning is housekeeping only."""
@@ -165,8 +167,8 @@ if IS_WINDOWS:
                 with translated():
                     if _active_processes(job) == 0:
                         del _jobs[pid]
-                        job.Close()
                         _bury_locked(pid)
+                        job.Close()
                         raise ProcessLookupError(pid)
                     win32job.TerminateJobObject(job, 1)
                 return

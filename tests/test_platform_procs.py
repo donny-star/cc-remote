@@ -257,3 +257,32 @@ def test_tombstones_are_bounded(monkeypatch) -> None:
             procs._bury_locked(pid)
     assert list(procs._tombstones.items()) == [(2, 20), (3, 30)]
     assert procs._created == {}
+
+
+@pytest.mark.windows_only(reason="Job Object tombstones only exist on Windows")
+def test_killpg_drained_job_close_failure_still_tombstones(monkeypatch) -> None:
+    class _FailingJob:
+        def Close(self) -> None:
+            raise OSError("close failed")
+
+    def no_taskkill(*args, **kwargs):
+        raise AssertionError(f"taskkill must not run for a drained Job pid: {args}")
+
+    fake_pid = 0x7FFFFFF4
+    monkeypatch.setattr(procs, "_active_processes", lambda job: 0)
+    monkeypatch.setattr(procs.subprocess, "run", no_taskkill)
+    with procs._jobs_lock:
+        procs._jobs[fake_pid] = _FailingJob()
+        procs._created[fake_pid] = 1
+    try:
+        with pytest.raises(OSError):
+            procs.killpg(fake_pid, procs.SIGTERM)
+        assert fake_pid not in procs._jobs
+        assert fake_pid in procs._tombstones
+        with pytest.raises(ProcessLookupError):
+            procs.killpg(fake_pid, procs.SIGKILL)
+    finally:
+        with procs._jobs_lock:
+            procs._jobs.pop(fake_pid, None)
+            procs._created.pop(fake_pid, None)
+            procs._tombstones.pop(fake_pid, None)
