@@ -871,7 +871,10 @@ def test_background_job_scan_caps_entries_and_state_file_size(
         monkeypatch, tmp_path):
     jobs = tmp_path / ".claude" / "jobs"
     jobs.mkdir(parents=True)
+    # Path.home() reads USERPROFILE on Windows; never scan the real ~/.claude.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     valid = jobs / "valid"
     valid.mkdir()
