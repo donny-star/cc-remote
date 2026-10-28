@@ -731,3 +731,36 @@ def test_profile_migration_leaves_no_lock_for_the_former_session_key(tmp_path):
     assert not former.session_dir.exists()
     assert not former.lock_path.exists()
     assert migrated.completed_turn_ids() == ()
+
+
+def test_atomic_journal_write_replaces_a_read_only_target_like_posix(tmp_path):
+    target = tmp_path / "state" / "manifest.json"
+    target.parent.mkdir()
+    target.write_bytes(b"old")
+    target.chmod(0o400)
+
+    checkpoint_module._atomic_write(target, b"new")
+
+    assert target.read_bytes() == b"new"
+    assert [path.name for path in target.parent.iterdir()] == ["manifest.json"]
+
+
+def test_cleanup_removes_journals_holding_read_only_git_objects(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    state = tmp_path / "state"
+    for session_id in ("captured-warm", "captured-cold"):
+        journal = CodexCheckpointJournal(str(root), state, session_id)
+        journal.begin_turn("turn-1")
+        journal.accept_turn("turn-1")
+        (root / "tracked.txt").write_text(f"{session_id}\n", encoding="utf-8")
+        journal.finish_turn("turn-1")
+        assert any(
+            path.is_file() and path.parent.name not in ("info", "pack")
+            for path in journal.objects_dir.rglob("*")
+        )
+        if session_id == "captured-warm":
+            journal.cleanup()
+        else:
+            assert cleanup_codex_checkpoint_session(state, session_id) == 1
+        assert not journal.session_dir.exists()
+        assert not journal.lock_path.exists()

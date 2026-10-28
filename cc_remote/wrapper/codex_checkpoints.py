@@ -22,7 +22,6 @@ import copy
 import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -182,7 +181,7 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        platform_files.replace(temporary, path)
     finally:
         try:
             os.unlink(temporary)
@@ -262,7 +261,7 @@ def cleanup_codex_checkpoint_session(
                 os.close(lock_fd)
         if tombstone is not None:
             try:
-                shutil.rmtree(tombstone, ignore_errors=False)
+                platform_files.force_rmtree(tombstone)
             except OSError as exc:
                 raise CheckpointError(
                     "Unable to remove Codex checkpoint journal"
@@ -707,7 +706,7 @@ class CodexCheckpointJournal:
         try:
             os.replace(self.objects_dir, retired)
             self._initialize_object_store()
-            shutil.rmtree(retired, ignore_errors=False)
+            platform_files.force_rmtree(retired)
         except OSError as exc:
             raise CheckpointError("Unable to compact checkpoint object store") from exc
 
@@ -1645,5 +1644,5 @@ class CodexCheckpointJournal:
             os.replace(self.session_dir, tombstone)
             self._closed = True
         if tombstone is not None:
-            shutil.rmtree(tombstone, ignore_errors=False)
+            platform_files.force_rmtree(tombstone)
             dirs.discard_lock(self.session_dir, "journal.lock")
