@@ -1,4 +1,4 @@
-"""Run the SDK service under its own LaunchAgent or systemd user unit."""
+"""Run the SDK service under its own LaunchAgent, systemd user unit or scheduled task."""
 
 from __future__ import annotations
 
@@ -6,32 +6,23 @@ import argparse
 import asyncio
 import json
 import os
-import signal
-import stat
 from pathlib import Path
 
-from cc_remote.platform import locks
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files, ipc, locks, signals
 from cc_remote.wrapper.process_scan import process_identity
 
 from .server import Service
 from .wire import private_directory
 
 
-async def serve(directory: Path) -> None:
+async def serve(directory: Path, *, stop: asyncio.Event | None = None) -> None:
     private_directory(directory)
-    lock_fd = os.open(directory / "service.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_fd = files.open_nofollow(directory / "service.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         locks.flock(lock_fd, locks.LOCK_EX | locks.LOCK_NB)
         path = directory / "service.sock"
-        if path.exists() or path.is_symlink():
-            info = path.lstat()
-            if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
-                raise PermissionError("unsafe Claude service socket")
-            path.unlink()
         service = Service(directory)
-        server = await asyncio.start_unix_server(service.connection, path)
-        os.chmod(path, 0o600)
+        server = await ipc.start_server(path, service.connection)
         identity = process_identity(os.getpid())
         state = {
             "pid": os.getpid(), "start_ticks": identity.start_ticks if identity else None,
@@ -39,20 +30,18 @@ async def serve(directory: Path) -> None:
             "socket": str(path), "protocol": 1,
         }
         descriptor = directory / "service.json"
-        fd = os.open(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = files.open_nofollow(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as out:
             json.dump(state, out)
-        stopped = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(signum, stopped.set)
+        stopped = stop if stop is not None else asyncio.Event()
+        uninstall = signals.install_shutdown_handler(asyncio.get_running_loop(), stopped.set)
         try:
             await stopped.wait()
         finally:
+            uninstall()
             server.close()
             await server.wait_closed()
             await asyncio.gather(*(session.close() for session in service.sessions.values()))
-            path.unlink(missing_ok=True)
             descriptor.unlink(missing_ok=True)
     finally:
         os.close(lock_fd)
