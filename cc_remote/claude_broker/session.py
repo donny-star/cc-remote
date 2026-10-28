@@ -18,7 +18,7 @@ from typing import Callable, Literal
 import uuid
 
 from cc_remote.claude_paths import claude_projects_dir
-from cc_remote.platform import procs, pty
+from cc_remote.platform import IS_WINDOWS, procs, pty
 
 from .control_store import ControlStore, ControlStoreError
 
@@ -66,6 +66,11 @@ _PERMISSION_OUTPUT_PATTERNS = (
     ("default", re.compile(r"\bmanual mode(?: on)?\b", re.IGNORECASE)),
 )
 _CONTROL_OUTPUT_TAIL_CHARS = 16 * 1024
+# Extensions a Windows launcher of claude-remote may carry (PATHEXT-style).
+_LAUNCHER_EXTENSIONS = frozenset({".bat", ".cmd", ".com", ".exe", ".ps1"})
+# Claude Code's project key on Windows: every character other than
+# [A-Za-z0-9] of the cwd becomes a dash (drive colon, separators, dots).
+_WINDOWS_PROJECT_KEY_RE = re.compile(r"[^A-Za-z0-9]")
 _FORBIDDEN_CLAUDE_ARGS = frozenset({
     "--session-id", "--resume", "-r", "--continue", "-c", "--fork-session",
 })
@@ -295,11 +300,18 @@ def resolve_executable(value: str) -> str:
     name = os.path.basename(candidate)
     stem, extension = os.path.splitext(name)
     if name == "claude-remote" or (
-            stem.lower() == "claude-remote" and extension.lower() in {".bat", ".cmd", ".exe"}):
+            stem.lower() == "claude-remote" and extension.lower() in _LAUNCHER_EXTENSIONS):
         raise SessionError(
             "bad_claude_binary", "refusing to launch claude-remote as Claude Code",
         )
     return candidate
+
+
+def _project_key(cwd: str) -> str:
+    """Claude Code's ``~/.claude/projects`` directory name for ``cwd``."""
+    if IS_WINDOWS:
+        return _WINDOWS_PROJECT_KEY_RE.sub("-", cwd)
+    return cwd.replace(os.sep, "-")
 
 
 def validate_cwd(value: str | None) -> str:
@@ -813,9 +825,10 @@ class PTYSession:
                 self._transcript_path_cache = None
 
         # Claude's normal project key is the absolute cwd with separators
-        # replaced by dashes. Prefer that exact path so the 100 ms watcher does
-        # not repeatedly walk every project directory.
-        direct = root / self.cwd.replace(os.sep, "-") / f"{self.id}.jsonl"
+        # replaced by dashes (on Windows every non-alphanumeric character).
+        # Prefer that exact path so the 100 ms watcher does not repeatedly
+        # walk every project directory.
+        direct = root / _project_key(self.cwd) / f"{self.id}.jsonl"
         try:
             resolved = direct.resolve(strict=True)
             if root in resolved.parents and resolved.is_file():

@@ -154,8 +154,13 @@ def arg(name, default=None):
     return default
 
 sid = arg("--session-id") or arg("--resume")
-# Claude dashes separators and a Windows drive colon in the project key.
-project = os.getcwd().replace(os.sep, "-").replace(":", "-")
+# Claude dashes separators in the project key; on Windows every character
+# other than [A-Za-z0-9] (drive colon, backslashes, dots, underscores).
+if os.name == "nt":
+    import re
+    project = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+else:
+    project = os.getcwd().replace(os.sep, "-")
 directory = os.path.join(os.path.expanduser("~/.claude/projects"), project)
 os.makedirs(directory, exist_ok=True)
 transcript = os.path.join(directory, sid + ".jsonl")
@@ -673,8 +678,9 @@ async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmat
             if isinstance(event, Perm)] == ["default"]
     assert [event.model for event in transport.sent
             if isinstance(event, Model)] == ["claude-opus-4-1"]
-    transcript = Path(os.path.expanduser(
-        f"~/.claude/projects/{str(project).replace(os.sep, '-').replace(':', '-')}/{sid}.jsonl"))
+    key = (re.sub(r"[^A-Za-z0-9]", "-", str(project)) if IS_WINDOWS
+           else str(project).replace(os.sep, "-"))
+    transcript = Path(os.path.expanduser(f"~/.claude/projects/{key}/{sid}.jsonl"))
     records = [json.loads(line) for line in transcript.read_text().splitlines()]
     permission_records = [
         record.get("permissionMode") for record in records
@@ -1113,6 +1119,32 @@ def test_transcript_fallback_fails_closed_for_duplicate_sid_across_cwds(
     assert session._find_transcript() is None
 
 
+@pytest.mark.parametrize("cwd, project", [
+    pytest.param(r"C:\Users\me\my.project_x", "C--Users-me-my-project-x",
+                 marks=pytest.mark.windows_only(reason="a Windows cwd")),
+    pytest.param("/home/me/project", "-home-me-project",
+                 marks=pytest.mark.posix_only(reason="a POSIX cwd")),
+])
+def test_transcript_quick_lookup_uses_claude_codes_project_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cwd: str, project: str,
+):
+    # On Windows Claude Code dashes every character of the cwd other than
+    # [A-Za-z0-9] (drive colon, backslashes, dots, underscores). A copy of the
+    # transcript elsewhere makes the fallback scan ambiguous, so only the
+    # direct project key can find it.
+    _set_home(monkeypatch, tmp_path)
+    sid = "11111111-1111-4111-8111-111111111111"
+    root = tmp_path / ".claude" / "projects"
+    for directory in (root / project, root / "-copied-cwd"):
+        directory.mkdir(parents=True)
+        (directory / f"{sid}.jsonl").write_text("", encoding="utf-8")
+    session = object.__new__(PTYSession)
+    session.id = sid
+    session.cwd = cwd
+    session._transcript_path_cache = None
+    assert session._find_transcript() == str((root / project / f"{sid}.jsonl").resolve())
+
+
 def test_transcript_lookup_uses_configured_claude_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
@@ -1349,10 +1381,23 @@ async def test_session_manager_hosts_the_tui_in_a_portable_pty(tmp_path: Path, f
         await manager.close()
 
 
-@pytest.mark.windows_only(reason="the explicit claude-remote launcher is a .cmd file on Windows (P5)")
-def test_resolve_executable_refuses_the_claude_remote_launcher(tmp_path: Path):
-    launcher = tmp_path / "claude-remote.cmd"
+@pytest.mark.windows_only(reason="Windows launchers carry a PATHEXT extension")
+@pytest.mark.parametrize("name", [
+    "claude-remote.cmd", "claude-remote.bat", "claude-remote.exe", "claude-remote.com",
+    "claude-remote.ps1", "Claude-Remote.PS1", "CLAUDE-REMOTE.Com",
+])
+def test_resolve_executable_refuses_the_claude_remote_launcher(tmp_path: Path, name: str):
+    launcher = tmp_path / name
     launcher.write_text("@echo off\r\n", encoding="utf-8")
+    with pytest.raises(broker_session_module.SessionError, match="refusing to launch claude-remote"):
+        broker_session_module.resolve_executable(str(launcher))
+
+
+@pytest.mark.posix_only(reason="the POSIX launcher is an extensionless executable")
+def test_resolve_executable_refuses_the_posix_claude_remote_launcher(tmp_path: Path):
+    launcher = tmp_path / "claude-remote"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
     with pytest.raises(broker_session_module.SessionError, match="refusing to launch claude-remote"):
         broker_session_module.resolve_executable(str(launcher))
 
