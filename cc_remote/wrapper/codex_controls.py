@@ -12,7 +12,7 @@ import threading
 from typing import Callable
 from uuid import uuid4
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, perms
 
 
 CODEX_APPROVAL_POLICIES = frozenset({"untrusted", "on-request", "never"})
@@ -468,8 +468,8 @@ class CodexControlStore:
         except FileNotFoundError:
             return {}
         if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != current_uid()
-                or stat.S_IMODE(info.st_mode) & 0o077
+                or not perms.owned_info(self.path, info)
+                or not perms.private_mode_info(self.path, info)
                 or info.st_size > _MAX_FILE_BYTES):
             raise CodexControlStoreError(
                 "Codex control store is not a private bounded file")
@@ -540,13 +540,9 @@ class CodexControlStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            platform_files.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(parent)
         except Exception as exc:
             try:
                 temporary.unlink()

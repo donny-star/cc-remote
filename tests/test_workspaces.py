@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cc_remote.workspaces import WorkRegistry, WorkStores
+from tests.platform_assertions import assert_private_dir, assert_private_file
 
 
 class WorkRegistryTests(unittest.TestCase):
@@ -247,8 +248,8 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertIn("结论先行", context)
         self.assertEqual((workspace / "资料库" / "report.csv").read_bytes(),
                          b"name,value\nA,1\n")
-        self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((workspace / "WORK.md").stat().st_mode & 0o777, 0o600)
+        assert_private_dir(workspace)
+        assert_private_file(workspace / "WORK.md")
 
     def test_existing_work_session_tracks_later_project_context_changes(self):
         project_id = self.store.create_project("持续项目", "初始说明")
@@ -574,7 +575,7 @@ class WorkRegistryTests(unittest.TestCase):
         workspace = Path(record.cwd)
 
         self.assertTrue((workspace / "uploads").is_dir())
-        self.assertEqual((workspace / "uploads").stat().st_mode & 0o777, 0o700)
+        assert_private_dir(workspace / "uploads")
         self.assertTrue(
             (workspace / "uploads" / ".cc-remote-upload-root").is_file())
         self.assertFalse((workspace.parent / "uploads").exists())
@@ -629,7 +630,7 @@ class WorkRegistryTests(unittest.TestCase):
                          [record.cwd])
         self.assertEqual(payload["sandbox"]["filesystem"]["allowWrite"],
                          [record.cwd])
-        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        assert_private_file(policy)
 
     def test_repeated_initialize_does_not_rebuild_profile_identity_index(self):
         self.store.initialize()
@@ -688,7 +689,7 @@ class WorkRegistryTests(unittest.TestCase):
             payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
             "rotated-token",
         )
-        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        assert_private_file(policy)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 
 import pytest
@@ -21,6 +20,7 @@ from cc_remote.codex_daemon_restart import (
     schedule_managed_daemon_restart,
     write_restart_state,
 )
+from tests.platform_assertions import assert_private_file
 
 
 def test_bare_explicit_codex_binary_uses_path_lookup(monkeypatch):
@@ -41,7 +41,7 @@ def test_restart_state_round_trip_is_private_and_rejects_malformed(tmp_path):
 
     assert state.epoch == "a" * 32
     assert read_restart_state(path) == state
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert_private_file(path)
     assert state.deadline_at > state.updated_at
 
     path.write_text(json.dumps({

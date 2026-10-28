@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +17,7 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
+from tests.platform_assertions import assert_private_file
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -80,7 +80,7 @@ def test_session_pin_store_persists_and_unpins(tmp_path):
     store.set_pinned("codex", "codex-1", True)
     assert SessionPinStore(tmp_path).ids("claude") == {"claude-1"}
     assert SessionPinStore(tmp_path).ids("codex") == {"codex-1"}
-    assert oct(os.stat(tmp_path / "session-pins.json").st_mode & 0o777) == "0o600"
+    assert_private_file(tmp_path / "session-pins.json")
 
     store.set_pinned("claude", "claude-1", False)
     assert SessionPinStore(tmp_path).ids("claude") == set()

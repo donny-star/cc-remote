@@ -10,11 +10,9 @@ import asyncio
 import getpass
 import json
 import os
-import stat
-import tempfile
 from pathlib import Path
 
-from cc_remote.platform.identity import current_uid
+from cc_remote.platform import files as platform_files, perms
 from cc_remote.wrapper.dsh_client import (
     DshClient, DshConnection, DshError,
 )
@@ -24,16 +22,16 @@ def save_connection(connection: DshConnection, path: Path) -> None:
     path = path.expanduser().absolute()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.parent.stat()
-    if info.st_uid != current_uid() or stat.S_IMODE(info.st_mode) & 0o022:
+    if not perms.owned_info(path.parent, info) or not perms.no_foreign_write_info(path.parent, info):
         raise DshError("invalid_connection", "配对文件所在目录必须由当前用户拥有且其他用户不可写。")
-    fd, staging = tempfile.mkstemp(prefix=".dsh-pair-", dir=path.parent)
+    fd, staging = platform_files.create_private_temp(path.parent, prefix=".dsh-pair-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"schema": 1, "origin": connection.origin, "token": connection.token}, stream)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(staging, path)
+        platform_files.replace(staging, path)
     finally:
         if os.path.exists(staging):
             os.unlink(staging)

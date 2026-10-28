@@ -12,6 +12,7 @@ import tempfile
 
 import pytest
 
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper import codex_daemon as daemon_module
 from cc_remote.wrapper import codex_handle as handle_module
 from cc_remote.wrapper.codex_daemon import (
@@ -1008,7 +1009,7 @@ def test_exact_zombie_daemon_updater_gets_sigterm_only(monkeypatch, tmp_path):
     monkeypatch.setattr(
         daemon_module, "_darwin_process_info", lambda pid: processes.get(pid))
     monkeypatch.setattr(
-        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+        daemon_module, "process_owner_uid", lambda _pid: current_uid())
     monkeypatch.setattr(
         daemon_module, "_darwin_process_state", lambda _pid: "Z+")
 
@@ -1066,7 +1067,7 @@ def test_ambiguous_darwin_daemon_state_never_signals(
     monkeypatch.setattr(
         daemon_module,
         "process_owner_uid",
-        lambda pid: os.getuid() + (1 if mismatch == "different_uid" else 0),
+        lambda pid: current_uid() + (1 if mismatch == "different_uid" else 0),
     )
     monkeypatch.setattr(
         daemon_module,

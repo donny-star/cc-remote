@@ -8,7 +8,7 @@ from os import PathLike
 
 from cc_remote.platform import IS_WINDOWS
 from cc_remote.platform._win32err import translated
-from cc_remote.platform.identity import current_sid, current_uid
+from cc_remote.platform.identity import current_euid, current_sid, current_uid
 
 StrPath = str | PathLike[str]
 
@@ -17,25 +17,68 @@ def make_private(path: StrPath, *, directory: bool) -> None:
     if not IS_WINDOWS:
         os.chmod(path, 0o700 if directory else 0o600)
         return
-    import ntsecuritycon
     import win32security
 
     with translated(os.fspath(path)):
-        user = win32security.ConvertStringSidToSid(current_sid())
-        system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid)
-        inherit = (
-            win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
-            if directory else 0
-        )
-        dacl = win32security.ACL()
-        for sid in (user, system):
-            dacl.AddAccessAllowedAceEx(
-                win32security.ACL_REVISION, inherit, ntsecuritycon.FILE_ALL_ACCESS, sid)
         win32security.SetNamedSecurityInfo(
             os.fspath(path), win32security.SE_FILE_OBJECT,
             win32security.DACL_SECURITY_INFORMATION
             | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-            None, None, dacl, None)
+            None, None, _private_dacl(directory=directory), None)
+
+
+def make_private_fd(fd: int) -> None:
+    """Restrict an open file to its owner without re-resolving its path.
+
+    A no-op on POSIX, where the creating ``open`` already applied the mode.
+    Windows reopens the descriptor's handle with WRITE_DAC (the original
+    handle lacks it) and sets a protected current-user + SYSTEM DACL on it.
+    Failures raise ``OSError``.
+    """
+    if not IS_WINDOWS:
+        return
+    import msvcrt
+
+    import win32file
+    import win32security
+
+    with translated():
+        handle = win32file.ReOpenFile(
+            msvcrt.get_osfhandle(fd),
+            _WRITE_DAC | _READ_CONTROL,
+            win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE
+            | win32file.FILE_SHARE_DELETE,
+            0)
+        try:
+            win32security.SetSecurityInfo(
+                handle, win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, _private_dacl(directory=False), None)
+        finally:
+            handle.Close()
+
+
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+
+
+def _private_dacl(*, directory: bool):
+    """A DACL granting full control to only the current user and SYSTEM."""
+    import ntsecuritycon
+    import win32security
+
+    user = win32security.ConvertStringSidToSid(current_sid())
+    system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid)
+    inherit = (
+        win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
+        if directory else 0
+    )
+    dacl = win32security.ACL()
+    for sid in (user, system):
+        dacl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION, inherit, ntsecuritycon.FILE_ALL_ACCESS, sid)
+    return dacl
 
 
 def is_private(path: StrPath) -> bool:
@@ -142,12 +185,13 @@ def _trusted_sids():
     return user, admins, trusted
 
 
-def _descriptor_is_private(descriptor, *, directory: bool) -> bool:
+def _descriptor_is_private(descriptor, *, directory: bool, deny_mask: int | None = None) -> bool:
     """Owner is the user (or administrators); only trusted SIDs are granted access.
 
     A directory's inheritable ACEs decide who can read the files later created
     in it, so they count as grants; CREATOR OWNER is trusted there because it
-    only ever resolves to each new child's owner.
+    only ever resolves to each new child's owner. With ``deny_mask`` an
+    untrusted grant fails only when it includes one of those rights.
     """
     import win32security
 
@@ -166,7 +210,7 @@ def _descriptor_is_private(descriptor, *, directory: bool) -> bool:
         if not (isinstance(ace, tuple) and len(ace) == 3
                 and isinstance(ace[0], tuple) and len(ace[0]) == 2):
             return False
-        (ace_type, ace_flags), _mask, sid = ace
+        (ace_type, ace_flags), mask, sid = ace
         if ace_type not in (win32security.ACCESS_ALLOWED_ACE_TYPE,
                             win32security.ACCESS_DENIED_ACE_TYPE):
             return False
@@ -179,5 +223,88 @@ def _descriptor_is_private(descriptor, *, directory: bool) -> bool:
             continue
         if inherit_only and sid == creator_owner:
             continue
+        if deny_mask is not None and not mask & deny_mask:
+            continue
         return False
     return True
+
+
+# Rights that let a principal change a file or a directory's entries.
+_WRITE_RIGHTS = (
+    0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0100  # data/add, append/subdir, EA, delete child, attributes
+    | 0x00010000 | 0x00040000 | 0x00080000      # DELETE, WRITE_DAC, WRITE_OWNER
+    | 0x10000000 | 0x40000000                    # GENERIC_ALL, GENERIC_WRITE
+)
+
+
+def _win32_descriptor(target: int | StrPath, info: int):
+    if isinstance(target, int):
+        return _handle_security_info(target, info)
+    return _named_security_info(target, info)
+
+
+def owned_info(
+    target: int | StrPath, info: os.stat_result, *, effective: bool = False,
+) -> bool:
+    """``info.st_uid == current_uid()`` (or euid) on POSIX; the owner SID on Windows.
+
+    ``target`` is the descriptor or path ``info`` came from. Windows stat
+    results report st_uid 0 for every file, so the owner must come from the
+    security descriptor and must be the current user or the BUILTIN
+    Administrators group; SYSTEM-owned directories such as the drive root
+    and the Users directory are not owned. A missing or unverifiable target
+    is not owned.
+    ``effective`` keeps callers that compared against the effective uid exact
+    on POSIX.
+    """
+    if not IS_WINDOWS:
+        return info.st_uid == (current_euid() if effective else current_uid())
+    try:
+        return owned_by_current_user(target)
+    except Exception:
+        return False  # missing or unverifiable is not owned
+
+
+def private_mode_info(target: int | StrPath, info: os.stat_result) -> bool:
+    """No group/other mode bits on POSIX; an owner-only DACL on Windows.
+
+    On Windows the owner must also be the current user or the BUILTIN
+    Administrators group, so SYSTEM-owned directories such as the drive root
+    and the Users directory report False. Any inspection failure reports False.
+    """
+    if not IS_WINDOWS:
+        return not stat.S_IMODE(info.st_mode) & 0o077
+    try:
+        import win32security
+
+        descriptor = _win32_descriptor(
+            target, win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION)
+        if descriptor is None:
+            return False
+        return _descriptor_is_private(descriptor, directory=stat.S_ISDIR(info.st_mode))
+    except Exception:
+        return False  # unverifiable is not private
+
+
+def no_foreign_write_info(target: int | StrPath, info: os.stat_result) -> bool:
+    """No group/other write bits on POSIX; no foreign write ACE on Windows.
+
+    On Windows the owner must also be the current user or the BUILTIN
+    Administrators group, so SYSTEM-owned directories such as the drive root
+    and the Users directory report False. Any inspection failure reports False.
+    """
+    if not IS_WINDOWS:
+        return not stat.S_IMODE(info.st_mode) & 0o022
+    try:
+        import win32security
+
+        descriptor = _win32_descriptor(
+            target, win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION)
+        if descriptor is None:
+            return False
+        return _descriptor_is_private(
+            descriptor, directory=stat.S_ISDIR(info.st_mode), deny_mask=_WRITE_RIGHTS)
+    except Exception:
+        return False

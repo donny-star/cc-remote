@@ -9,9 +9,11 @@ from __future__ import annotations
 import errno
 import functools
 import os
+import secrets
 import shutil
 import stat
 import sys
+import tempfile
 import time
 from os import PathLike
 
@@ -291,6 +293,19 @@ def is_reparse_point(path: StrPath) -> bool:
     return bool(info.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+_IO_REPARSE_TAG_AF_UNIX = 0x80000023
+
+
+def is_unix_socket(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result describes a Unix-domain socket file.
+
+    Windows AF_UNIX sockets report S_IFREG plus the AF_UNIX reparse tag.
+    """
+    if not IS_WINDOWS:
+        return stat.S_ISSOCK(info.st_mode)
+    return getattr(info, "st_reparse_tag", 0) == _IO_REPARSE_TAG_AF_UNIX
+
+
 def open_nofollow(path: StrPath, flags: int, mode: int = 0o600) -> int:
     """Open a regular file without following a final link.
 
@@ -309,6 +324,71 @@ def open_nofollow(path: StrPath, flags: int, mode: int = 0o600) -> int:
     if not IS_WINDOWS:
         return os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
     return _win32_create(path, flags, refuse_reparse=True)
+
+
+_ERROR_ACCESS_DENIED = 5
+_ERROR_FILE_EXISTS = 80
+_ERROR_ALREADY_EXISTS = 183
+
+
+def create_private_temp(
+    directory: StrPath, prefix: str = "", suffix: str = "",
+) -> tuple[int, str]:
+    """Create a new owner-only temporary file; return ``(fd, absolute path)``.
+
+    POSIX is ``tempfile.mkstemp`` (mode 0600). Windows creates the file with
+    a protected current-user + SYSTEM DACL in the CreateFile call itself, so
+    no other principal can open it in between, even when ``directory`` is
+    readable by others. The binary descriptor is not inherited and shares
+    delete like :func:`open_with_share_delete`.
+    """
+    if not IS_WINDOWS:
+        return tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=directory)
+    import msvcrt
+
+    import pywintypes
+    import win32api
+    import win32file
+    import win32security
+
+    from cc_remote.platform import perms
+    from cc_remote.platform._win32err import as_oserror
+
+    directory = os.path.abspath(os.fspath(directory))
+    try:
+        attributes = win32security.SECURITY_ATTRIBUTES()
+        attributes.bInheritHandle = False
+        descriptor = attributes.SECURITY_DESCRIPTOR
+        descriptor.SetSecurityDescriptorDacl(True, perms._private_dacl(directory=False), False)
+        descriptor.SetSecurityDescriptorControl(
+            win32security.SE_DACL_PROTECTED, win32security.SE_DACL_PROTECTED)
+    except pywintypes.error as exc:
+        raise as_oserror(exc, directory) from None
+    for _ in range(tempfile.TMP_MAX):
+        path = os.path.join(directory, prefix + secrets.token_hex(8) + suffix)
+        try:
+            handle = win32file.CreateFile(
+                path, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE
+                | win32file.FILE_SHARE_DELETE,
+                attributes, win32file.CREATE_NEW, win32file.FILE_ATTRIBUTE_NORMAL, None)
+        except pywintypes.error as exc:
+            if exc.winerror in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS):
+                continue
+            if exc.winerror == _ERROR_ACCESS_DENIED and os.path.isdir(path):
+                continue  # the name is taken by a directory
+            raise as_oserror(exc, path) from None
+        raw = handle.Detach()
+        try:
+            return msvcrt.open_osfhandle(raw, os.O_RDWR | os.O_BINARY), path
+        except BaseException:
+            win32api.CloseHandle(raw)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+    raise FileExistsError(errno.EEXIST, "No usable temporary file name found", directory)
 
 
 def pread(fd: int, length: int, offset: int) -> bytes:

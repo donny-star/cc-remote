@@ -19,6 +19,8 @@ import time
 from typing import Callable, Literal
 from uuid import uuid4
 
+from cc_remote.platform import files as platform_files
+
 
 _WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
 _MAX_ENTRIES = 4096
@@ -672,12 +674,8 @@ class SessionPresentationStore:
                 except OSError:
                     pass
                 raise
-            os.replace(tmp, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.replace(tmp, self.path)
+            platform_files.fsync_directory(self.path.parent)
         except Exception as exc:
             try:
                 tmp.unlink()
