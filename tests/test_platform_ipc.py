@@ -118,6 +118,28 @@ def test_ensure_private_directory_creates_nothing_outside_the_profile(tmp_path, 
     assert not (tmp_path / "outside").exists()
 
 
+@pytest.mark.windows_only(reason="Windows directories inherit their parent's ACEs")
+def test_ensure_private_directory_privatizes_only_a_directory_it_created(tmp_path, monkeypatch):
+    parent = tmp_path / "shared-parent"
+    parent.mkdir()
+    share_with_everyone(parent, inheritable=True)
+    existing = parent / "existing"
+    existing.mkdir()
+    assert not perms.is_private(existing)  # the inheritable grant reached it
+    # Python < 3.13 ignores mkdir's mode on Windows; 3.13 maps 0o700 to a
+    # private ACL. Drop the mode so every supported version is exercised.
+    real_mkdir = Path.mkdir
+    monkeypatch.setattr(Path, "mkdir", lambda self, mode=0o777, parents=False, exist_ok=False:
+                        real_mkdir(self, parents=parents, exist_ok=exist_ok))
+
+    created = ipc.ensure_private_directory(parent / "created")
+    assert perms.is_private(created)
+    with pytest.raises(ipc.UnsafeEndpointError, match="must not be accessible by other users"):
+        ipc.ensure_private_directory(existing)
+    assert not perms.is_private(existing)  # a pre-existing directory is never rewritten
+    assert not perms.is_private(parent)
+
+
 @pytest.mark.windows_only(reason="the profile root comes from the process token")
 def test_profile_directory_translates_pywin32_errors(monkeypatch):
     import pywintypes
@@ -236,6 +258,27 @@ def test_write_endpoint_never_replaces_an_existing_record(tmp_path):
         ipc.write_endpoint(path, _endpoint(port=1))
     assert ipc.read_endpoint(path) == _endpoint()
     assert [entry.name for entry in directory.iterdir()] == ["service.sock"]
+
+
+@windows_records
+def test_write_endpoint_cleanup_failure_never_masks_the_original_error(tmp_path, monkeypatch):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    path = directory / "service.sock"
+    ipc.write_endpoint(path, _endpoint())
+    real_unlink = Path.unlink
+    attempts = []
+
+    def unlink(self, missing_ok=False):
+        if self.name.endswith(".tmp"):
+            attempts.append(self)
+            raise PermissionError(errno.EACCES, "held by a scanner", str(self))
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(ipc.AlreadyRunningError, match="already running"):
+        ipc.write_endpoint(path, _endpoint(port=1))
+    assert len(attempts) == 1
+    assert ipc.read_endpoint(path) == _endpoint()
 
 
 @windows_records
@@ -687,10 +730,9 @@ async def test_reclaim_removes_a_record_whose_port_is_closed(endpoint_path, monk
 
 @windows_reclaim
 @pytest.mark.asyncio
-async def test_reclaim_refuses_a_live_owner_whose_full_backlog_refuses(endpoint_path, monkeypatch):
+async def test_reclaim_refuses_a_live_owner_whose_full_backlog_refuses(endpoint_path):
     # A stalled server with a full backlog refuses like a closed port (~2 s on
     # Windows); while its owner runs, that must not hand the endpoint over.
-    refusals = _spy_refusals(monkeypatch)
     stalled = socket.socket()
     stalled.bind(("127.0.0.1", 0))
     stalled.listen(1)
@@ -703,7 +745,8 @@ async def test_reclaim_refuses_a_live_owner_whose_full_backlog_refuses(endpoint_
     finally:
         filler.close()
         stalled.close()
-    assert refusals
+    # Client editions refuse on a full backlog; Server editions may accept on a
+    # dynamic backlog and then fail the handshake. Either way it is unverifiable.
     assert ipc.read_endpoint(endpoint_path).port == port
 
 
@@ -731,6 +774,17 @@ async def test_reclaim_of_a_dead_owner_does_not_wait_for_the_refusal(endpoint_pa
     started = loop.time()
     await ipc._reclaim_windows(endpoint_path)
     assert loop.time() - started < 1.5
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_retries_a_sharing_violation_on_the_stale_record(endpoint_path, monkeypatch):
+    _record(endpoint_path, _closed_port(), os.urandom(32), pid=_dead_pid(), start_time=1)
+    calls = _fail_endpoint_unlink(monkeypatch, endpoint_path, [
+        OSError(errno.EACCES, "sharing violation", None, 32)])
+    await ipc._reclaim_windows(endpoint_path)
+    assert len(calls) == 2
     assert not endpoint_path.exists()
 
 
@@ -1374,7 +1428,8 @@ async def test_start_over_a_dead_owners_silent_port_fits_the_readiness_budget(en
     try:
         started = loop.time()
         async with await ipc.start_server(endpoint_path, _echo):
-            assert loop.time() - started < 3.0
+            # A dead owner's silent port costs one handshake timeout, no more.
+            assert loop.time() - started < ipc.HANDSHAKE_TIMEOUT + 0.5
             assert await _ping(endpoint_path) == b"PING"
     finally:
         await _stop(listener)
@@ -1447,6 +1502,23 @@ async def test_close_stops_listening_before_raising_a_withdrawal_failure(
     assert not server.is_serving()
     with pytest.raises(OSError):
         socket.create_connection(("127.0.0.1", port), timeout=3).close()
+    await asyncio.wait_for(server.wait_closed(), 2)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_close_retries_the_withdrawal_after_a_failed_close(endpoint_path, monkeypatch):
+    server = await ipc.start_server(endpoint_path, _echo)
+    calls = _fail_endpoint_unlink(monkeypatch, endpoint_path, [
+        OSError(errno.EACCES, "access denied", None, 5)])
+    with pytest.raises(PermissionError, match="access denied"):
+        server.close()
+    assert endpoint_path.exists()
+    server.close()
+    assert len(calls) == 2
+    assert not endpoint_path.exists()
+    server.close()  # withdrawn once; nothing left to retry
+    assert len(calls) == 2
     await asyncio.wait_for(server.wait_closed(), 2)
 
 

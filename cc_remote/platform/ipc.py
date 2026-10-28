@@ -77,7 +77,16 @@ def ensure_private_directory(path: StrPath) -> Path:
         # Refuse before mkdir so a rejected path leaves nothing behind.
         raise UnsafeEndpointError("directory must be inside the current user's profile")
     try:
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            created = False
+        if IS_WINDOWS and created:
+            # A new directory inherits its parent's ACEs; mode bits mean nothing
+            # here. Only a directory created just now is ever rewritten.
+            perms.make_private(directory, directory=True)
     except OSError as exc:
         raise UnsafeEndpointError(f"directory cannot be prepared: {exc}") from exc
     if IS_WINDOWS:
@@ -231,7 +240,8 @@ def write_endpoint(path: StrPath, endpoint: Endpoint) -> tuple[int, int]:
             os.close(fd)
         _publish(temporary, target)
     except BaseException:
-        with contextlib.suppress(FileNotFoundError):
+        # Never let a cleanup failure mask the original error.
+        with contextlib.suppress(OSError):
             temporary.unlink()
         raise
     return info.st_dev, info.st_ino
@@ -464,8 +474,7 @@ async def _reclaim_windows(target: Path) -> None:
     if current != endpoint:
         raise UnsafeEndpointError(
             f"cannot verify the existing endpoint at {target}: it changed while probing")
-    with contextlib.suppress(FileNotFoundError):
-        target.unlink()
+    _withdraw(target)
 
 
 @contextlib.asynccontextmanager
@@ -474,8 +483,8 @@ async def _start_lock(target: Path):
 
     Precondition: the directory is already private (call only after
     ``ensure_private_directory``). The lock file carries no secret and simply
-    inherits the directory's ACL. It is never removed: deleting it would let a third starter lock
-    a fresh file while the second still holds the old one.
+    inherits the directory's ACL. It is never removed: deleting it would let a
+    third starter lock a fresh file while the second still holds the old one.
     """
     fd = files.open_nofollow(target.with_name(target.name + ".lock"),
                              os.O_RDWR | os.O_CREAT, 0o600)
@@ -526,13 +535,14 @@ class IpcServer:
 
         Withdrawing first means the recorded port is never released while the
         record still names it and its owner is alive. The listener stops even
-        when withdrawing fails; that failure is raised afterwards.
+        when withdrawing fails; that failure is raised afterwards, and a later
+        ``close()`` retries the withdrawal.
         """
         try:
             if not self._removed:
-                self._removed = True
                 if self._still_ours():
                     _withdraw(self._path)
+                self._removed = True
         finally:
             self._server.close()
 
@@ -598,7 +608,12 @@ async def start_server(path: StrPath, handler: Handler, *,
 async def open_connection(path: StrPath, *, limit: int = DEFAULT_LIMIT,
                           timeout: float = HANDSHAKE_TIMEOUT,
                           ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Connect to a same-user server; the returned streams are authenticated."""
+    """Connect to a same-user server; the returned streams are authenticated.
+
+    On Windows ``timeout`` bounds the TCP connect and then, separately, the
+    HMAC handshake, so a call may take up to twice ``timeout`` in the worst
+    case. On POSIX it bounds the connect; there is no handshake.
+    """
     target = Path(path).expanduser().absolute()
     if IS_WINDOWS:
         return await _windows_open(target, limit, timeout)
