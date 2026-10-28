@@ -1013,9 +1013,13 @@ async def test_a_failed_endpoint_withdrawal_still_closes_clients_and_sessions(
             await asyncio.wait_for(server.close(), 5)
         assert await _read_to_eof(reader) == b""
         assert manager_closes == [0]
-        assert socket_path.exists()  # the record is still published...
-        await asyncio.wait_for(server.close(), 5)  # ...so the retry withdraws it
-        assert len(withdrawals) == 2
+        if IS_WINDOWS:
+            assert socket_path.exists()  # the record is still published...
+            await asyncio.wait_for(server.close(), 5)  # ...so the retry withdraws it
+            assert len(withdrawals) == 2
+        else:
+            # asyncio unlinks its own Unix socket when the listener closes.
+            await asyncio.wait_for(server.close(), 5)
         assert not socket_path.exists()
     finally:
         writer.close()
