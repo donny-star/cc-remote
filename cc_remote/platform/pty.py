@@ -348,6 +348,8 @@ class _WindowsPty(PtyProcess):
         self._reader_done: asyncio.Future[None] | None = None
         self._returncode: int | None = None
         self._write_lock = asyncio.Lock()
+        # Settled by close(): an abandoned write no longer holds the lock.
+        self._released: asyncio.Future[None] | None = None
         # Opened while pywinpty still holds the child's handle, so the pid is
         # this child; the handle in turn keeps the pid from being reused.
         self._process = _process_handle(self.pid)
@@ -472,13 +474,20 @@ class _WindowsPty(PtyProcess):
             text = self._decoder.decode(data)
             if not text:
                 return  # an incomplete UTF-8 sequence waits for its next bytes
+            if self._released is None:
+                self._released = asyncio.get_running_loop().create_future()
+                if self._closed:
+                    self._released.set_result(None)
             # The worker thread cannot be stopped: a cancelled caller keeps the
             # lock until it finished, so the next write cannot overtake it.
-            writing = asyncio.ensure_future(asyncio.to_thread(self._terminal.write, text))
+            # Once close() released the console there is no order left to
+            # keep, and a write the console never takes is abandoned.
+            writing = _in_daemon_thread(
+                self._terminal.write, text, name=f"conpty-write-{self.pid}")
             try:
                 await asyncio.shield(writing)
             except asyncio.CancelledError:
-                await _outlast(writing)
+                await _outlast(writing, self._released)
                 raise
             except Exception as exc:  # WinptyError
                 raise OSError(f"ConPTY write failed: {exc}") from exc
@@ -520,6 +529,8 @@ class _WindowsPty(PtyProcess):
     def close(self) -> None:
         self._reading = False
         self._stop.set()
+        if self._released is not None and not self._released.done():
+            self._released.set_result(None)
         if self._closed:
             return
         self._closed = True
@@ -584,15 +595,60 @@ class _ClosedTerminal:
         raise OSError("pseudo console is closed")
 
 
-async def _outlast(future: asyncio.Future[Any]) -> None:
-    """Wait for ``future`` to finish, however often the waiter is cancelled."""
-    while not future.done():
+async def _outlast(future: asyncio.Future[Any],
+                   released: asyncio.Future[None] | None = None) -> None:
+    """Wait for ``future`` to finish, however often the waiter is cancelled.
+
+    A settled ``released`` ends the wait early; ``future`` then finishes
+    unobserved.
+    """
+    waits = {future} if released is None else {future, released}
+    while not future.done() and not (released is not None and released.done()):
         try:
-            await asyncio.wait({future})
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             pass
+    if future.done():
+        _retrieve(future)  # the caller reports its cancellation instead
+    else:
+        future.add_done_callback(_retrieve)
+
+
+def _retrieve(future: asyncio.Future[Any]) -> None:
     if not future.cancelled():
-        future.exception()  # retrieved: the caller reports its cancellation instead
+        future.exception()
+
+
+def _in_daemon_thread(func: Callable[..., Any], *args: Any, name: str) -> asyncio.Future[Any]:
+    """Run ``func(*args)`` on a thread of its own, settling the returned future.
+
+    ``asyncio.run`` and interpreter exit both join default-executor threads, so
+    a call that never returns (a console that never takes its input) must not
+    run on one: it would keep the process from ever exiting.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def settle(result: Any, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is None:
+            future.set_result(result)
+        else:
+            future.set_exception(error)
+
+    def run() -> None:
+        try:
+            result, error = func(*args), None
+        except BaseException as exc:  # handed to whoever awaits the future
+            result, error = None, exc
+        try:
+            loop.call_soon_threadsafe(settle, result, error)
+        except RuntimeError:  # the loop already closed; nobody is listening
+            pass
+
+    threading.Thread(target=run, name=name, daemon=True).start()
+    return future
 
 
 def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | None,

@@ -535,6 +535,85 @@ async def test_a_cancelled_write_still_precedes_the_next_one():
         terminal.close()
 
 
+@pytest.mark.windows_only(reason="ConPTY writes run on worker threads")
+@pytest.mark.asyncio
+async def test_close_releases_a_cancelled_write_stuck_on_the_console():
+    console = _FakeConPty()
+    started = threading.Event()
+    release = threading.Event()
+    daemons: list[bool] = []
+
+    def stuck_write(text: str) -> int:
+        daemons.append(threading.current_thread().daemon)
+        started.set()
+        release.wait(30)
+        return 0
+
+    console.write = stuck_write
+    terminal = pty._WindowsPty(console)
+    try:
+        writing = asyncio.create_task(terminal.write(b"a"))
+        assert await asyncio.to_thread(started.wait, 5)
+        writing.cancel()
+        await asyncio.sleep(0.2)
+        assert not writing.done()  # still ordered ahead of any later write
+        terminal.close()  # the console is gone: nothing is left to order
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(writing, 2)
+        # Never a default-executor thread: asyncio.run and interpreter exit
+        # would both wait for it.
+        assert daemons == [True]
+    finally:
+        release.set()
+        terminal.close()
+
+
+_STUCK_WRITE_SHUTDOWN = r"""
+import asyncio, os, sys, threading
+sys.path.insert(0, sys.argv[1])
+from cc_remote.platform import pty
+
+class Console:
+    pid = os.getpid()
+    def isalive(self): return True
+    def get_exitstatus(self): return None
+    def cancel_io(self): return False
+    def read(self, blocking=False):
+        threading.Event().wait(0.01)
+        return ""
+    def write(self, text):
+        threading.Event().wait()  # a console that never takes the input
+
+async def main():
+    terminal = pty._WindowsPty(Console())
+    # Abandoned like PTYSession.close abandons its writer past the bound.
+    writer = asyncio.ensure_future(terminal.write(b"x"))
+    await asyncio.sleep(0.2)
+    writer.cancel()
+    await asyncio.wait({writer}, timeout=0.2)
+    terminal.close()
+    print("closed", flush=True)
+
+asyncio.run(main())
+print("finished", flush=True)
+"""
+
+
+@pytest.mark.windows_only(reason="ConPTY writes run on worker threads")
+def test_a_stuck_console_write_does_not_hold_up_process_exit():
+    child = subprocess.Popen(
+        [sys.executable, "-c", _STUCK_WRITE_SHUTDOWN, str(ROOT)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        output, _ = child.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        output, _ = child.communicate()
+        pytest.fail(f"process exit waited for the stuck write: {output!r}")
+    assert child.returncode == 0, output
+    assert output.split() == ["closed", "finished"]
+
+
 _NTSTATUS_EXIT = "import os; os._exit(-1073741510)"  # STATUS_CONTROL_C_EXIT
 
 
