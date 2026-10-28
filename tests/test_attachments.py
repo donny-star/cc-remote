@@ -188,6 +188,9 @@ def test_turn_temp_directory_is_removed_when_query_fails():
 def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
+    # Children inherit foreign read unless restricted, so the privacy
+    # assertion below cannot pass by inheritance from a private tmp_path.
+    foreign_readable_dir(workspace)
 
     class FailingSdk:
         effort = "high"
