@@ -1435,3 +1435,177 @@ def test_control_store_round_trips_privately_and_rejects_a_shared_file(tmp_path:
     share_with_everyone(path)
     with pytest.raises(broker_session_module.ControlStoreError, match="not a private"):
         broker_session_module.ControlStore(str(path)).load()
+
+
+@pytest.mark.asyncio
+async def test_cli_keyboard_attachment_forwards_piped_stdin(monkeypatch: pytest.MonkeyPatch):
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"typed")
+    os.close(write_fd)
+    received = bytearray()
+    typed = asyncio.Event()
+
+    class Attachment:
+        keyboard = True
+
+        def __init__(self):
+            self.closed = False
+
+        async def read(self):
+            await typed.wait()
+            return FrameType.EXIT, {"returncode": 5}
+
+        async def write(self, data):
+            received.extend(data)
+            if bytes(received) == b"typed":
+                typed.set()
+
+        async def resize(self, *_args):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    attachment = Attachment()
+
+    class Client:
+        async def attach(self, _session_id, *, keyboard=True):
+            assert keyboard is True
+            return attachment
+
+    class Stream:
+        def __init__(self, fd):
+            self.fd = fd
+
+        def fileno(self):
+            return self.fd
+
+    monkeypatch.setattr(broker_cli, "_write_all", lambda _fd, _data: None)
+    monkeypatch.setattr(broker_cli.sys, "stdin", Stream(read_fd))
+    monkeypatch.setattr(broker_cli.sys, "stdout", Stream(1))
+    try:
+        result = await broker_cli._interactive_attach(
+            Client(), "11111111-1111-4111-8111-111111111111", keyboard=True)
+    finally:
+        os.close(read_fd)
+    assert result == 5
+    assert bytes(received) == b"typed"
+    assert attachment.closed is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_broker_starts_one_detached_private_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    started = []
+
+    def popen_group(args, **kwargs):
+        started.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(broker_cli.procs, "popen_group", popen_group)
+
+    class Client:
+        attempts = 0
+
+        async def status(self):
+            Client.attempts += 1
+            if Client.attempts == 1:
+                raise BrokerClientError("broker_unavailable", "not running")
+            return {"ok": True}
+
+    socket_path = tmp_path / "broker" / "claude-broker.sock"
+    await broker_cli._ensure_broker(Client(), str(socket_path))
+    assert perms.is_private(socket_path.parent)
+    assert len(started) == 1
+    args, kwargs = started[0]
+    assert args[1:] == ["-m", "cc_remote.claude_remote", "--socket", str(socket_path), "serve"]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == broker_cli.pty.DETACHED_CREATIONFLAGS
+    assert (socket_path.parent / "claude-broker.log").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["exit", "detach", "error", "cancel"])
+async def test_cli_attach_closes_its_one_input_reader_before_leaving_raw_mode(
+    monkeypatch: pytest.MonkeyPatch, ending: str,
+):
+    events: list[str] = []
+    remote_done = asyncio.Event()
+    reading = asyncio.Event()
+
+    class RawTerminal:
+        def __init__(self, _stdin_fd, _stdout_fd, *, keyboard):
+            assert keyboard is True
+
+        def __enter__(self):
+            events.append("raw")
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("restored")
+
+    class InputReader:
+        def __init__(self, _fd):
+            events.append("reader")
+
+        async def read(self):
+            reading.set()
+            if ending == "detach":
+                return b""
+            await asyncio.Future()
+
+        def close(self):
+            events.append("reader-closed")
+
+    class Attachment:
+        keyboard = True
+
+        async def read(self):
+            await reading.wait()
+            if ending == "exit":
+                return FrameType.EXIT, {"returncode": 3}
+            if ending == "error":
+                return FrameType.ERROR, {"error": {"code": "boom", "message": "lost"}}
+            await remote_done.wait()
+
+        async def write(self, _data):
+            return None
+
+        async def resize(self, *_args):
+            return None
+
+        async def close(self):
+            events.append("detached")
+
+    class Client:
+        async def attach(self, _session_id, *, keyboard=True):
+            return Attachment()
+
+    class Stream:
+        def __init__(self, fd):
+            self.fd = fd
+
+        def fileno(self):
+            return self.fd
+
+    monkeypatch.setattr(broker_cli.pty, "RawTerminal", RawTerminal)
+    monkeypatch.setattr(broker_cli.pty, "InputReader", InputReader)
+    monkeypatch.setattr(broker_cli.os, "isatty", lambda _fd: False)
+    monkeypatch.setattr(broker_cli.sys, "stdin", Stream(0))
+    monkeypatch.setattr(broker_cli.sys, "stdout", Stream(1))
+    attach = asyncio.create_task(broker_cli._interactive_attach(
+        Client(), "11111111-1111-4111-8111-111111111111", keyboard=True))
+    if ending == "exit":
+        assert await attach == 3
+    elif ending == "detach":
+        assert await attach == 0
+    elif ending == "error":
+        with pytest.raises(BrokerClientError, match="lost"):
+            await attach
+    else:
+        await reading.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+    assert events == ["reader", "raw", "reader-closed", "restored", "detached"]
