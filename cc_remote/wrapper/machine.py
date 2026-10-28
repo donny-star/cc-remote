@@ -221,6 +221,7 @@ from cc_remote.wrapper.codex_daemon import (
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.platform import files as platform_files
+from cc_remote.platform.dirs import DirHandle
 from cc_remote.platform.identity import current_euid, current_uid
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from cc_remote.wrapper.claude_broker_history import (
@@ -26417,25 +26418,18 @@ class WrapperMachine:
         if relative in ("", "."):
             raise ValueError("预览目标必须是普通文件")
         parts = relative.split(os.sep)
-        file_flags = os.O_RDONLY
-        file_flags |= getattr(os, "O_CLOEXEC", 0)
-        file_flags |= getattr(os, "O_NONBLOCK", 0)
-        file_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_flags = os.O_RDONLY
-        dir_flags |= getattr(os, "O_CLOEXEC", 0)
-        dir_flags |= getattr(os, "O_DIRECTORY", 0)
-        dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_fd: Optional[int] = None
+        directory: Optional[DirHandle] = None
         try:
             # Walk from an already-open cwd and refuse symlinks at every hop.
             # This closes the realpath/open race where a parent directory could
             # otherwise be replaced by an escaping symlink between both calls.
-            dir_fd = os.open(access_root, dir_flags)
+            directory = DirHandle.open_root(access_root)
             for part in parts[:-1]:
-                next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
-                os.close(dir_fd)
-                dir_fd = next_fd
-            fd = os.open(parts[-1], file_flags, dir_fd=dir_fd)
+                child = directory.open_dir(part)
+                directory.close()
+                directory = child
+            fd = directory.open_file(
+                parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError as exc:
             raise ValueError("文件不存在") from exc
         except PermissionError as exc:
@@ -26443,8 +26437,8 @@ class WrapperMachine:
         except OSError as exc:
             raise ValueError("无法打开该文件") from exc
         finally:
-            if dir_fd is not None:
-                os.close(dir_fd)
+            if directory is not None:
+                directory.close()
 
         try:
             file_stat = os.fstat(fd)
@@ -26790,8 +26784,8 @@ class WrapperMachine:
     ) -> tuple[str, int, int, str]:
         """CAS-style atomic save for one existing Markdown regular file.
 
-        Every path component is opened relative to an already-open cwd with
-        ``O_NOFOLLOW``. The replacement is written and fsynced in the same
+        Every path component is opened relative to an already-open cwd without
+        following links. The replacement is written and fsynced in the same
         directory, then renamed over the file only after a second revision
         check. Existing UTF-8 BOM, dominant LF/CRLF style, and mode bits are
         preserved.
@@ -26828,20 +26822,13 @@ class WrapperMachine:
         if relative in ("", ".") or any(part in ("", ".", "..") for part in parts):
             raise ValueError("保存路径无效")
 
-        dir_flags = os.O_RDONLY
-        dir_flags |= getattr(os, "O_CLOEXEC", 0)
-        dir_flags |= getattr(os, "O_DIRECTORY", 0)
-        dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-        file_flags = os.O_RDONLY
-        file_flags |= getattr(os, "O_CLOEXEC", 0)
-        file_flags |= getattr(os, "O_NONBLOCK", 0)
-        file_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_fd: Optional[int] = None
+        directory: Optional[DirHandle] = None
         temp_name: Optional[str] = None
 
         def read_current() -> tuple[bytes, os.stat_result, str]:
             try:
-                fd = os.open(parts[-1], file_flags, dir_fd=dir_fd)
+                fd = directory.open_file(
+                    parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
             except FileNotFoundError as exc:
                 raise ValueError("文件不存在") from exc
             except PermissionError as exc:
@@ -26889,14 +26876,14 @@ class WrapperMachine:
                 )
 
         try:
-            dir_fd = os.open(root, dir_flags)
+            directory = DirHandle.open_root(root)
             for part in parts[:-1]:
                 try:
-                    next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
+                    child = directory.open_dir(part)
                 except OSError as exc:
                     raise ValueError("保存路径不能包含符号链接") from exc
-                os.close(dir_fd)
-                dir_fd = next_fd
+                directory.close()
+                directory = child
 
             original, original_stat, original_revision = read_current()
             if (
@@ -26924,10 +26911,8 @@ class WrapperMachine:
                 raise ValueError("保存内容超过 512 KiB 限制")
 
             temp_name = f".cc-remote-{uuid4().hex}.tmp"
-            temp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            temp_flags |= getattr(os, "O_CLOEXEC", 0)
-            temp_flags |= getattr(os, "O_NOFOLLOW", 0)
-            temp_fd = os.open(temp_name, temp_flags, 0o600, dir_fd=dir_fd)
+            temp_fd = directory.open_file(
+                temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 view = memoryview(payload)
                 written = 0
@@ -26940,15 +26925,10 @@ class WrapperMachine:
 
             _, latest_stat, latest_revision = read_current()
             require_expected(latest_stat, latest_revision)
-            os.replace(
-                temp_name,
-                parts[-1],
-                src_dir_fd=dir_fd,
-                dst_dir_fd=dir_fd,
-            )
+            directory.replace(temp_name, parts[-1])
             temp_name = None
-            os.fsync(dir_fd)
-            saved_stat = os.stat(parts[-1], dir_fd=dir_fd, follow_symlinks=False)
+            directory.fsync()
+            saved_stat = directory.lstat(parts[-1])
             return (
                 display_path,
                 saved_stat.st_size,
@@ -26956,13 +26936,13 @@ class WrapperMachine:
                 hashlib.sha256(payload).hexdigest(),
             )
         finally:
-            if temp_name is not None and dir_fd is not None:
+            if temp_name is not None and directory is not None:
                 try:
-                    os.unlink(temp_name, dir_fd=dir_fd)
+                    directory.unlink(temp_name)
                 except FileNotFoundError:
                     pass
-            if dir_fd is not None:
-                os.close(dir_fd)
+            if directory is not None:
+                directory.close()
 
     @classmethod
     def _read_markdown_preview(

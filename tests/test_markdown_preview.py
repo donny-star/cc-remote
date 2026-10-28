@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import stat
-import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -1187,6 +1186,7 @@ def test_concurrent_preview_revokes_preserve_unrelated_grants(tmp_path):
         "claude", "code", "session-2")
 
 
+@pytest.mark.requires_symlink(reason="the fixture plants a symbolic link lock file")
 def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -1194,12 +1194,7 @@ def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     target.write_text("do not touch", encoding="utf-8")
     target.chmod(0o640)
     before = target.stat().st_mode & 0o777
-    try:
-        (state / ".preview-capabilities.lock").symlink_to(target)
-    except OSError as exc:
-        if sys.platform == "win32":
-            pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
-        raise
+    (state / ".preview-capabilities.lock").symlink_to(target)
 
     store = PreviewCapabilityStore(state)
 
@@ -1617,13 +1612,13 @@ def test_external_diff_never_reopens_capability_checked_path(
             return
         try:
             os.replace(replacement, outside)
-        except OSError:
+        except OSError as exc:
             # Windows denies replacing a path while another descriptor holds
-            # it open without share-delete, so the race this test injects
-            # cannot land there at all. That is consistent with (and even
-            # stronger than) the invariant under test: the read snapshot is
-            # never affected by a racing replace.
-            if sys.platform != "win32":
+            # it open without share-delete (ERROR_SHARING_VIOLATION) or while
+            # the target is pinned (ERROR_ACCESS_DENIED), so the race this test
+            # injects cannot land there at all. That is consistent with (and
+            # even stronger than) the invariant under test.
+            if getattr(exc, "winerror", None) not in (32, 5):
                 raise
         replaced = True
 
@@ -1708,6 +1703,7 @@ def test_external_binary_diff_never_decodes_capability_snapshot(tmp_path):
     assert "PRIVATE_BINARY_PAYLOAD" not in diff
 
 
+@pytest.mark.posix_only(reason="named pipes (os.mkfifo) only exist on POSIX file systems")
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):
     fifo = tmp_path / "pipe.md"
     os.mkfifo(fifo)

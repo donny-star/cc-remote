@@ -793,6 +793,7 @@ def test_get_diff_with_explicit_unknown_sid_never_reads_focused_repo():
     asyncio.run(run())
 
 
+@pytest.mark.posix_only(reason="named pipes (os.mkfifo) only exist on POSIX file systems")
 def test_diff_rejects_untracked_fifo_without_opening_it(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
