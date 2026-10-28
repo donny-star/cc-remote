@@ -494,12 +494,18 @@ def process_command(
 def _environment_value(
     environment: tuple[bytes, ...],
     key: str,
+    *,
+    fold_case: bool = False,
 ) -> tuple[bool, str | None]:
     prefix = os.fsencode(key) + b"="
+    if fold_case:
+        # Windows variable names are case-insensitive (``Path`` is ``PATH``).
+        prefix = prefix.upper()
     values = [
         value[len(prefix):]
         for value in environment
-        if value.startswith(prefix)
+        if (value[:len(prefix)].upper() == prefix if fold_case
+            else value.startswith(prefix))
     ]
     if len(values) > 1:
         return False, None
@@ -544,7 +550,7 @@ def process_command_environment_value(
         environment = tuple(os.fsencode(item) for item in params[1])
         if sum(len(item) + 1 for item in environment) > MAX_ENVIRON_BYTES:
             return False, None, None
-        complete, value = _environment_value(environment, key)
+        complete, value = _environment_value(environment, key, fold_case=True)
         return complete, args, value
     proc_dir = Path(proc_root) / str(identity.pid)
     stat = _process_stat(proc_dir)

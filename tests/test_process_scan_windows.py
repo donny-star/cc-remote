@@ -148,3 +148,24 @@ def test_cwds_are_incomplete_when_a_live_process_hides_them(
     monkeypatch.setattr(win32_process, "access_denied", lambda pid: pid == 300)
     assert process_scan.win32_process_cwds([300]) == ({}, False)
     assert process_scan.win32_process_cwds([301]) == ({}, True)
+
+
+@pytest.mark.windows_only(reason="Windows environment variable names are case-insensitive")
+def test_environment_value_matches_names_case_insensitively(
+        fake_processes, monkeypatch) -> None:
+    from cc_remote.platform import win32_process
+
+    table, _parents = fake_processes
+    table[100] = (10, (b"codex.exe",))
+    environment = ("Path=C:\\Windows", "Codex_Home=C:\\profiles\\stack")
+    monkeypatch.setattr(
+        win32_process, "process_parameters",
+        lambda pid: ("C:\\work", environment) if pid == 100 else None)
+    identity = process_scan.ProcessIdentity(100, 10)
+    assert process_scan.process_command_environment_value(identity, "CODEX_HOME") == (
+        True, (b"codex.exe",), "C:\\profiles\\stack")
+    assert process_scan.process_environment_value(identity, "codex_home") == (
+        True, "C:\\profiles\\stack")
+    environment = ("CODEX_HOME=C:\\a", "codex_home=C:\\b")
+    assert process_scan.process_environment_value(identity, "CODEX_HOME") == (
+        False, None)
