@@ -38481,7 +38481,7 @@ class WrapperMachine:
                             "Work uploads path conflicts with workspace content")
                 finally:
                     os.close(marker_fd)
-                platform_files.fchmod(uploads.fd, uploads.path, 0o700)
+                uploads.make_private()
 
                 uploads.mkdir(msg_id, 0o700)
                 message = uploads.open_dir(msg_id)
@@ -38492,7 +38492,7 @@ class WrapperMachine:
                         message.fd, message_info, effective=True)
                 ):
                     raise RuntimeError("Work message upload path is unsafe")
-                platform_files.fchmod(message.fd, message.path, 0o700)
+                message.make_private()
             except OSError as exc:
                 raise RuntimeError("Work upload directory is unsafe") from exc
             yield str(Path(cwd) / "uploads" / msg_id), message

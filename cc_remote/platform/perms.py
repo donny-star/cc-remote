@@ -59,6 +59,30 @@ def make_private_fd(fd: int) -> None:
             handle.Close()
 
 
+def make_private_dir_fd(fd: int) -> None:
+    """Restrict an open directory to its owner through its descriptor.
+
+    POSIX is ``os.fchmod(fd, 0o700)``. On Windows the descriptor's handle
+    must already carry WRITE_DAC, because ReOpenFile refuses directories
+    (:meth:`cc_remote.platform.dirs.DirHandle.make_private` opens one); it
+    gets a protected current-user + SYSTEM DACL that new children inherit.
+    Failures raise ``OSError``.
+    """
+    if not IS_WINDOWS:
+        os.fchmod(fd, 0o700)
+        return
+    import msvcrt
+
+    import win32security
+
+    with translated():
+        win32security.SetSecurityInfo(
+            msvcrt.get_osfhandle(fd), win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, _private_dacl(directory=True), None)
+
+
 def copy_security_fd(src_fd: int, dst_fd: int) -> None:
     """Give ``dst_fd``'s file the access control of ``src_fd``'s file.
 

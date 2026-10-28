@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from cc_remote.platform import files
+from cc_remote.platform import files, perms
 from cc_remote.platform.dirs import DirHandle
 
 
@@ -169,6 +169,21 @@ def test_fstat_identity_is_stable(tmp_path) -> None:
     with DirHandle.open_root(tmp_path) as first, DirHandle.open_root(tmp_path) as second:
         a, b = os.fstat(first.fd), os.fstat(second.fd)
         assert (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def test_make_private_restricts_an_existing_directory(tmp_path) -> None:
+    from tests.platform_assertions import assert_private_dir, foreign_readable_dir
+
+    target = tmp_path / "loose"
+    target.mkdir()
+    foreign_readable_dir(target)
+    with DirHandle.open_root(tmp_path) as root, root.open_dir("loose") as loose:
+        loose.make_private()
+        loose.make_private()  # already private: unchanged
+    assert_private_dir(target)
+    if sys.platform == "win32":  # POSIX children get their own creation mode
+        (target / "new.txt").write_bytes(b"x")
+        assert perms.is_private(target / "new.txt")
 
 
 @pytest.mark.windows_only(reason="POSIX dir_fd resolves children against the descriptor")

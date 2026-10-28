@@ -30,7 +30,7 @@ import warnings
 from os import PathLike
 from typing import Iterator
 
-from cc_remote.platform import IS_WINDOWS, files
+from cc_remote.platform import IS_WINDOWS, files, perms
 
 StrPath = str | PathLike[str]
 
@@ -83,7 +83,7 @@ def _win32_private_path(handle: int) -> str:
     return "\\\\?\\" + path
 
 
-def _win32_open_directory(path: str) -> tuple[int, str]:
+def _win32_open_directory(path: str, *, write_dac: bool = False) -> tuple[int, str]:
     """Open and pin a directory; return ``(fd, private path)``."""
     import ctypes
     import msvcrt
@@ -92,11 +92,13 @@ def _win32_open_directory(path: str) -> tuple[int, str]:
     file_list_directory, file_read_attributes = 0x1, 0x80
     read_control, synchronize = 0x00020000, 0x00100000
     share_read_write = 0x1 | 0x2  # no FILE_SHARE_DELETE: pins the directory
-    open_existing, backup_semantics = 3, 0x02000000
+    open_existing, backup_semantics, write_dac_access = 3, 0x02000000, 0x00040000
+    access = file_list_directory | file_read_attributes | read_control | synchronize
+    if write_dac:
+        access |= write_dac_access
     kernel32 = files._kernel32()
     handle = kernel32.CreateFileW(
-        path, file_list_directory | file_read_attributes | read_control | synchronize,
-        share_read_write, None, open_existing,
+        path, access, share_read_write, None, open_existing,
         backup_semantics | files._FILE_FLAG_OPEN_REPARSE_POINT, None)
     if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -196,6 +198,30 @@ class DirHandle:
             os.mkdir(self._os_child(name), mode)
         else:
             os.mkdir(name, mode, dir_fd=self.fd)
+
+    def make_private(self) -> None:
+        """Restrict this directory to its owner without the caller's path.
+
+        POSIX is ``os.fchmod(fd, 0o700)``. Windows cannot reopen a directory
+        handle with WRITE_DAC, so unless the directory is already private it
+        opens the pinned private path again, checks that this is the same
+        directory, and sets the protected owner-only DACL through that
+        handle. Skipping a private directory avoids re-propagating the DACL
+        to every child.
+        """
+        if not IS_WINDOWS:
+            perms.make_private_dir_fd(self.fd)
+            return
+        if perms.is_private_fd(self.fd):
+            return
+        fd, _ = _win32_open_directory(self._os_path, write_dac=True)
+        try:
+            pinned, reopened = os.fstat(self.fd), os.fstat(fd)
+            if (pinned.st_dev, pinned.st_ino) != (reopened.st_dev, reopened.st_ino):
+                raise OSError(errno.ESTALE, "pinned directory changed", self.path)
+            perms.make_private_dir_fd(fd)
+        finally:
+            os.close(fd)
 
     def lstat(self, name: str) -> os.stat_result:
         if IS_WINDOWS:

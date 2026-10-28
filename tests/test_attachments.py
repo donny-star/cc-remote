@@ -19,6 +19,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
     validate_attachments,
 )
+from cc_remote.platform import perms
 from cc_remote.protocol import ERR_BAD_PROMPT, Query, Steer, TurnSteered
 from tests.platform_assertions import (
     assert_private_dir,
@@ -419,6 +420,26 @@ def test_work_upload_refuses_message_ids_windows_cannot_name(tmp_path):
         assert str(raised.value) == "Work upload directory is unsafe"
     assert [path.name for path in (workspace / "uploads").iterdir()] == [
         ".cc-remote-upload-root"]
+
+
+@pytest.mark.windows_only(reason="POSIX already re-tightens uploads with fchmod")
+def test_work_upload_retightens_a_loosened_existing_uploads_directory(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    note = [{"filename": "note.txt", "data": _b64(8)}]
+    machine._stash_work_attachments(
+        "inspect", note, None, str(workspace), "message-1", "claude")
+    uploads = workspace / "uploads"
+    foreign_readable_dir(uploads)  # a foreign ACE on the existing directory
+    assert not perms.is_private(uploads)
+
+    machine._stash_work_attachments(
+        "inspect", note, None, str(workspace), "message-2", "claude")
+
+    assert_private_dir(uploads)
+    assert_private_dir(uploads / "message-2")
+    assert (uploads / "message-2" / "00-note.txt").read_bytes() == b"x" * 8
 
 
 @pytest.mark.requires_symlink(
