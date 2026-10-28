@@ -94,6 +94,7 @@ class BrokerServer:
             return
         target = _prepare_parent(self.config.socket_path)
         self.manager.load_control_store()
+        self._closing = False  # a closed broker may start again
         try:
             self._server = await ipc.start_server(target, self._handle_client)
         except ipc.AlreadyRunningError as exc:

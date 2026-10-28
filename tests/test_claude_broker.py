@@ -511,6 +511,26 @@ def test_client_rejects_a_stale_broker_protocol():
 
 
 @pytest.mark.asyncio
+async def test_a_closed_server_serves_again_after_a_restart(
+    fake_claude: Path, short_socket_dir: Path,
+):
+    socket_path = short_socket_dir / "restart.sock"
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(socket_path), claude_binary=str(fake_claude),
+        max_sessions=1, history_bytes=64 * 1024,
+    ))
+    client = BrokerClient(str(socket_path))
+    try:
+        await server.start()
+        assert (await client.status())["ok"] is True
+        await server.close()
+        await server.start()
+        assert (await client.status())["ok"] is True
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_new_attach_atomic_send_detach_and_resume(broker, tmp_path: Path):
     _server, client = broker
     created = await client.new(cwd=str(tmp_path))
