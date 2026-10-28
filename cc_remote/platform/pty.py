@@ -20,6 +20,7 @@ import asyncio
 import codecs
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import threading
@@ -38,10 +39,18 @@ _EXIT_POLL_SECONDS = 0.05
 _EXIT_SETTLE_SECONDS = 0.1
 _EXIT_SETTLE_MAX_SECONDS = 1.0
 _READER_STOP_SECONDS = 2.0
+_RESIZE_POLL_SECONDS = 0.25
+# An auto-started server must not die with the console that launched it.
+# POSIX needs nothing here: start_new_session already leaves the terminal.
+DETACHED_CREATIONFLAGS = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
 
-if not IS_WINDOWS:
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
     import fcntl
     import termios
+    import tty
 
 OutputCallback = Callable[[bytes], None]
 _log = logger("cc_remote.platform.pty")
@@ -611,3 +620,226 @@ def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | Non
     del terminal  # the last reference: pywinpty closes the pseudo console
     if job is not None:
         job.Close()
+
+
+# --- the attaching user's terminal --------------------------------------------
+
+_ENABLE_PROCESSED_INPUT = 0x0001
+_ENABLE_LINE_INPUT = 0x0002
+_ENABLE_ECHO_INPUT = 0x0004
+_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+_UTF8_CODE_PAGE = 65001
+
+
+def _kernel32() -> Any:
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _console_handle(fd: int) -> int | None:
+    """The console handle behind ``fd``, or None when it is not a console."""
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+    except OSError:
+        return None
+    mode = ctypes.c_uint32()
+    if not _kernel32().GetConsoleMode(handle, ctypes.byref(mode)):
+        return None
+    return handle
+
+
+def _console_mode(handle: int) -> int:
+    mode = ctypes.c_uint32()
+    if not _kernel32().GetConsoleMode(handle, ctypes.byref(mode)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return mode.value
+
+
+def _set_console_mode(handle: int, mode: int) -> None:
+    if not _kernel32().SetConsoleMode(handle, mode):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _console_output_cp() -> int:
+    code_page = _kernel32().GetConsoleOutputCP()
+    if not code_page:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return code_page
+
+
+def _set_console_output_cp(code_page: int) -> None:
+    if not _kernel32().SetConsoleOutputCP(code_page):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+class RawTerminal:
+    """Put the attaching terminal in raw mode; restore it on exit.
+
+    POSIX: ``tty.setraw`` on stdin when it carries the keyboard, as before.
+    Windows: VT output and UTF-8 output on the console screen buffer, and VT
+    input with line/echo/Ctrl+C processing disabled when it carries the
+    keyboard, so keys reach the remote TUI as the same byte sequences.
+    Neither touches a pipe or a file. Whatever was changed is restored on
+    every exit, including a failure part-way through entering.
+    """
+
+    def __init__(self, stdin_fd: int, stdout_fd: int, *, keyboard: bool):
+        self._stdin_fd = stdin_fd
+        self._stdout_fd = stdout_fd
+        self._keyboard = keyboard
+        self._restore: list[Callable[[], object]] = []
+
+    def __enter__(self) -> RawTerminal:
+        try:
+            if IS_WINDOWS:
+                self._enter_windows()
+            elif self._keyboard and os.isatty(self._stdin_fd):
+                original = termios.tcgetattr(self._stdin_fd)
+                tty.setraw(self._stdin_fd)
+                self._restore.append(lambda: termios.tcsetattr(
+                    self._stdin_fd, termios.TCSAFLUSH, original))
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def _enter_windows(self) -> None:
+        output = _console_handle(self._stdout_fd)
+        if output is not None:
+            output_mode = _console_mode(output)
+            code_page = _console_output_cp()
+            _set_console_mode(output, output_mode | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                              | _DISABLE_NEWLINE_AUTO_RETURN)
+            self._restore.append(lambda: _set_console_mode(output, output_mode))
+            _set_console_output_cp(_UTF8_CODE_PAGE)
+            self._restore.append(lambda: _set_console_output_cp(code_page))
+        console_input = _console_handle(self._stdin_fd) if self._keyboard else None
+        if console_input is not None:
+            input_mode = _console_mode(console_input)
+            raw = input_mode & ~(_ENABLE_PROCESSED_INPUT | _ENABLE_LINE_INPUT
+                                 | _ENABLE_ECHO_INPUT)
+            _set_console_mode(console_input, raw | _ENABLE_VIRTUAL_TERMINAL_INPUT)
+            self._restore.append(lambda: _set_console_mode(console_input, input_mode))
+
+    def __exit__(self, *_exc: object) -> None:
+        while self._restore:
+            restore = self._restore.pop()
+            try:
+                restore()
+            except OSError:
+                pass
+
+
+def terminal_size(fd: int) -> tuple[int, int, int, int]:
+    """``(rows, cols, xpixel, ypixel)`` of the terminal on ``fd`` (24x80 default)."""
+    if IS_WINDOWS:
+        # A console input handle has no geometry; the process's screen buffer
+        # (stdout) does, and shutil also honours COLUMNS/LINES overrides.
+        size = shutil.get_terminal_size((80, 24))
+        return size.lines, size.columns, 0, 0
+    try:
+        raw = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpixel, ypixel = struct.unpack("HHHH", raw)
+        if rows and cols:
+            return rows, cols, xpixel, ypixel
+    except OSError:
+        pass
+    return 24, 80, 0, 0
+
+
+def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]:
+    """Call ``callback`` on the running loop when the terminal on ``fd`` resizes.
+
+    POSIX uses SIGWINCH; Windows has none, so it polls every 250 ms. Returns
+    an ``unwatch()`` callable.
+    """
+    loop = asyncio.get_running_loop()
+    if not IS_WINDOWS:
+        import signal
+
+        try:
+            loop.add_signal_handler(signal.SIGWINCH, callback)
+        except (NotImplementedError, RuntimeError):
+            return lambda: None
+        return lambda: loop.remove_signal_handler(signal.SIGWINCH)
+
+    async def poll() -> None:
+        last = terminal_size(fd)
+        while True:
+            await asyncio.sleep(_RESIZE_POLL_SECONDS)
+            current = terminal_size(fd)
+            if current != last:
+                last = current
+                callback()
+
+    task = loop.create_task(poll())
+    return task.cancel
+
+
+class InputReader:
+    """Read chunks of keyboard input from ``fd`` without blocking the loop.
+
+    POSIX waits for readiness with ``add_reader``. Windows reads on a daemon
+    thread (it never holds up interpreter exit); a console is read with
+    ReadConsoleW so input arrives as UTF-8. ``read`` returns b"" at EOF.
+    """
+
+    def __init__(self, fd: int):
+        self._fd = fd
+        self._queue: asyncio.Queue[bytes] | None = None
+
+    async def read(self) -> bytes:
+        if not IS_WINDOWS:
+            return await self._read_posix()
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+            threading.Thread(
+                target=self._pump, args=(asyncio.get_running_loop(), self._queue),
+                name="stdin-reader", daemon=True).start()
+        return await self._queue.get()
+
+    async def _read_posix(self) -> bytes:
+        mode = os.fstat(self._fd).st_mode
+        if stat.S_ISREG(mode):
+            return os.read(self._fd, READ_CHUNK_BYTES)
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[None] = loop.create_future()
+
+        def mark_ready() -> None:
+            if not ready.done():
+                ready.set_result(None)
+
+        loop.add_reader(self._fd, mark_ready)
+        try:
+            await ready
+            return os.read(self._fd, READ_CHUNK_BYTES)
+        finally:
+            loop.remove_reader(self._fd)
+
+    def _pump(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes]) -> None:
+        import io
+
+        console = None
+        if _console_handle(self._fd) is not None:
+            console = io._WindowsConsoleIO(self._fd, "rb", closefd=False)  # type: ignore[attr-defined]
+        while True:
+            try:
+                if console is not None:
+                    data = console.read(READ_CHUNK_BYTES) or b""
+                else:
+                    data = os.read(self._fd, READ_CHUNK_BYTES)
+            except OSError:
+                data = b""
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, data)
+            except RuntimeError:  # loop closed
+                return
+            if not data:
+                return
+
+
+__all__ = [
+    "DETACHED_CREATIONFLAGS", "InputReader", "PtyProcess", "READ_CHUNK_BYTES", "RawTerminal",
+    "spawn", "terminal_size", "watch_resize",
+]

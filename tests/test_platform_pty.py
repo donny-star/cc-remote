@@ -636,3 +636,252 @@ async def test_a_reader_stuck_past_the_bound_is_logged_as_a_leak(monkeypatch):
     finally:
         console.release.set()
     assert await _conpty_threads_gone(terminal.pid)
+
+
+ATTACH_CHILD = r'''
+import asyncio
+import os
+
+from cc_remote.platform import pty
+
+
+def raw_state():
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        mode = ctypes.c_uint32()
+        ctypes.WinDLL("kernel32").GetConsoleMode(msvcrt.get_osfhandle(0), ctypes.byref(mode))
+        return int(not mode.value & 0x2)  # ENABLE_LINE_INPUT
+    import termios
+
+    return int(not termios.tcgetattr(0)[3] & termios.ICANON)
+
+
+async def main():
+    os.write(1, b"BEFORE raw=%d\n" % raw_state())
+    resized = asyncio.Event()
+    with pty.RawTerminal(0, 1, keyboard=True):
+        rows, cols, _x, _y = pty.terminal_size(0)
+        os.write(1, b"RAW raw=%d size=%dx%d\n" % (raw_state(), rows, cols))
+        unwatch = pty.watch_resize(0, resized.set)
+        reader = pty.InputReader(0)
+        received = b""
+        while not received.endswith(b"\r"):
+            received += await reader.read()
+        os.write(1, b"GOT " + received.hex().encode() + b"\n")
+        await asyncio.wait_for(resized.wait(), 10)
+        rows, cols, _x, _y = pty.terminal_size(0)
+        os.write(1, b"RESIZED size=%dx%d\n" % (rows, cols))
+        unwatch()
+    os.write(1, b"AFTER raw=%d\n" % raw_state())
+
+
+asyncio.run(main())
+'''
+
+
+@pytest.mark.asyncio
+async def test_raw_terminal_input_and_resize_inside_a_real_terminal(tmp_path):
+    script = tmp_path / "attach_child.py"
+    script.write_text(ATTACH_CHILD, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    # The size must come from the terminal, not an inherited override.
+    env.pop("COLUMNS", None)
+    env.pop("LINES", None)
+    output = _Collector()
+    terminal = pty.spawn([sys.executable, str(script)], cwd=str(tmp_path), env=env)
+    try:
+        terminal.start(output)
+        await output.until(lambda data: b"RAW raw=1 size=24x80" in data)
+        for chunk in (b"a", "中".encode(), b"\x03", b"\x1b[A", b"\r"):
+            await terminal.write(chunk)
+        await output.until(lambda data: b"GOT 61e4b8ad031b5b410d" in data)
+        terminal.resize(30, 100)
+        await output.until(lambda data: b"RESIZED size=30x100" in data)
+        assert await asyncio.wait_for(terminal.wait(), 10) == 0
+        data = bytes(output.data) + b"".join(terminal.drain())
+    finally:
+        terminal.close()
+    assert b"BEFORE raw=0" in data
+    assert b"AFTER raw=0" in data
+
+
+@pytest.mark.asyncio
+async def test_input_reader_and_raw_terminal_accept_pipes():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"piped")
+        os.close(write_fd)
+        write_fd = -1
+        with pty.RawTerminal(read_fd, read_fd, keyboard=True):
+            reader = pty.InputReader(read_fd)
+            assert await asyncio.wait_for(reader.read(), 5) == b"piped"
+            assert await asyncio.wait_for(reader.read(), 5) == b""
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.posix_only(reason="POSIX reads the size from the tty itself")
+def test_terminal_size_defaults_off_a_terminal(tmp_path):
+    with open(tmp_path / "plain", "wb") as stream:
+        assert pty.terminal_size(stream.fileno()) == (24, 80, 0, 0)
+
+
+@pytest.mark.windows_only(reason="Windows reads the size through shutil (stdout or COLUMNS/LINES)")
+def test_terminal_size_honours_columns_and_lines(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "91")
+    monkeypatch.setenv("LINES", "33")
+    assert pty.terminal_size(0) == (33, 91, 0, 0)
+
+
+def test_detached_servers_leave_the_launching_console():
+    import subprocess
+
+    expected = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+    assert pty.DETACHED_CREATIONFLAGS == expected
+
+
+class _FakeConsole:
+    """Console modes and the output code page behind fake handles 0 (in) / 1 (out)."""
+
+    INPUT = 0x01F7  # processed, line, echo, window, mouse, insert, quick edit
+    OUTPUT = 0x0003
+    CODE_PAGE = 437
+
+    def __init__(self, monkeypatch, *, fail_set: str | None = None,
+                 fail_restore: str | None = None) -> None:
+        self.modes = {"in": self.INPUT, "out": self.OUTPUT}
+        self.code_page = self.CODE_PAGE
+        self._fail_set = fail_set
+        self._fail_restore = fail_restore
+        monkeypatch.setattr(pty, "_console_handle", lambda fd: {0: "in", 1: "out"}.get(fd))
+        monkeypatch.setattr(pty, "_console_mode", lambda handle: self.modes[handle])
+        monkeypatch.setattr(pty, "_set_console_mode", self._set_mode)
+        monkeypatch.setattr(pty, "_console_output_cp", lambda: self.code_page)
+        monkeypatch.setattr(pty, "_set_console_output_cp", self._set_code_page)
+
+    def _set_mode(self, handle: str, mode: int) -> None:
+        original = self.INPUT if handle == "in" else self.OUTPUT
+        if handle == self._fail_set and mode != original:
+            raise PermissionError("SetConsoleMode denied")
+        if handle == self._fail_restore and mode == original:
+            raise OSError("SetConsoleMode failed")
+        self.modes[handle] = mode
+
+    def _set_code_page(self, code_page: int) -> None:
+        self.code_page = code_page
+
+    def assert_restored(self) -> None:
+        assert self.modes == {"in": self.INPUT, "out": self.OUTPUT}
+        assert self.code_page == self.CODE_PAGE
+
+
+class _Escape(Exception):
+    pass
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console modes")
+@pytest.mark.parametrize("escape", [None, _Escape, asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+def test_raw_console_modes_are_restored_on_every_exit(monkeypatch, escape):
+    console = _FakeConsole(monkeypatch)
+    try:
+        with pty.RawTerminal(0, 1, keyboard=True):
+            assert console.modes["in"] == (_FakeConsole.INPUT & ~0x7) | 0x200
+            assert console.modes["out"] == _FakeConsole.OUTPUT | 0x4 | 0x8
+            assert console.code_page == 65001
+            if escape is not None:
+                raise escape()
+    except BaseException as exc:
+        assert escape is not None and isinstance(exc, escape)
+    else:
+        assert escape is None
+    console.assert_restored()
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console modes")
+def test_a_failed_raw_switch_restores_what_was_already_changed(monkeypatch):
+    console = _FakeConsole(monkeypatch, fail_set="in")
+    with pytest.raises(PermissionError):
+        with pty.RawTerminal(0, 1, keyboard=True):
+            pytest.fail("entered despite the failed input mode")
+    console.assert_restored()
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console modes")
+def test_one_failed_restore_does_not_skip_the_others(monkeypatch):
+    console = _FakeConsole(monkeypatch, fail_restore="in")
+    with pty.RawTerminal(0, 1, keyboard=True):
+        pass
+    assert console.modes["out"] == _FakeConsole.OUTPUT
+    assert console.code_page == _FakeConsole.CODE_PAGE
+
+
+@pytest.mark.windows_only(reason="exercises the Windows console modes")
+def test_a_mirror_leaves_the_keyboard_alone(monkeypatch):
+    console = _FakeConsole(monkeypatch)
+    with pty.RawTerminal(0, 1, keyboard=False):
+        assert console.modes["in"] == _FakeConsole.INPUT
+        assert console.modes["out"] == _FakeConsole.OUTPUT | 0x4 | 0x8
+    console.assert_restored()
+
+
+@pytest.mark.posix_only(reason="exercises termios raw mode")
+@pytest.mark.parametrize("escape", [None, _Escape, asyncio.CancelledError, KeyboardInterrupt])
+def test_termios_is_restored_on_every_exit(monkeypatch, escape):
+    import termios
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(pty.os, "isatty", lambda fd: fd == 0)
+    monkeypatch.setattr(pty.termios, "tcgetattr", lambda fd: ["original", fd])
+    monkeypatch.setattr(pty.tty, "setraw", lambda fd: calls.append(("setraw", fd)))
+    monkeypatch.setattr(pty.termios, "tcsetattr", lambda fd, when, attrs: calls.append(
+        ("tcsetattr", fd, when, attrs)))
+    try:
+        with pty.RawTerminal(0, 1, keyboard=True):
+            assert calls == [("setraw", 0)]
+            if escape is not None:
+                raise escape()
+    except BaseException as exc:
+        assert escape is not None and isinstance(exc, escape)
+    assert calls == [("setraw", 0), ("tcsetattr", 0, termios.TCSAFLUSH, ["original", 0])]
+
+
+@pytest.mark.windows_only(reason="Windows has no SIGWINCH and polls the size")
+@pytest.mark.asyncio
+async def test_watch_resize_polls_until_unwatched(monkeypatch):
+    sizes = [(24, 80, 0, 0)]
+    monkeypatch.setattr(pty, "terminal_size", lambda fd: sizes[-1])
+    monkeypatch.setattr(pty, "_RESIZE_POLL_SECONDS", 0.01)
+    resized = asyncio.Event()
+    unwatch = pty.watch_resize(0, resized.set)
+    try:
+        await asyncio.sleep(0.05)
+        assert not resized.is_set()
+        sizes.append((30, 100, 0, 0))
+        await asyncio.wait_for(resized.wait(), 5)
+    finally:
+        unwatch()
+    resized.clear()
+    sizes.append((40, 120, 0, 0))
+    await asyncio.sleep(0.05)
+    assert not resized.is_set()
+
+
+@pytest.mark.windows_only(reason="the Windows reader is a thread")
+@pytest.mark.asyncio
+async def test_the_input_thread_ends_at_eof():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.close(write_fd)
+        reader = pty.InputReader(read_fd)
+        assert await asyncio.wait_for(reader.read(), 5) == b""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while any(thread.name == "stdin-reader" for thread in threading.enumerate()):
+            assert loop.time() < deadline, "stdin reader thread outlived EOF"
+            await asyncio.sleep(0.02)
+    finally:
+        os.close(read_fd)
