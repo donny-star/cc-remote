@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -10,9 +11,11 @@ import os
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -865,3 +868,512 @@ async def test_start_lock_is_released_on_error_and_cancellation(endpoint_path, m
         await holder
     async with ipc._start_lock(endpoint_path):
         pass
+
+
+async def _ping(path: Path, payload: bytes = b"ping") -> bytes:
+    reader, writer = await ipc.open_connection(path)
+    try:
+        writer.write(payload)
+        await writer.drain()
+        return await reader.readexactly(len(payload))
+    finally:
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_round_trip_and_endpoint_removed_on_close(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo) as server:
+        assert server.path == endpoint_path
+        assert server.is_serving()
+        assert await _ping(endpoint_path) == b"PING"
+    assert not endpoint_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_second_server_is_refused_while_the_first_is_live(endpoint_path):
+    first = await ipc.start_server(endpoint_path, _echo)
+    try:
+        with pytest.raises(ipc.AlreadyRunningError, match="already running"):
+            await ipc.start_server(endpoint_path, _echo)
+        assert await _ping(endpoint_path, b"x") == b"X"
+    finally:
+        first.close()
+        await first.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_file_at_the_endpoint_is_never_replaced(endpoint_path):
+    endpoint_path.write_text("do not replace", encoding="utf-8")
+    with pytest.raises(ipc.UnsafeEndpointError, match="refusing to replace"):
+        await ipc.start_server(endpoint_path, _echo)
+    assert endpoint_path.read_text(encoding="utf-8") == "do not replace"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_endpoint_refuses_clients_and_is_reclaimed(endpoint_path):
+    _leave_stale_endpoint(endpoint_path)
+    with pytest.raises(ConnectionRefusedError):
+        await ipc.open_connection(endpoint_path)
+    async with await ipc.start_server(endpoint_path, _echo):
+        assert await _ping(endpoint_path) == b"PING"
+
+
+@pytest.mark.asyncio
+async def test_missing_endpoint_raises_file_not_found(endpoint_path):
+    with pytest.raises(FileNotFoundError):
+        await ipc.open_connection(endpoint_path)
+    with pytest.raises(FileNotFoundError):
+        ipc.connect_sync(endpoint_path)
+
+
+@pytest.mark.asyncio
+async def test_connect_sync_returns_a_blocking_authenticated_socket(endpoint_path):
+    def talk() -> bytes:
+        with ipc.connect_sync(endpoint_path) as sock:
+            assert sock.gettimeout() is None
+            sock.sendall(b"sync")
+            data = b""
+            while len(data) < 4:
+                data += sock.recv(4 - len(data))
+            return data
+
+    async with await ipc.start_server(endpoint_path, _echo):
+        assert await asyncio.to_thread(talk) == b"SYNC"
+
+
+@pytest.mark.asyncio
+async def test_reader_limit_applies_to_server_streams(endpoint_path):
+    seen = []
+
+    async def handler(reader, writer):
+        try:
+            await reader.readline()
+        except ValueError:
+            seen.append("limit")
+        finally:
+            writer.close()
+
+    async with await ipc.start_server(endpoint_path, handler, limit=64):
+        reader, writer = await ipc.open_connection(endpoint_path)
+        writer.write(b"x" * 200 + b"\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.read(), 2)
+        writer.close()
+    assert seen == ["limit"]
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_a_newer_endpoint_alone(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    endpoint_path.unlink()
+    endpoint_path.write_text("newer", encoding="utf-8")
+    server.close()
+    await server.wait_closed()
+    assert endpoint_path.read_text(encoding="utf-8") == "newer"
+
+
+windows_endpoint = pytest.mark.windows_only(
+    reason="the HMAC endpoint replaces AF_UNIX only on Windows")
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_wrong_token_is_rejected_before_the_handler(endpoint_path):
+    calls = []
+
+    async def handler(reader, writer):
+        calls.append(1)
+        writer.close()
+
+    async with await ipc.start_server(endpoint_path, handler) as server:
+        forged = endpoint_path.with_name("forged.sock")
+        ipc.write_endpoint(forged, dataclasses.replace(
+            ipc.read_endpoint(endpoint_path), token=os.urandom(32)))
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc.open_connection(forged)
+        await _wait_until(lambda: server.auth_failures == 1)
+    assert calls == []
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_impostor_on_the_recorded_port_never_learns_the_token(endpoint_path):
+    received = bytearray()
+    finished = asyncio.Event()
+
+    async def impostor(reader, writer):
+        received.extend(await reader.readexactly(ipc.NONCE_BYTES))
+        writer.write(os.urandom(ipc.NONCE_BYTES + ipc.MAC_BYTES))
+        await writer.drain()
+        received.extend(await reader.read())
+        writer.close()
+        finished.set()
+
+    listener = await asyncio.start_server(impostor, "127.0.0.1", 0)
+    token = os.urandom(32)
+    _record(endpoint_path, listener.sockets[0].getsockname()[1], token)
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc.open_connection(endpoint_path)
+        await asyncio.wait_for(finished.wait(), 2)
+    finally:
+        listener.close()
+        await listener.wait_closed()
+    assert len(received) == ipc.NONCE_BYTES
+    assert token not in bytes(received)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_dead_owner_is_refused_before_any_connection(endpoint_path):
+    connections = []
+
+    async def impostor(reader, writer):
+        connections.append(1)
+        writer.close()
+
+    listener = await asyncio.start_server(impostor, "127.0.0.1", 0)
+    _record(endpoint_path, listener.sockets[0].getsockname()[1], os.urandom(32),
+            pid=_dead_pid(), start_time=1)
+    try:
+        with pytest.raises(ConnectionRefusedError):
+            await ipc.open_connection(endpoint_path)
+        with pytest.raises(ConnectionRefusedError):
+            ipc.connect_sync(endpoint_path)
+        await asyncio.sleep(0.1)
+    finally:
+        listener.close()
+        await listener.wait_closed()
+    assert connections == []
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_a_reused_pid_with_another_start_time_is_refused(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo):
+        record = ipc.read_endpoint(endpoint_path)
+        moved = endpoint_path.with_name("moved.sock")
+        ipc.write_endpoint(moved, dataclasses.replace(record, start_time=record.start_time + 1))
+        with pytest.raises(ConnectionRefusedError):
+            await ipc.open_connection(moved)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_a_non_private_endpoint_record_is_refused(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo):
+        share_with_everyone(endpoint_path)
+        with pytest.raises(ipc.UnsafeEndpointError, match="private"):
+            await ipc.open_connection(endpoint_path)
+        with pytest.raises(ipc.UnsafeEndpointError, match="private"):
+            ipc.connect_sync(endpoint_path)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_a_silent_peer_is_dropped_after_the_handshake_timeout(endpoint_path, monkeypatch):
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    async with await ipc.start_server(endpoint_path, _echo) as server:
+        record = ipc.read_endpoint(endpoint_path)
+        reader, writer = await asyncio.open_connection("127.0.0.1", record.port)
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        writer.close()
+        await _wait_until(lambda: server.auth_failures == 1)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_listener_is_loopback_only_and_exclusive(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo) as server:
+        record = ipc.read_endpoint(endpoint_path)
+        listening = server._server.sockets[0]
+        assert listening.getsockname()[0] == "127.0.0.1"
+        # Windows 10 already refuses this same-address bind by default, so the
+        # option itself is asserted as well.
+        assert listening.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE) == 1
+        intruder = socket.socket()
+        intruder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            with pytest.raises(OSError):
+                intruder.bind(("127.0.0.1", record.port))
+        finally:
+            intruder.close()
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_simultaneous_starters_on_a_stale_endpoint_leave_exactly_one_server(
+        endpoint_path, monkeypatch):
+    _leave_stale_endpoint(endpoint_path)
+    real_probe = ipc._probe
+    calls = []
+
+    async def slow_second_probe(endpoint):
+        # Without the start lock the second starter would wake up after the
+        # first one published and delete that fresh record.
+        verdict = await real_probe(endpoint)
+        calls.append(verdict)
+        if len(calls) == 2:
+            await asyncio.sleep(0.5)
+        return verdict
+
+    monkeypatch.setattr(ipc, "_probe", slow_second_probe)
+    results = await asyncio.gather(
+        ipc.start_server(endpoint_path, _echo), ipc.start_server(endpoint_path, _echo),
+        return_exceptions=True)
+    servers = [item for item in results if isinstance(item, ipc.IpcServer)]
+    try:
+        assert len(servers) == 1
+        assert [type(item) for item in results if item not in servers] == [ipc.AlreadyRunningError]
+        assert calls == ["gone", "live"]
+        published = ipc.read_endpoint(endpoint_path).port
+        assert published == servers[0]._server.sockets[0].getsockname()[1]
+        assert await _ping(endpoint_path) == b"PING"
+    finally:
+        for server in servers:
+            server.close()
+            await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_close_withdraws_the_endpoint_before_the_listener_stops(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    stop_listening = server._server.close
+    seen = []
+
+    def close_listener():
+        seen.append(endpoint_path.exists())
+        stop_listening()
+
+    server._server.close = close_listener
+    server.close()
+    await server.wait_closed()
+    assert seen == [False]
+
+
+posix_endpoint = pytest.mark.posix_only(reason="AF_UNIX peer credentials are POSIX-only")
+
+
+@posix_endpoint
+@pytest.mark.asyncio
+async def test_posix_socket_is_0600_inside_a_0700_directory(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo):
+        info = endpoint_path.lstat()
+        assert stat.S_ISSOCK(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        assert stat.S_IMODE(endpoint_path.parent.stat().st_mode) == 0o700
+
+
+@posix_endpoint
+@pytest.mark.asyncio
+async def test_server_drops_a_peer_with_another_uid(endpoint_path, monkeypatch):
+    calls = []
+
+    async def handler(reader, writer):
+        calls.append(1)
+        writer.close()
+
+    real = ipc._peer_uid
+    # Accepted sockets are bound to the endpoint path; the client side is not.
+    monkeypatch.setattr(
+        ipc, "_peer_uid", lambda sock: real(sock) + (1 if sock.getsockname() else 0))
+    async with await ipc.start_server(endpoint_path, handler) as server:
+        reader, writer = await ipc.open_connection(endpoint_path)
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        writer.close()
+        await _wait_until(lambda: server.auth_failures == 1)
+    assert calls == []
+
+
+@posix_endpoint
+@pytest.mark.asyncio
+async def test_client_refuses_a_server_with_another_uid(endpoint_path, monkeypatch):
+    async with await ipc.start_server(endpoint_path, _echo):
+        monkeypatch.setattr(ipc, "_peer_uid", lambda sock: os.getuid() + 1)
+        with pytest.raises(ipc.AuthenticationError):
+            await ipc.open_connection(endpoint_path)
+        with pytest.raises(ipc.AuthenticationError):
+            ipc.connect_sync(endpoint_path)
+
+
+@posix_endpoint
+@pytest.mark.asyncio
+async def test_client_refuses_a_socket_with_loose_permissions(endpoint_path):
+    async with await ipc.start_server(endpoint_path, _echo):
+        endpoint_path.chmod(0o666)
+        with pytest.raises(ipc.UnsafeEndpointError):
+            await ipc.open_connection(endpoint_path)
+
+
+@pytest.mark.asyncio
+async def test_close_is_idempotent_and_never_withdraws_a_later_endpoint(endpoint_path):
+    server = await ipc.start_server(endpoint_path, _echo)
+    server.close()
+    await server.wait_closed()
+    assert not endpoint_path.exists()
+    endpoint_path.write_text("later", encoding="utf-8")
+    server.close()
+    await server.wait_closed()
+    assert not server.is_serving()
+    assert endpoint_path.read_text(encoding="utf-8") == "later"
+
+
+def _lock_is_held(path: Path) -> bool:
+    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR)
+    try:
+        ipc.locks.flock(fd, ipc.locks.LOCK_EX | ipc.locks.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # also releases a lock taken just above
+    return False
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_reclaim_and_publish_both_run_inside_the_start_lock(endpoint_path, monkeypatch):
+    _leave_stale_endpoint(endpoint_path)
+    real_reclaim, real_write = ipc._reclaim_windows, ipc.write_endpoint
+    seen = []
+
+    async def reclaim(target):
+        seen.append(("reclaim", _lock_is_held(target), perms.is_private(target.parent)))
+        await real_reclaim(target)
+
+    def write(target, endpoint):
+        seen.append(("publish", _lock_is_held(target), target.exists()))
+        return real_write(target, endpoint)
+
+    monkeypatch.setattr(ipc, "_reclaim_windows", reclaim)
+    monkeypatch.setattr(ipc, "write_endpoint", write)
+    async with await ipc.start_server(endpoint_path, _echo):
+        assert seen == [("reclaim", True, True), ("publish", True, False)]
+        assert not _lock_is_held(endpoint_path)
+
+
+def _secret_forms(token: bytes) -> list[str]:
+    return [token.hex(), base64.b64encode(token).decode("ascii"), repr(token)]
+
+
+def _assert_reveals_nothing(exc: BaseException, token: bytes) -> None:
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = f"{exc!s} {exc!r}"
+        assert not any(form in text for form in _secret_forms(token))
+        assert token not in [arg for arg in exc.args if isinstance(arg, bytes)]
+        exc = exc.__cause__ or exc.__context__
+
+
+async def _hang_up(reader, writer):
+    """Read the nonce and close: the peer quit in the middle of the handshake."""
+    await reader.readexactly(ipc.NONCE_BYTES)
+    writer.close()
+
+
+async def _reset(reader, writer):
+    """Read the nonce and abort with a TCP reset."""
+    await reader.readexactly(ipc.NONCE_BYTES)
+    writer.get_extra_info("socket").setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("HH", 1, 0))
+    writer.transport.abort()
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+@pytest.mark.parametrize("behaviour", [_silent, _hang_up, _reset, _random_reply],
+                         ids=["silent", "hang-up", "reset", "wrong-proof"])
+async def test_client_handshake_failures_are_bounded_authentication_errors(
+        endpoint_path, behaviour):
+    accepted = []
+
+    async def tracked(reader, writer):
+        accepted.append(writer)
+        await behaviour(reader, writer)
+
+    listener, port = await _listen(tracked)
+    token = os.urandom(32)
+    _record(endpoint_path, port, token)
+    loop = asyncio.get_running_loop()
+    caught = []
+    try:
+        started = loop.time()
+        with pytest.raises(ipc.AuthenticationError) as raised:
+            # The outer bound turns a missing handshake timeout into a failure.
+            await asyncio.wait_for(ipc.open_connection(endpoint_path, timeout=0.3), 2)
+        caught.append(raised.value)
+        started_sync = time.monotonic()
+        with pytest.raises(ipc.AuthenticationError) as raised:
+            await asyncio.wait_for(
+                asyncio.to_thread(ipc.connect_sync, endpoint_path, timeout=0.3), 2)
+        caught.append(raised.value)
+        assert time.monotonic() - started_sync < 1.5
+        assert loop.time() - started < 3.0
+    finally:
+        for writer in accepted:  # unblocks a client that ignored its timeout
+            writer.transport.abort()
+        await _stop(listener)
+    for exc in caught:
+        _assert_reveals_nothing(exc, token)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_sync_client_reveals_only_a_fresh_nonce_to_an_impostor(endpoint_path):
+    received = bytearray()
+    finished = asyncio.Event()
+
+    async def impostor(reader, writer):
+        received.extend(await reader.readexactly(ipc.NONCE_BYTES))
+        writer.write(os.urandom(ipc.NONCE_BYTES + ipc.MAC_BYTES))
+        await writer.drain()
+        received.extend(await reader.read())
+        writer.close()
+        finished.set()
+
+    listener, port = await _listen(impostor)
+    token = os.urandom(32)
+    _record(endpoint_path, port, token)
+    try:
+        with pytest.raises(ipc.AuthenticationError):
+            await asyncio.to_thread(ipc.connect_sync, endpoint_path)
+        await asyncio.wait_for(finished.wait(), 2)
+    finally:
+        await _stop(listener)
+    assert len(received) == ipc.NONCE_BYTES
+    assert token not in bytes(received)
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_sync_client_with_a_wrong_token_is_rejected_before_the_handler(endpoint_path):
+    calls = []
+
+    async def handler(reader, writer):
+        calls.append(1)
+        writer.close()
+
+    async with await ipc.start_server(endpoint_path, handler) as server:
+        forged = endpoint_path.with_name("forged.sock")
+        ipc.write_endpoint(forged, dataclasses.replace(
+            ipc.read_endpoint(endpoint_path), token=os.urandom(32)))
+        with pytest.raises(ipc.AuthenticationError):
+            await asyncio.to_thread(ipc.connect_sync, forged)
+        await _wait_until(lambda: server.auth_failures == 1)
+    assert calls == []
+
+
+@windows_endpoint
+@pytest.mark.asyncio
+async def test_start_over_a_dead_owners_silent_port_fits_the_readiness_budget(endpoint_path):
+    # claude-remote waits 3 s for an auto-started service to become ready.
+    listener, port = await _listen(_silent)
+    _record(endpoint_path, port, os.urandom(32), pid=_dead_pid(), start_time=1)
+    loop = asyncio.get_running_loop()
+    try:
+        started = loop.time()
+        async with await ipc.start_server(endpoint_path, _echo):
+            assert loop.time() - started < 3.0
+            assert await _ping(endpoint_path) == b"PING"
+    finally:
+        await _stop(listener)

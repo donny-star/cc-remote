@@ -35,6 +35,7 @@ from cc_remote.platform.identity import current_uid
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 StrPath = str | os.PathLike[str]
 
+DEFAULT_LIMIT = 2 ** 16
 HANDSHAKE_TIMEOUT = 2.0
 ENDPOINT_VERSION = 1
 MAX_ENDPOINT_BYTES = 4096
@@ -478,3 +479,287 @@ async def _start_lock(target: Path):
         yield
     finally:
         os.close(fd)  # closing the descriptor releases the lock
+
+
+# --- server object ------------------------------------------------------------
+
+class IpcServer:
+    """An ``asyncio`` server plus the endpoint path it published."""
+
+    def __init__(self, server: asyncio.AbstractServer, path: Path,
+                 identity: tuple[int, int], guard: _Guard):
+        self._server = server
+        self._path = path
+        self._identity = identity
+        self._guard = guard
+        self._removed = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def auth_failures(self) -> int:
+        return self._guard.failures
+
+    def is_serving(self) -> bool:
+        return self._server.is_serving()
+
+    def close(self) -> None:
+        """Withdraw the endpoint if it is still ours, then stop listening.
+
+        Withdrawing first means the recorded port is never released while the
+        record still names it and its owner is alive.
+        """
+        if not self._removed:
+            self._removed = True
+            try:
+                info = self._path.lstat()
+            except FileNotFoundError:
+                info = None
+            if info is not None and (info.st_dev, info.st_ino) == self._identity:
+                with contextlib.suppress(FileNotFoundError):
+                    self._path.unlink()
+        self._server.close()
+
+    async def wait_closed(self) -> None:
+        await self._server.wait_closed()
+
+    async def serve_forever(self) -> None:
+        await self._server.serve_forever()
+
+    async def __aenter__(self) -> IpcServer:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self.close()
+        await self.wait_closed()
+
+
+# --- public API ---------------------------------------------------------------
+
+async def start_server(path: StrPath, handler: Handler, *,
+                       limit: int = DEFAULT_LIMIT) -> IpcServer:
+    """Serve ``handler`` for same-user peers at ``path``.
+
+    Raises :class:`AlreadyRunningError` when a live server owns ``path`` and
+    :class:`UnsafeEndpointError` when ``path`` or its directory is unsafe.
+    """
+    target = Path(path).expanduser().absolute()
+    ensure_private_directory(target.parent)
+    if IS_WINDOWS:
+        return await _windows_start_server(target, handler, limit)
+    return await _posix_start_server(target, handler, limit)
+
+
+async def open_connection(path: StrPath, *, limit: int = DEFAULT_LIMIT,
+                          timeout: float = HANDSHAKE_TIMEOUT,
+                          ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Connect to a same-user server; the returned streams are authenticated."""
+    target = Path(path).expanduser().absolute()
+    if IS_WINDOWS:
+        return await _windows_open(target, limit, timeout)
+    return await _posix_open(target, limit, timeout)
+
+
+def connect_sync(path: StrPath, *, timeout: float = HANDSHAKE_TIMEOUT) -> socket.socket:
+    """Blocking :func:`open_connection` for synchronous CLIs; returns a blocking socket."""
+    target = Path(path).expanduser().absolute()
+    if IS_WINDOWS:
+        return _windows_connect_sync(target, timeout)
+    return _posix_connect_sync(target, timeout)
+
+
+# --- POSIX backend ------------------------------------------------------------
+
+def _check_posix_socket(target: Path) -> None:
+    info = target.lstat()  # FileNotFoundError: nothing is listening
+    if (info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise UnsafeEndpointError("socket must be owned by this uid with mode 0600")
+
+
+def _reclaim_posix(target: Path) -> None:
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    if info.st_uid != current_uid() or not stat.S_ISSOCK(info.st_mode):
+        raise UnsafeEndpointError("refusing to replace a non-owned or non-socket path")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.2)
+        probe.connect(str(target))
+    except (ConnectionRefusedError, FileNotFoundError):
+        target.unlink()
+    except OSError as exc:
+        raise UnsafeEndpointError(f"cannot verify existing socket: {exc}") from exc
+    else:
+        raise AlreadyRunningError(f"endpoint is already running at {target}")
+    finally:
+        probe.close()
+
+
+async def _posix_start_server(target: Path, handler: Handler, limit: int) -> IpcServer:
+    _reclaim_posix(target)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)
+    try:
+        listener.bind(str(target))
+    except BaseException:
+        listener.close()
+        raise
+    finally:
+        os.umask(old_umask)
+    guard = _Guard(handler, target)
+    try:
+        os.chmod(target, 0o600)
+        info = target.lstat()
+        if info.st_uid != current_uid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise UnsafeEndpointError("socket permissions are not 0600")
+        listener.listen(socket.SOMAXCONN)
+        listener.setblocking(False)
+        server = await asyncio.start_unix_server(guard, sock=listener, limit=limit)
+    except BaseException:
+        listener.close()
+        with contextlib.suppress(FileNotFoundError):
+            target.unlink()
+        raise
+    return IpcServer(server, target, (info.st_dev, info.st_ino), guard)
+
+
+async def _posix_open(target: Path, limit: int, timeout: float,
+                      ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    _check_posix_socket(target)
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(target), limit=limit), timeout)
+    except asyncio.TimeoutError as exc:
+        # Python 3.10's asyncio.TimeoutError is not an OSError.
+        raise TimeoutError(errno.ETIMEDOUT, "endpoint did not accept the connection") from exc
+    if not _posix_peer_allowed(writer):
+        await _close_quietly(writer)
+        raise AuthenticationError("endpoint peer uid does not match")
+    return reader, writer
+
+
+def _posix_connect_sync(target: Path, timeout: float) -> socket.socket:
+    _check_posix_socket(target)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(str(target))
+        if _peer_uid(sock) != current_uid():
+            raise AuthenticationError("endpoint peer uid does not match")
+        sock.settimeout(None)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+# --- Windows backend ----------------------------------------------------------
+
+async def _windows_start_server(target: Path, handler: Handler, limit: int) -> IpcServer:
+    # start_server already made the directory private, as _start_lock requires.
+    async with _start_lock(target):
+        await _reclaim_windows(target)
+        token = secrets.token_bytes(TOKEN_BYTES)
+        guard = _Guard(handler, target, token)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # Without exclusive use another process could bind the same port.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(socket.SOMAXCONN)
+            listener.setblocking(False)
+            server = await asyncio.start_server(guard, sock=listener, limit=limit)
+        except BaseException:
+            listener.close()
+            raise
+        try:
+            start_time = _process_start_time(os.getpid())
+            if start_time is None:
+                raise OSError("cannot read this process's start time")
+            identity = write_endpoint(target, Endpoint(
+                port=listener.getsockname()[1], token=token,
+                pid=os.getpid(), start_time=start_time))
+        except BaseException:
+            server.close()
+            await server.wait_closed()
+            raise
+    return IpcServer(server, target, identity, guard)
+
+
+async def _windows_open(target: Path, limit: int, timeout: float,
+                        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    endpoint = read_endpoint(target)
+    _require_live(endpoint)
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", endpoint.port, limit=limit), timeout)
+    except (OSError, asyncio.TimeoutError) as exc:
+        # Includes the ~2 s Windows takes to refuse a closed loopback port.
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, "endpoint is not accepting connections") from exc
+    try:
+        await asyncio.wait_for(_client_handshake(reader, writer, endpoint.token), timeout)
+    except AuthenticationError:
+        await _close_quietly(writer)
+        raise
+    except (OSError, EOFError, asyncio.TimeoutError) as exc:
+        # A timeout, an early close or a reset: the peer proved nothing.
+        await _close_quietly(writer)
+        raise AuthenticationError("endpoint handshake failed") from exc
+    except BaseException:
+        await _close_quietly(writer)
+        raise
+    return reader, writer
+
+
+def _recv_exactly(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise AuthenticationError("endpoint closed during the handshake")
+        data += chunk
+    return bytes(data)
+
+
+def _windows_connect_sync(target: Path, timeout: float) -> socket.socket:
+    endpoint = read_endpoint(target)
+    _require_live(endpoint)
+    try:
+        sock = socket.create_connection(("127.0.0.1", endpoint.port), timeout=timeout)
+    except OSError as exc:  # refused, or timed out while Windows retried the SYN
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, "endpoint is not accepting connections") from exc
+    try:
+        client_nonce = secrets.token_bytes(NONCE_BYTES)
+        sock.sendall(client_nonce)
+        reply = _recv_exactly(sock, NONCE_BYTES + MAC_BYTES)
+        server_nonce, server_mac = reply[:NONCE_BYTES], reply[NONCE_BYTES:]
+        if not hmac.compare_digest(
+                server_mac, _mac(endpoint.token, b"srv", client_nonce, server_nonce)):
+            raise AuthenticationError("endpoint did not prove the shared token")
+        sock.sendall(_mac(endpoint.token, b"cli", server_nonce, client_nonce))
+        sock.settimeout(None)
+    except AuthenticationError:
+        sock.close()
+        raise
+    except OSError as exc:  # a timeout (socket.timeout) or a reset mid-handshake
+        sock.close()
+        raise AuthenticationError("endpoint handshake failed") from exc
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+__all__ = [
+    "AlreadyRunningError", "AuthenticationError", "DEFAULT_LIMIT", "Endpoint",
+    "HANDSHAKE_TIMEOUT", "IpcServer", "UnsafeEndpointError", "connect_sync",
+    "ensure_private_directory", "open_connection", "read_endpoint", "start_server",
+    "write_endpoint",
+]
