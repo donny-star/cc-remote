@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
 
 from cc_remote.attachments import MAX_IMAGE_PIXELS, decode_attachment, validate_attachments
-from cc_remote.platform.identity import current_euid
+from cc_remote.platform import files as platform_files, perms
 
 
 # Extra durable copies, not the user's working files or native transcripts.
@@ -257,7 +257,7 @@ class SessionArtifactStore:
         self.root = Path(state_dir) / "session-artifacts"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != current_euid():
+        if not stat.S_ISDIR(info.st_mode) or not perms.owned_info(self.root, info, effective=True):
             raise OSError("unsafe artifact directory")
         os.chmod(self.root, 0o700)
         self.path = self.root / "index.sqlite3"
@@ -383,14 +383,14 @@ class SessionArtifactStore:
                 if path.parent != self.root:
                     raise OSError("unsafe artifact upload path")
                 try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    fd = platform_files.open_nofollow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
                 except FileNotFoundError:
                     new_files[path] = len(data)
                 else:
                     with os.fdopen(fd, "rb") as existing:
                         info = os.fstat(existing.fileno())
                         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                                or info.st_uid != current_euid()):
+                                or not perms.owned_info(existing.fileno(), info, effective=True)):
                             raise OSError("unsafe artifact upload")
                         if existing.read(len(data) + 1) != data:
                             raise OSError("artifact upload content changed")
@@ -401,7 +401,7 @@ class SessionArtifactStore:
             try:
                 for identity, name, path, data in pending:
                     if path in new_files:
-                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        fd = platform_files.open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                         created.append(path)
                         with os.fdopen(fd, "wb") as out:
                             out.write(data)

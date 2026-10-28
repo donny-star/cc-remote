@@ -31,7 +31,7 @@ class DshMutationJournal:
     def connection(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fd = platform_files.open_nofollow(self.path, os.O_CREAT | os.O_RDWR, 0o600)
             os.close(fd)
             with closing(sqlite3.connect(self.path, timeout=10)) as db:
                 db.row_factory = sqlite3.Row

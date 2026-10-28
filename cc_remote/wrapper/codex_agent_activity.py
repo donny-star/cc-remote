@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import threading
 
+from cc_remote.platform import files as platform_files
 from cc_remote.protocol import BackgroundProcessItem, MAX_BACKGROUND_PROCESS_ITEMS
 from cc_remote.wrapper.codex_agents import _ID, _parent
 from cc_remote.wrapper.codex_external import parse_turn_markers
@@ -95,7 +96,7 @@ class CodexAgentActivity:
 
     def _read(self, home, sid, path, parent, budget):
         path = _local_path(home, path)
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = platform_files.open_nofollow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode):
