@@ -808,3 +808,22 @@ def test_cold_cleanup_losing_the_race_leaves_no_journal_lock(tmp_path, monkeypat
     assert cleanup_codex_checkpoint_session(state, "raced-cold") == 0
     assert not journal.session_dir.exists()
     assert not journal.lock_path.exists()
+
+
+@pytest.mark.windows_only(reason="POSIX refuses a symlinked session directory before cleanup")
+def test_cold_cleanup_removes_a_junction_session_directory_not_its_target(tmp_path):
+    import _winapi
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "junction-cold")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "kept.txt").write_bytes(b"keep")
+    checkpoint_module.platform_files.force_rmtree(journal.session_dir)
+    _winapi.CreateJunction(str(victim), str(journal.session_dir))
+
+    assert cleanup_codex_checkpoint_session(state, "junction-cold") == 1
+    assert (victim / "kept.txt").read_bytes() == b"keep"
+    assert not os.path.lexists(journal.session_dir)
+    assert list(journal.session_dir.parent.iterdir()) == []

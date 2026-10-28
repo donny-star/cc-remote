@@ -141,19 +141,36 @@ def _win32_long_path(path: str) -> str:
 
 
 def force_rmtree(path: StrPath) -> None:
-    """Remove a tree, clearing Windows read-only bits and long-path limits."""
+    """Remove a tree, clearing Windows read-only bits and long-path limits.
+
+    POSIX refuses a top-level symlink, as ``shutil.rmtree`` does. Windows
+    removes a top-level junction or symlink itself, never its target; links
+    inside the tree are removed without being followed on both.
+    """
     if not IS_WINDOWS:
         shutil.rmtree(path)
         return
 
     def clear_readonly_and_retry(func, target, _error) -> None:
+        if func is os.path.islink:
+            # shutil refusing a link; retrying would report it removed.
+            raise OSError(errno.ELOOP, "refusing to remove a link's target", target)
         try:
-            os.chmod(target, stat.S_IWRITE)
+            _win32_clear_read_only_nofollow(target)
             func(target)
         except FileNotFoundError:
             pass
 
     long_path = _win32_long_path(os.fspath(path))
+    try:
+        info = os.lstat(long_path)
+    except FileNotFoundError:
+        info = None  # rmtree raises it below
+    if info is not None and (
+            stat.S_ISLNK(info.st_mode)
+            or info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT):
+        _win32_remove_link(long_path, info)
+        return
     for attempt in range(5):
         try:
             if sys.version_info >= (3, 12):
@@ -247,6 +264,37 @@ def _win32_set_read_only(handle: int, read_only: bool) -> None:
     if not _kernel32().SetFileInformationByHandle(
             handle, _FILE_BASIC_INFO, ctypes.byref(info), ctypes.sizeof(info)):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win32_clear_read_only_nofollow(path: str) -> None:
+    """Clear FILE_ATTRIBUTE_READONLY on ``path`` itself, never a link target."""
+    import ctypes
+    from ctypes import wintypes
+
+    read_attributes, write_attributes = 0x80, 0x100
+    share_all, open_existing, backup_semantics = 0x7, 3, 0x02000000
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        path, read_attributes | write_attributes, share_all, None, open_existing,
+        backup_semantics | _FILE_FLAG_OPEN_REPARSE_POINT, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        _win32_set_read_only(handle, False)
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _win32_remove_link(path: str, info: os.stat_result) -> None:
+    """Remove a junction or symlink itself; raise unless it is gone."""
+    remove = os.rmdir if info.st_file_attributes & _FILE_ATTRIBUTE_DIRECTORY else os.unlink
+    try:
+        remove(path)
+    except PermissionError:
+        _win32_clear_read_only_nofollow(path)  # e.g. ``attrib +R /L``
+        remove(path)
+    if os.path.lexists(path):
+        raise OSError(errno.EBUSY, "link is still present after removal", path)
 
 
 def _win32_unlink_read_only(path: str) -> bool:

@@ -142,6 +142,35 @@ def test_force_rmtree_removes_readonly_files(tmp_path) -> None:
     assert not (tmp_path / "tree").exists()
 
 
+@pytest.mark.windows_only(reason="POSIX rmtree refuses a top-level symlink, as before")
+def test_force_rmtree_removes_a_top_level_junction_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    kept = victim / "kept.txt"
+    kept.write_bytes(b"keep")
+    os.chmod(kept, stat.S_IREAD)
+    link = tmp_path / "link"
+    _link_directory(victim, link)
+    try:
+        files.force_rmtree(link)
+        assert not os.path.lexists(link)
+        assert kept.read_bytes() == b"keep"
+        assert not os.access(kept, os.W_OK)  # read-only bits outside are untouched
+    finally:
+        os.chmod(kept, stat.S_IREAD | stat.S_IWRITE)
+
+
+@pytest.mark.windows_only(reason="POSIX rmtree refuses a top-level symlink, as before")
+def test_force_rmtree_removes_a_dangling_top_level_junction(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    link = tmp_path / "link"
+    _link_directory(victim, link)
+    victim.rmdir()
+    files.force_rmtree(link)
+    assert not os.path.lexists(link)
+
+
 def test_fsync_directory_accepts_existing_directory(tmp_path) -> None:
     files.fsync_directory(tmp_path)
 
@@ -377,3 +406,39 @@ def test_create_private_temp_retries_a_taken_name(tmp_path, monkeypatch) -> None
     os.close(fd)
     assert Path(name).name == "t" + "c" * 16
     assert (tmp_path / ("t" + "a" * 16)).read_bytes() == b"taken"
+
+
+def _attrib(*args: str) -> None:
+    import subprocess
+
+    subprocess.run(["attrib", *args], check=True, capture_output=True)
+
+
+def _read_only(path) -> bool:
+    return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+
+
+@pytest.mark.windows_only(reason="read-only links and directories are Windows attributes")
+@pytest.mark.parametrize("nested", [False, True])
+def test_force_rmtree_removes_read_only_junctions_without_touching_targets(
+        tmp_path, nested) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "kept.txt").write_bytes(b"keep")
+    tree = tmp_path / "tree"
+    if nested:
+        tree.mkdir()
+        link = tree / "link"
+    else:
+        link = tree
+    _link_directory(victim, link)
+    _attrib("+R", str(victim))
+    _attrib("+R", "/L", str(link))
+    assert _read_only(link) and _read_only(victim)
+    try:
+        files.force_rmtree(tree)
+        assert not os.path.lexists(tree)
+        assert (victim / "kept.txt").read_bytes() == b"keep"
+        assert _read_only(victim)
+    finally:
+        _attrib("-R", str(victim))
