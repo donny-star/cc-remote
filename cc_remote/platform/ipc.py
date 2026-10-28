@@ -38,6 +38,9 @@ class AuthenticationError(ConnectionError):
 def ensure_private_directory(path: StrPath) -> Path:
     """Create ``path`` (0700) when missing and require it to be user-private."""
     directory = Path(path).expanduser().absolute()
+    if IS_WINDOWS and not _inside_profile(directory):
+        # Refuse before mkdir so a rejected path leaves nothing behind.
+        raise UnsafeEndpointError("directory must be inside the current user's profile")
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
@@ -67,19 +70,31 @@ def _profile_directory() -> str:
     import win32profile
     import win32security
 
-    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    from cc_remote.platform._win32err import translated
+
+    with translated():
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            return win32profile.GetUserProfileDirectory(token)
+        finally:
+            token.Close()
+
+
+def _inside_profile(directory: Path) -> bool:
+    # Non-strict realpath resolves only the existing prefix (including 8.3
+    # short names such as a default TEMP) and keeps the missing remainder.
+    profile = os.path.normcase(os.path.realpath(_profile_directory()))
+    real = os.path.normcase(os.path.realpath(directory))
     try:
-        return win32profile.GetUserProfileDirectory(token)
-    finally:
-        token.Close()
+        return os.path.commonpath([profile, real]) == profile
+    except ValueError:  # another drive or a UNC share
+        return False
 
 
 def _check_windows_directory(directory: Path) -> None:
     if not directory.is_dir() or files.is_reparse_point(directory):
         raise UnsafeEndpointError("directory must be a real directory")
-    profile = os.path.normcase(os.path.realpath(_profile_directory()))
-    real = os.path.normcase(os.path.realpath(directory))
-    if os.path.commonpath([profile, real]) != profile:
+    if not _inside_profile(directory):
         raise UnsafeEndpointError("directory must be inside the current user's profile")
     if not perms.owned_by_current_user(directory):
         raise UnsafeEndpointError("directory must be owned by the current uid")

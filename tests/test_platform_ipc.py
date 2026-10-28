@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+import uuid
 
 import pytest
 
@@ -80,6 +81,46 @@ def test_ensure_private_directory_requires_the_user_profile(tmp_path, monkeypatc
     assert ipc.ensure_private_directory(profile / "inside").is_dir()
     with pytest.raises(ipc.UnsafeEndpointError, match="profile"):
         ipc.ensure_private_directory(tmp_path / "outside")
+
+
+@pytest.mark.windows_only(reason="the profile boundary only exists for Windows endpoints")
+def test_ensure_private_directory_rejects_another_drive(tmp_path, monkeypatch):
+    monkeypatch.setattr(ipc, "_profile_directory", lambda: "Z:\profile")
+    with pytest.raises(ipc.UnsafeEndpointError, match="profile") as caught:
+        ipc.ensure_private_directory(tmp_path / "elsewhere")
+    assert isinstance(caught.value, OSError)
+    assert not (tmp_path / "elsewhere").exists()
+
+
+@pytest.mark.windows_only(reason="the profile boundary only exists for Windows endpoints")
+def test_ensure_private_directory_creates_nothing_outside_the_profile(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.setattr(ipc, "_profile_directory", lambda: str(profile))
+    outside = tmp_path / "outside" / uuid.uuid4().hex / "x"
+    with pytest.raises(ipc.UnsafeEndpointError, match="profile"):
+        ipc.ensure_private_directory(outside)
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.windows_only(reason="the profile root comes from the process token")
+def test_profile_directory_translates_pywin32_errors(monkeypatch):
+    import pywintypes
+    import win32profile
+
+    def denied(_token):
+        raise pywintypes.error(5, "GetUserProfileDirectory", "denied")
+
+    monkeypatch.setattr(win32profile, "GetUserProfileDirectory", denied)
+    ipc._profile_directory.cache_clear()
+    try:
+        with pytest.raises(OSError) as caught:
+            ipc._profile_directory()
+        assert isinstance(caught.value, PermissionError)
+        with pytest.raises(OSError):
+            ipc.ensure_private_directory("C:/Users/never-created-by-ipc-tests/x")
+    finally:
+        ipc._profile_directory.cache_clear()
 
 
 @pytest.mark.windows_only(reason="the profile root comes from the process token")
