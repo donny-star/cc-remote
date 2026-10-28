@@ -29,7 +29,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from cc_remote.log import logger
-from cc_remote.platform import IS_WINDOWS, files, perms
+from cc_remote.platform import IS_WINDOWS, files, locks, perms
 from cc_remote.platform.identity import current_uid
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
@@ -43,6 +43,13 @@ NONCE_BYTES = 32
 MAC_BYTES = 32
 _FAILURE_LOG_INTERVAL = 60.0
 _SHARING_VIOLATION = 32
+# A listening server accepts a loopback connect at once, but Windows reports a
+# refused one only after ~2 s of SYN retries. A dead owner's port gets the
+# quick bound; a live owner's gets one long enough to see the refusal.
+_PROBE_QUICK_CONNECT_TIMEOUT = 0.5
+_PROBE_CONNECT_TIMEOUT = 3.0
+_START_LOCK_TIMEOUT = 10.0
+_START_LOCK_POLL = 0.02
 
 log = logger("cc_remote.platform.ipc")
 
@@ -275,6 +282,8 @@ async def _server_handshake(reader: asyncio.StreamReader,
 
 def _peer_uid(sock: socket.socket) -> int:
     """Return an AF_UNIX peer uid on Linux or macOS, failing closed elsewhere."""
+    if IS_WINDOWS:
+        raise AuthenticationError("Unix peer credentials are unsupported")
     if hasattr(socket, "SO_PEERCRED"):
         try:
             credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
@@ -312,6 +321,9 @@ class _Guard:
     """Authenticate each accepted connection before ``handler`` sees it."""
 
     def __init__(self, handler: Handler, path: Path, token: bytes | None = None):
+        if IS_WINDOWS and token is None:
+            # Windows has no peer uid; only the token proves the same user.
+            raise UnsafeEndpointError("a Windows endpoint guard requires a token")
         self._handler = handler
         self._path = path
         self._token = token
@@ -343,3 +355,104 @@ class _Guard:
             self._last_log = now
             log.warning("local endpoint rejected an unauthenticated peer",
                         endpoint=str(self._path), failures=self.failures)
+
+
+# --- Windows liveness, stale endpoints and start serialization ---------------
+
+async def _close_quietly(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+
+
+def _process_start_time(pid: int) -> int | None:
+    from cc_remote.platform import win32_process
+
+    return win32_process.creation_time(pid)
+
+
+def _owner_alive(endpoint: Endpoint) -> bool:
+    return _process_start_time(endpoint.pid) == endpoint.start_time
+
+
+def _require_live(endpoint: Endpoint) -> None:
+    if not _owner_alive(endpoint):
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "endpoint owner is no longer running")
+
+
+async def _probe(endpoint: Endpoint) -> str:
+    """``live`` (proved the token), ``gone`` (stale) or ``unknown``."""
+    connection = None
+    for timeout in (_PROBE_QUICK_CONNECT_TIMEOUT, _PROBE_CONNECT_TIMEOUT):
+        try:
+            connection = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", endpoint.port), timeout)
+            break
+        except ConnectionRefusedError:
+            return "gone"
+        except (OSError, asyncio.TimeoutError):
+            # Only a live owner earns the long wait that tells a refused port
+            # from a full backlog; a dead owner's silent port is simply stale.
+            if not _owner_alive(endpoint):
+                return "gone"
+    if connection is None:
+        return "unknown"
+    reader, writer = connection
+    try:
+        await asyncio.wait_for(
+            _client_handshake(reader, writer, endpoint.token), HANDSHAKE_TIMEOUT)
+        return "live"
+    except AuthenticationError:
+        return "gone"
+    except (OSError, EOFError, asyncio.TimeoutError):
+        return "unknown"
+    finally:
+        await _close_quietly(writer)
+
+
+async def _reclaim_windows(target: Path) -> None:
+    """Remove a dead server's record; refuse a live or unverifiable one.
+
+    A completed handshake is the proof of a running server; it also covers an
+    owner whose process cannot be inspected (e.g. elevated). An inconclusive
+    probe only counts as stale once the recorded owner is provably gone.
+    """
+    try:
+        endpoint = read_endpoint(target)  # also proves the file is ours
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # unsafe, malformed, a directory, unreadable
+        raise UnsafeEndpointError(
+            "refusing to replace a non-owned or non-endpoint path") from exc
+    verdict = await _probe(endpoint)
+    if verdict == "live":
+        raise AlreadyRunningError(f"endpoint is already running at {target}")
+    if verdict == "unknown" and _owner_alive(endpoint):
+        raise UnsafeEndpointError(f"cannot verify the existing endpoint at {target}")
+    with contextlib.suppress(FileNotFoundError):
+        target.unlink()
+
+
+@contextlib.asynccontextmanager
+async def _start_lock(target: Path):
+    """Serialize reclaim-and-publish between servers starting at ``target``.
+
+    The lock file is never removed: deleting it would let a third starter lock
+    a fresh file while the second still holds the old one.
+    """
+    fd = files.open_nofollow(target.with_name(target.name + ".lock"),
+                             os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + _START_LOCK_TIMEOUT
+        while True:
+            try:
+                locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise AlreadyRunningError(
+                        f"another server is starting at {target}") from None
+                await asyncio.sleep(_START_LOCK_POLL)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock

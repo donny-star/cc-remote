@@ -7,16 +7,19 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 
 import pytest
 
-from cc_remote.platform import ipc, perms
-from tests.ipc_helpers import share_with_everyone
+from cc_remote.platform import IS_WINDOWS, ipc, perms
+from tests.ipc_helpers import SHORT_TMP, share_with_everyone
 
 
 def test_ensure_private_directory_creates_an_owner_only_tree(tmp_path):
@@ -532,3 +535,219 @@ def test_peer_uid_reads_the_connected_user():
     finally:
         left.close()
         right.close()
+
+
+@pytest.mark.windows_only(reason="Windows has no Unix peer credentials")
+def test_peer_uid_fails_closed_on_windows():
+    sock = socket.socket()
+    try:
+        with pytest.raises(ipc.AuthenticationError, match="unsupported"):
+            ipc._peer_uid(sock)
+    finally:
+        sock.close()
+
+
+@pytest.mark.windows_only(reason="Windows connections are authenticated only by the token")
+def test_guard_requires_a_token_on_windows():
+    with pytest.raises(ipc.UnsafeEndpointError, match="requires a token"):
+        ipc._Guard(_echo, Path("endpoint"))
+
+
+@pytest.fixture
+def endpoint_path():
+    root = Path(tempfile.mkdtemp(prefix="ccipc-", dir=SHORT_TMP))
+    try:
+        yield root / "ep.sock"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _own_start_time() -> int:
+    from cc_remote.platform import win32_process
+
+    return win32_process.creation_time(os.getpid())
+
+
+def _dead_pid() -> int:
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    return finished.pid
+
+
+def _closed_port() -> int:
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+def _record(path: Path, port: int, token: bytes, *, pid: int | None = None,
+            start_time: int | None = None) -> None:
+    ipc.ensure_private_directory(path.parent)
+    ipc.write_endpoint(path, ipc.Endpoint(
+        port=port, token=token, pid=pid or os.getpid(),
+        start_time=start_time or _own_start_time()))
+
+
+def _leave_stale_endpoint(path: Path) -> None:
+    """What a killed server leaves behind: an owned endpoint nobody listens on."""
+    ipc.ensure_private_directory(path.parent)
+    if IS_WINDOWS:
+        _record(path, _closed_port(), os.urandom(32))
+        return
+    old_umask = os.umask(0o177)
+    try:
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(path))
+        stale.close()
+    finally:
+        os.umask(old_umask)
+
+
+async def _listen(behaviour):
+    server = await asyncio.start_server(behaviour, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _silent(reader, writer):
+    """Accept and never answer: a hung or impostor listener."""
+    await reader.read()
+    writer.close()
+
+
+async def _random_reply(reader, writer):
+    """Answer the nonce with garbage: another process reused the port."""
+    await reader.readexactly(ipc.NONCE_BYTES)
+    writer.write(os.urandom(ipc.NONCE_BYTES + ipc.MAC_BYTES))
+    await writer.drain()
+    await reader.read()
+    writer.close()
+
+
+async def _stop(listener) -> None:
+    listener.close()
+    await listener.wait_closed()
+
+
+windows_reclaim = pytest.mark.windows_only(
+    reason="endpoint records and their reclaim rules exist only on Windows")
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_a_live_server(endpoint_path):
+    token = os.urandom(32)
+
+    async def genuine(reader, writer):
+        await ipc._server_handshake(reader, writer, token)
+        await reader.read()
+        writer.close()
+
+    listener, port = await _listen(genuine)
+    try:
+        _record(endpoint_path, port, token)
+        with pytest.raises(ipc.AlreadyRunningError, match="already running"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert ipc.read_endpoint(endpoint_path).port == port
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_a_record_whose_port_is_closed(endpoint_path):
+    # The owner (this process) is alive; nothing listens: Windows refuses after ~2 s.
+    _leave_stale_endpoint(endpoint_path)
+    await ipc._reclaim_windows(endpoint_path)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_of_a_dead_owner_does_not_wait_for_the_refusal(endpoint_path):
+    # A crashed server's record must not cost the ~2 s Windows refusal: a
+    # restarted broker has to publish within claude-remote's 3 s readiness wait.
+    _record(endpoint_path, _closed_port(), os.urandom(32), pid=_dead_pid(), start_time=1)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await ipc._reclaim_windows(endpoint_path)
+    assert loop.time() - started < 1.5
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_a_record_whose_port_was_taken_by_another_process(endpoint_path):
+    listener, port = await _listen(_random_reply)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_an_unverifiable_record_of_a_live_owner(endpoint_path, monkeypatch):
+    # A live owner whose loop is busy must never lose its endpoint to a second starter.
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    listener, port = await _listen(_silent)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        with pytest.raises(ipc.UnsafeEndpointError, match="cannot verify"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_removes_an_unverifiable_record_of_a_dead_owner(endpoint_path, monkeypatch):
+    monkeypatch.setattr(ipc, "HANDSHAKE_TIMEOUT", 0.2)
+    listener, port = await _listen(_silent)
+    try:
+        _record(endpoint_path, port, os.urandom(32), pid=_dead_pid(), start_time=1)
+        await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_ignores_a_missing_record_and_refuses_foreign_files(endpoint_path):
+    ipc.ensure_private_directory(endpoint_path.parent)
+    await ipc._reclaim_windows(endpoint_path)
+    endpoint_path.write_text("do not replace", encoding="utf-8")
+    with pytest.raises(ipc.UnsafeEndpointError, match="refusing to replace"):
+        await ipc._reclaim_windows(endpoint_path)
+    assert endpoint_path.read_text(encoding="utf-8") == "do not replace"
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_start_lock_serializes_starters_and_gives_up(endpoint_path, monkeypatch):
+    ipc.ensure_private_directory(endpoint_path.parent)
+    order = []
+
+    async def starter(name: str, hold: float) -> None:
+        async with ipc._start_lock(endpoint_path):
+            order.append(f"{name}+")
+            await asyncio.sleep(hold)
+            order.append(f"{name}-")
+
+    first = asyncio.create_task(starter("a", 0.3))
+    await asyncio.sleep(0.05)
+    await starter("b", 0)
+    await first
+    assert order == ["a+", "a-", "b+", "b-"]
+
+    monkeypatch.setattr(ipc, "_START_LOCK_TIMEOUT", 0.2)
+    holder = asyncio.create_task(starter("c", 1.0))
+    await asyncio.sleep(0.05)
+    with pytest.raises(ipc.AlreadyRunningError, match="another server is starting"):
+        await starter("d", 0)
+    await holder
