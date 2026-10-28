@@ -46,7 +46,12 @@ _RESIZE_POLL_SECONDS = 0.25
 # Windows gives it a console of its own without a window, not DETACHED_PROCESS:
 # a venv python.exe is a launcher that re-spawns the real interpreter, and a
 # console-less launcher would hand that child a fresh, visible console window.
-DETACHED_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+# It also leaves the launcher's Job: IDE terminals, CI runners and Task
+# Scheduler kill their whole Job on close. A Job without BREAKAWAY_OK refuses
+# the spawn (PermissionError); retry without JOB_BREAKAWAY_CREATIONFLAG then.
+JOB_BREAKAWAY_CREATIONFLAG = subprocess.CREATE_BREAKAWAY_FROM_JOB if IS_WINDOWS else 0
+DETACHED_CREATIONFLAGS = (
+    subprocess.CREATE_NO_WINDOW | JOB_BREAKAWAY_CREATIONFLAG if IS_WINDOWS else 0)
 
 if IS_WINDOWS:
     import ctypes
@@ -1062,6 +1067,6 @@ class InputReader:
 
 
 __all__ = [
-    "DETACHED_CREATIONFLAGS", "InputReader", "PtyProcess", "READ_CHUNK_BYTES", "RawTerminal",
-    "spawn", "terminal_size", "watch_resize",
+    "DETACHED_CREATIONFLAGS", "InputReader", "JOB_BREAKAWAY_CREATIONFLAG", "PtyProcess",
+    "READ_CHUNK_BYTES", "RawTerminal", "spawn", "terminal_size", "watch_resize",
 ]

@@ -20,6 +20,11 @@ from .server import BrokerConfig, BrokerSecurityError, BrokerServer
 from .session import DEFAULT_HISTORY_BYTES, DEFAULT_MAX_SESSIONS, SessionError
 
 
+# A cold Windows start (venv launcher, pywin32 imports, an antivirus scan) can
+# take seconds; a broker that already exited ends the wait early.
+BROKER_READY_SECONDS = 10.0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-remote",
@@ -249,36 +254,34 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
     try:
         ipc.ensure_private_directory(parent)
     except ipc.UnsafeEndpointError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and not isinstance(cause, ipc.UnsafeEndpointError):
+            # The directory could not be created at all: report why.
+            raise BrokerClientError(
+                "broker_start_failed",
+                f"cannot create the broker socket directory {parent}: {cause}",
+            ) from exc
         raise BrokerSecurityError(
-            "broker socket directory must be private and owned by the current uid") from exc
+            f"broker socket directory must be private and owned by the current uid: {exc}",
+        ) from exc
     log_path = os.path.join(parent, "claude-broker.log")
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        procs.popen_group(
-            [
-                sys.executable,
-                "-m",
-                "cc_remote.claude_remote",
-                "--socket",
-                target,
-                "serve",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log_fd,
-            stderr=log_fd,
-            close_fds=True,
-            # Windows: a windowless console of its own, so closing the
-            # launching terminal cannot end the broker. POSIX gets 0, which
-            # subprocess accepts unchanged.
-            creationflags=pty.DETACHED_CREATIONFLAGS,
+        broker = _spawn_broker(
+            [sys.executable, "-m", "cc_remote.claude_remote", "--socket", target, "serve"],
+            log_fd,
         )
     finally:
         os.close(log_fd)
 
-    deadline = asyncio.get_running_loop().time() + 3.0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + BROKER_READY_SECONDS
     last_error: BrokerClientError | None = None
-    while asyncio.get_running_loop().time() < deadline:
+    while loop.time() < deadline:
         await asyncio.sleep(0.05)
+        # Sampled before the check: a broker that lost a concurrent start
+        # exits, but only after the winner answers.
+        exited = broker.poll()
         try:
             await client.status()
             return
@@ -286,10 +289,38 @@ async def _ensure_broker(client: BrokerClient, socket_path: str) -> None:
             last_error = exc
             if exc.code not in {"broker_unavailable", "broker_disconnected"}:
                 raise
+        if exited is not None:
+            raise BrokerClientError(
+                "broker_start_failed",
+                f"broker exited with status {exited} before it became ready; see {log_path}",
+            )
     raise BrokerClientError(
         "broker_start_failed",
         f"broker did not become ready; see {log_path}: {last_error or 'timeout'}",
     )
+
+
+def _spawn_broker(argv: list[str], log_fd: int) -> subprocess.Popen:
+    def spawn(creationflags: int) -> subprocess.Popen:
+        return procs.popen_group(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=log_fd,
+            close_fds=True,
+            # Windows: a windowless console of its own, outside the launching
+            # terminal's Job, so closing that terminal cannot end the broker.
+            # POSIX gets 0, which subprocess accepts unchanged.
+            creationflags=creationflags,
+        )
+
+    try:
+        return spawn(pty.DETACHED_CREATIONFLAGS)
+    except PermissionError:
+        if not pty.JOB_BREAKAWAY_CREATIONFLAG:
+            raise
+        # The launching Job does not allow breakaway: stay inside it.
+        return spawn(pty.DETACHED_CREATIONFLAGS & ~pty.JOB_BREAKAWAY_CREATIONFLAG)
 
 
 async def async_main(argv: list[str] | None = None) -> int:

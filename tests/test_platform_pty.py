@@ -903,8 +903,10 @@ def test_terminal_size_honours_columns_and_lines(monkeypatch):
 def test_detached_servers_leave_the_launching_console():
     import subprocess
 
-    expected = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+    breakaway = subprocess.CREATE_BREAKAWAY_FROM_JOB if IS_WINDOWS else 0
+    expected = subprocess.CREATE_NO_WINDOW | breakaway if IS_WINDOWS else 0
     assert pty.DETACHED_CREATIONFLAGS == expected
+    assert pty.JOB_BREAKAWAY_CREATIONFLAG == breakaway
 
 
 @pytest.mark.windows_only(reason="console windows are a Windows concept")
@@ -925,6 +927,45 @@ def test_detached_server_never_gets_a_console_window(tmp_path):
         creationflags=pty.DETACHED_CREATIONFLAGS)
     assert child.wait(30) == 0
     assert report.read_text() == "0"
+
+
+_CONSOLE_PIDS = """
+import ctypes, json, os, subprocess, sys
+from cc_remote.platform import procs, pty
+pids = (ctypes.c_uint32 * 64)()
+count = ctypes.windll.kernel32.GetConsoleProcessList(pids, 64)
+with open(sys.argv[1], "w") as report:
+    json.dump({"pid": os.getpid(), "console": list(pids[:count])}, report)
+"""
+
+
+@pytest.mark.windows_only(reason="consoles are a Windows concept")
+def test_a_detached_server_is_not_attached_to_the_launching_console(tmp_path):
+    import subprocess
+    import sys
+
+    # The launcher owns a (hidden) console of its own, like a user's terminal.
+    launcher_report = tmp_path / "launcher.json"
+    child_report = tmp_path / "child.json"
+    launcher_code = _CONSOLE_PIDS + (
+        "child = procs.popen_group([sys.executable, '-c', sys.argv[3], sys.argv[2]],"
+        " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,"
+        " close_fds=True, creationflags=pty.DETACHED_CREATIONFLAGS)"
+        "; sys.exit(child.wait(30))")
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0  # SW_HIDE
+    launcher = subprocess.run(
+        [sys.executable, "-c", launcher_code, str(launcher_report), str(child_report),
+         _CONSOLE_PIDS],
+        cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=startup,
+        timeout=60, check=False)
+    assert launcher.returncode == 0
+    launched = json.loads(launcher_report.read_text())
+    child = json.loads(child_report.read_text())
+    assert launched["pid"] in launched["console"]  # the launcher had a console
+    assert child["pid"] in child["console"]  # and so does the server: its own
+    assert launched["pid"] not in child["console"]
 
 
 class _FakeConsole:

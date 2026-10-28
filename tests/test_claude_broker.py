@@ -1500,6 +1500,21 @@ async def test_cli_keyboard_attachment_forwards_piped_stdin(monkeypatch: pytest.
     assert attachment.closed is True
 
 
+class _FakeBrokerProcess:
+    def __init__(self, returncode: int | None = None):
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+class _UnavailableBroker:
+    """A client whose broker is never reachable."""
+
+    async def status(self):
+        raise BrokerClientError("broker_unavailable", "not running")
+
+
 @pytest.mark.asyncio
 async def test_ensure_broker_starts_one_detached_private_broker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -1508,7 +1523,7 @@ async def test_ensure_broker_starts_one_detached_private_broker(
 
     def popen_group(args, **kwargs):
         started.append((args, kwargs))
-        return object()
+        return _FakeBrokerProcess()
 
     monkeypatch.setattr(broker_cli.procs, "popen_group", popen_group)
 
@@ -1616,3 +1631,115 @@ async def test_cli_attach_closes_its_one_input_reader_before_leaving_raw_mode(
         with pytest.raises(asyncio.CancelledError):
             await attach
     assert events == ["reader", "raw", "reader-closed", "restored", "detached"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_broker_waits_for_a_slow_cold_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    # A cold Windows start (venv launcher, pywin32 imports, a Defender scan)
+    # can take several seconds before the endpoint answers.
+    monkeypatch.setattr(
+        broker_cli.procs, "popen_group", lambda *_args, **_kwargs: _FakeBrokerProcess())
+    loop = asyncio.get_running_loop()
+    ready_at = loop.time() + 3.5
+
+    class Client:
+        async def status(self):
+            if loop.time() < ready_at:
+                raise BrokerClientError("broker_unavailable", "starting")
+            return {"ok": True}
+
+    await broker_cli._ensure_broker(Client(), str(tmp_path / "broker" / "claude-broker.sock"))
+    assert loop.time() >= ready_at
+
+
+@pytest.mark.asyncio
+async def test_ensure_broker_stops_waiting_once_the_broker_exited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setattr(
+        broker_cli.procs, "popen_group", lambda *_args, **_kwargs: _FakeBrokerProcess(1))
+    socket_path = tmp_path / "broker" / "claude-broker.sock"
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(BrokerClientError) as error:
+        await broker_cli._ensure_broker(_UnavailableBroker(), str(socket_path))
+    assert loop.time() - started < 2.0
+    assert error.value.code == "broker_start_failed"
+    assert "exited" in str(error.value)
+    assert str(socket_path.parent / "claude-broker.log") in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_ensure_broker_leaves_the_launching_job_when_it_may(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    flags = []
+
+    def popen_group(_args, **kwargs):
+        flags.append(kwargs["creationflags"])
+        return _FakeBrokerProcess()
+
+    class Client:
+        attempts = 0
+
+        async def status(self):
+            Client.attempts += 1
+            if Client.attempts == 1:
+                raise BrokerClientError("broker_unavailable", "not running")
+            return {"ok": True}
+
+    monkeypatch.setattr(broker_cli.procs, "popen_group", popen_group)
+    await broker_cli._ensure_broker(Client(), str(tmp_path / "broker" / "claude-broker.sock"))
+    assert flags == [broker_cli.pty.DETACHED_CREATIONFLAGS]
+    if IS_WINDOWS:
+        # A kill-on-close Job of the launching terminal must not end the broker.
+        assert flags[0] & subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+
+@pytest.mark.windows_only(reason="Job breakaway is a Windows concept")
+@pytest.mark.asyncio
+async def test_ensure_broker_stays_in_a_job_that_forbids_breakaway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    flags = []
+
+    def popen_group(_args, **kwargs):
+        flags.append(kwargs["creationflags"])
+        if kwargs["creationflags"] & subprocess.CREATE_BREAKAWAY_FROM_JOB:
+            raise PermissionError(13, "Access is denied")  # no JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        return _FakeBrokerProcess()
+
+    class Client:
+        attempts = 0
+
+        async def status(self):
+            Client.attempts += 1
+            if Client.attempts == 1:
+                raise BrokerClientError("broker_unavailable", "not running")
+            return {"ok": True}
+
+    monkeypatch.setattr(broker_cli.procs, "popen_group", popen_group)
+    await broker_cli._ensure_broker(Client(), str(tmp_path / "broker" / "claude-broker.sock"))
+    assert flags == [
+        broker_cli.pty.DETACHED_CREATIONFLAGS,
+        broker_cli.pty.DETACHED_CREATIONFLAGS & ~subprocess.CREATE_BREAKAWAY_FROM_JOB,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_broker_reports_why_its_directory_cannot_be_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setattr(
+        broker_cli.procs, "popen_group",
+        lambda *_args, **_kwargs: pytest.fail("nothing may start without a directory"))
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    with pytest.raises(BrokerClientError) as error:
+        await broker_cli._ensure_broker(
+            _UnavailableBroker(), str(blocker / "broker" / "claude-broker.sock"))
+    assert error.value.code == "broker_start_failed"
+    assert "private" not in str(error.value)
+    assert str(blocker / "broker") in str(error.value)
