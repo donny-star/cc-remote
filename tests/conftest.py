@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -35,6 +37,26 @@ def _isolate_account_profile_environment(
         monkeypatch.delenv(key, raising=False)
 
 
+@functools.cache
+def _symlink_unavailable() -> str | None:
+    """Why this process cannot create symbolic links, or None when it can.
+
+    Windows needs Developer Mode or an elevated token (WinError 1314
+    otherwise). POSIX always can.
+    """
+    if sys.platform != "win32":
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        target = os.path.join(directory, "target")
+        with open(target, "w", encoding="utf-8"):
+            pass
+        try:
+            os.symlink(target, os.path.join(directory, "link"))
+        except OSError as exc:
+            return f"cannot create symbolic links: {exc.strerror or exc}"
+    return None
+
+
 def pytest_configure(config: pytest.Config) -> None:
     if sys.platform != "win32":
         return
@@ -52,7 +74,7 @@ def pytest_collection_modifyitems(
 ) -> None:
     excluded = "posix_only" if sys.platform == "win32" else "windows_only"
     for item in items:
-        for name in ("posix_only", "windows_only"):
+        for name in ("posix_only", "windows_only", "requires_symlink"):
             marker = item.get_closest_marker(name)
             if marker is not None and not marker.kwargs.get("reason"):
                 raise pytest.UsageError(f"{item.nodeid}: @{name} requires reason=")
@@ -60,3 +82,9 @@ def pytest_collection_modifyitems(
         if marker is not None:
             item.add_marker(pytest.mark.skip(
                 reason=f"{excluded}: {marker.kwargs['reason']}"))
+        marker = item.get_closest_marker("requires_symlink")
+        if marker is not None:
+            unavailable = _symlink_unavailable()
+            if unavailable is not None:
+                item.add_marker(pytest.mark.skip(
+                    reason=f"requires_symlink: {marker.kwargs['reason']} ({unavailable})"))
