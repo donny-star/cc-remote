@@ -6,6 +6,8 @@ helpers keep the POSIX contract callers were written against.
 """
 from __future__ import annotations
 
+import errno
+import functools
 import os
 import shutil
 import stat
@@ -160,15 +162,52 @@ def force_rmtree(path: StrPath) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
-def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
-    """``os.open`` whose descriptor never blocks unlink/replace of ``path``.
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_TAG_INFO = 9
 
-    ``mode`` is ignored on Windows: a created file inherits its directory's
-    ACL. Use :func:`cc_remote.platform.perms.make_private` to restrict it.
+
+@functools.cache
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return kernel32
+
+
+def _win32_handle_attributes(handle: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    info = _AttributeTagInfo()
+    if not _kernel32().GetFileInformationByHandleEx(
+            handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(info.FileAttributes)
+
+
+def _win32_create(path: StrPath, flags: int, *, refuse_reparse: bool) -> int:
+    """CreateFileW with POSIX open() dispositions and FILE_SHARE_DELETE.
+
+    With ``refuse_reparse`` the reparse point itself is opened and refused.
+    CREATE_ALWAYS would supersede a reparse point before it can be inspected
+    (an AF_UNIX socket file became a regular file), so truncation then
+    happens only after the check.
     """
-    if not IS_WINDOWS:
-        return os.open(path, flags, mode)
-
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -194,26 +233,71 @@ def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
         disposition = truncate_existing
     else:
         disposition = open_existing
+    attributes = file_attribute_normal
+    truncate_after_check = False
+    if refuse_reparse:
+        attributes |= _FILE_FLAG_OPEN_REPARSE_POINT
+        if disposition == create_always:
+            disposition, truncate_after_check = open_always, True
+        elif disposition == truncate_existing:
+            disposition, truncate_after_check = open_existing, True
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    handle = create_file(
-        os.fspath(path), access, share_all, None, disposition,
-        file_attribute_normal, None,
-    )
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        os.fspath(path), access, share_all, None, disposition, attributes, None)
     if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        return msvcrt.open_osfhandle(
+        if refuse_reparse and _win32_handle_attributes(handle) & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.ELOOP, "refusing to open a reparse point", os.fspath(path))
+        fd = msvcrt.open_osfhandle(
             handle, access_flags | os.O_BINARY | (flags & os.O_APPEND))
     except BaseException:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
         raise
+    if truncate_after_check:
+        try:
+            os.ftruncate(fd, 0)
+        except BaseException:
+            os.close(fd)
+            raise
+    return fd
+
+
+def open_with_share_delete(path: StrPath, flags: int, mode: int = 0o600) -> int:
+    """``os.open`` whose descriptor never blocks unlink/replace of ``path``.
+
+    ``mode`` is ignored on Windows: a created file inherits its directory's
+    ACL. Use :func:`cc_remote.platform.perms.make_private` to restrict it.
+    """
+    if not IS_WINDOWS:
+        return os.open(path, flags, mode)
+    return _win32_create(path, flags, refuse_reparse=False)
+
+
+def is_reparse_point(path: StrPath) -> bool:
+    """True when ``path`` itself is a link (POSIX) or any reparse point (Windows).
+
+    Windows counts symlinks, junctions, AF_UNIX socket files and every other
+    reparse tag. Raises FileNotFoundError when ``path`` does not exist.
+    """
+    info = os.lstat(path)
+    if not IS_WINDOWS:
+        return stat.S_ISLNK(info.st_mode)
+    return bool(info.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def open_nofollow(path: StrPath, flags: int, mode: int = 0o600) -> int:
+    """Open a regular file without following a final link.
+
+    POSIX adds ``O_NOFOLLOW | O_CLOEXEC``. Windows opens the reparse point
+    itself and refuses it with ``OSError(ELOOP)``; otherwise the descriptor is
+    the share-delete, binary one of :func:`open_with_share_delete` and
+    ``mode`` is ignored. Directories are not supported on Windows.
+    """
+    if not IS_WINDOWS:
+        return os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
+    return _win32_create(path, flags, refuse_reparse=True)
 
 
 def pread(fd: int, length: int, offset: int) -> bytes:
