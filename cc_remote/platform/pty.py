@@ -885,7 +885,9 @@ _KEY_EVENT = 0x0001
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_TIMEOUT = 0x00000102
 _CONSOLE_POLL_MS = 100
-_CONSOLE_RECORDS = 64
+# Input records taken per read. A paste queues a key-down and a key-up record
+# per character, and every chunk becomes one broker write.
+_CONSOLE_RECORDS = 4096
 _CTRL_PRESSED = 0x0004 | 0x0008  # RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED
 _VK_SPACE = 0x20
 _VK_2 = 0x32

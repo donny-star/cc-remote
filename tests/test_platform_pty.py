@@ -1248,6 +1248,34 @@ async def test_console_keys_arrive_as_utf8_and_only_an_error_is_eof(monkeypatch)
     assert console.batches == []
 
 
+@pytest.mark.windows_only(reason="exercises the Windows console input records")
+def test_a_queued_paste_is_taken_in_large_chunks(monkeypatch):
+    # Each chunk becomes one broker write: a 1000-character paste (a key-down
+    # and a key-up record per character) must not be cut into 64-record reads.
+    _kernel32, record = pty._console_input_api()
+    queued_records = 2000
+
+    class Kernel32:
+        def GetNumberOfConsoleInputEvents(self, handle, count):
+            count._obj.value = queued_records
+            return True
+
+        def ReadConsoleInputW(self, handle, records, length, read):
+            for index in range(length):
+                records[index].EventType = 0x0001  # KEY_EVENT
+                key = records[index].Event.KeyEvent
+                key.bKeyDown = index % 2 == 0
+                key.wRepeatCount = 1
+                key.UnicodeChar = ord("a")
+            read._obj.value = length
+            return True
+
+    monkeypatch.setattr(pty, "_console_input_api", lambda: (Kernel32(), record))
+    keys = pty._read_console_input(0)
+    assert len(keys) == queued_records
+    assert pty._ConsoleKeyDecoder().feed(keys) == b"a" * (queued_records // 2)
+
+
 @pytest.mark.windows_only(reason="exercises the Windows console reader")
 @pytest.mark.asyncio
 async def test_close_leaves_no_console_read_behind(monkeypatch):
