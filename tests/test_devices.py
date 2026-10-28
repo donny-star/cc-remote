@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from argparse import Namespace
 
@@ -13,11 +12,13 @@ from starlette.websockets import WebSocketDisconnect
 
 from cc_remote.config import RelayConfig, WrapperConfig
 from cc_remote import device as device_cli
+from cc_remote.platform import perms
 from cc_remote.protocol import PROTOCOL_VERSION, Hello, deserialize, serialize
 from cc_remote.relay.auth import SESSION_COOKIE_NAME, session_token_claims
 from cc_remote.relay import server
 from cc_remote.relay.devices import DeviceStore
 from cc_remote.relay.server import create_app
+from tests.platform_assertions import assert_private_file, grant_foreign_read
 
 
 def _cfg(tmp_path, **overrides) -> RelayConfig:
@@ -89,7 +90,7 @@ def test_pairing_code_is_single_use_and_plaintext_credential_is_not_stored(tmp_p
         return enrolled.token
 
     token = asyncio.run(scenario())
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert_private_file(path)
     assert token.encode() not in path.read_bytes()
 
 
@@ -276,7 +277,7 @@ def test_wrapper_config_reads_private_paired_device_file(tmp_path, monkeypatch):
         "machine_id": "device-1234",
         "label": "Mac",
     }), encoding="utf-8")
-    os.chmod(path, 0o600)
+    perms.make_private(path, directory=False)
     monkeypatch.setenv("CC_REMOTE_DEVICE_CONFIG", str(path))
     monkeypatch.delenv("RELAY_URL", raising=False)
     monkeypatch.delenv("WRAPPER_TOKEN", raising=False)
@@ -296,7 +297,7 @@ def test_wrapper_config_rejects_group_readable_device_credentials(
         "wrapper_token": "t" * 64,
         "machine_id": "device-1234",
     }), encoding="utf-8")
-    os.chmod(path, 0o640)
+    grant_foreign_read(path)
     monkeypatch.setenv("CC_REMOTE_DEVICE_CONFIG", str(path))
     monkeypatch.delenv("RELAY_URL", raising=False)
     with pytest.raises(ValueError, match="must not be accessible"):
@@ -332,7 +333,7 @@ def test_pairing_cli_writes_private_config_without_printing_token(
         replace=False,
     )
     assert device_cli.pair(args) == 0
-    assert os.stat(target).st_mode & 0o777 == 0o600
+    assert_private_file(target)
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["wrapper_token"] == token
     assert token not in capsys.readouterr().out

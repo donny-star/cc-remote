@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from cc_remote.claude_broker.paths import default_socket_path
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
+from cc_remote.platform import perms
 from cc_remote.platform.identity import current_uid
 
 try:
@@ -68,8 +69,7 @@ def _load_device_config() -> dict[str, str]:
     path = device_config_path()
     if not path.exists():
         return {}
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
+    if not perms.private_mode_info(path, path.stat()):
         raise ValueError(
             f"device credential file must not be accessible by group/others: {path}")
     try:

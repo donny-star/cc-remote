@@ -16,6 +16,7 @@ import tempfile
 import time
 
 from cc_remote.log import logger
+from cc_remote.platform import perms
 from cc_remote.wrapper.child_env import claude_profile_process_env
 from cc_remote.wrapper.claude_controls import valid_claude_model
 from cc_remote.wrapper.claude_runtime import resolve_claude_cli
@@ -86,6 +87,7 @@ async def _read_catalog(
             # user/project customizations or put provider credentials in argv.
             settings = scope.enter_context(tempfile.NamedTemporaryFile(
                 mode="w+", prefix="cc-remote-models-", suffix=".json"))
+            perms.make_private(settings.name, directory=False)
             json.dump(_claude_runtime_settings(config_dir), settings)
             settings.flush()
             args.extend(["--setting-sources", "", "--settings", settings.name])

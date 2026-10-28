@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cc_remote.wrapper import claude_models as models
+from tests.platform_assertions import assert_private_file
 
 
 def test_native_catalog_keeps_new_models_and_exact_effort_capabilities():
@@ -113,7 +114,7 @@ async def test_probe_only_initializes_and_always_reaps_child(
     async def spawn_child(*args, **kwargs):
         if work_only:
             path = Path(args[args.index("--settings") + 1])
-            assert path.stat().st_mode & 0o777 == 0o600
+            assert_private_file(path)
             assert json.loads(path.read_text()) == {
                 "model": "work-model", "env": {"ANTHROPIC_API_KEY": "profile-key"}}
         return proc

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from cc_remote.config import device_config_path
+from cc_remote.platform import files as platform_files, perms
 
 
 def _origin(value: str) -> str:
@@ -54,13 +55,14 @@ def _write_private_text(path: Path, content: str, *, replace: bool) -> None:
     staged = Path(staged_name)
     try:
         os.fchmod(fd, 0o600)
+        perms.make_private(staged, directory=False)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(staged, path)
-        os.chmod(path, 0o600)
+        platform_files.replace(staged, path)
+        perms.make_private(path, directory=False)
     except Exception:
         if fd >= 0:
             try:
