@@ -173,3 +173,87 @@ def test_killpg_escalation_never_falls_back_to_taskkill(tmp_path, monkeypatch) -
         with pytest.raises(ProcessLookupError):
             procs.killpg(child.pid, procs.SIGKILL)
     assert child.pid not in procs._jobs
+
+
+def _wait_job_drained(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with procs._jobs_lock:
+            job = procs._jobs.get(pid)
+            if job is None or procs._active_processes(job) == 0:
+                return
+        time.sleep(0.05)
+    raise AssertionError("job never drained")
+
+
+@pytest.mark.windows_only(reason="Job Object tombstones only exist on Windows")
+def test_killpg_of_pruned_group_never_falls_back_to_taskkill(monkeypatch) -> None:
+    first = procs.popen_group([sys.executable, "-c", "pass"])
+    first.wait(timeout=10)
+    _wait_job_drained(first.pid)
+    # Spawning another group prunes the drained Job of ``first``.
+    second = procs.popen_group([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert first.pid not in procs._jobs
+        assert first.pid in procs._tombstones
+
+        def no_taskkill(*args, **kwargs):
+            raise AssertionError(f"taskkill must not run for a tombstoned pid: {args}")
+
+        monkeypatch.setattr(procs.subprocess, "run", no_taskkill)
+        with pytest.raises(ProcessLookupError):
+            procs.killpg(first.pid, procs.SIGKILL)
+    finally:
+        try:
+            procs.killpg(second.pid, procs.SIGKILL)
+        except ProcessLookupError:
+            pass
+        second.wait(timeout=10)
+
+
+@pytest.mark.windows_only(reason="Job Object tombstones only exist on Windows")
+def test_killpg_drained_job_is_tombstoned() -> None:
+    child = procs.popen_group([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    _wait_job_drained(child.pid)
+    with pytest.raises(ProcessLookupError):
+        procs.killpg(child.pid, procs.SIGTERM)  # drains the Job here
+    assert child.pid not in procs._jobs
+    assert child.pid in procs._tombstones
+    with pytest.raises(ProcessLookupError):
+        procs.killpg(child.pid, procs.SIGKILL)  # tombstone, not taskkill
+
+
+@pytest.mark.windows_only(reason="Job Object tombstones only exist on Windows")
+def test_register_clears_tombstone_of_reused_pid() -> None:
+    import win32job
+
+    fake_pid = 0x7FFFFFF0
+    job = win32job.CreateJobObject(None, "")
+    with procs._jobs_lock:
+        procs._tombstones[fake_pid] = 1
+    try:
+        procs._register(fake_pid, job, 2)
+        assert fake_pid not in procs._tombstones
+        assert procs._jobs[fake_pid] is job
+        assert procs._created[fake_pid] == 2
+    finally:
+        with procs._jobs_lock:
+            procs._jobs.pop(fake_pid, None)
+            procs._created.pop(fake_pid, None)
+            procs._tombstones.pop(fake_pid, None)
+        job.Close()
+
+
+@pytest.mark.windows_only(reason="Job Object tombstones only exist on Windows")
+def test_tombstones_are_bounded(monkeypatch) -> None:
+    from collections import OrderedDict
+
+    monkeypatch.setattr(procs, "_TOMBSTONE_LIMIT", 2)
+    monkeypatch.setattr(procs, "_tombstones", OrderedDict())
+    monkeypatch.setattr(procs, "_created", {1: 10, 2: 20, 3: 30})
+    with procs._jobs_lock:
+        for pid in (1, 2, 3):
+            procs._bury_locked(pid)
+    assert list(procs._tombstones.items()) == [(2, 20), (3, 30)]
+    assert procs._created == {}
