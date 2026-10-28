@@ -220,6 +220,7 @@ from cc_remote.wrapper.codex_daemon import (
 )
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
+from cc_remote.platform import files as platform_files
 from cc_remote.platform.identity import current_euid, current_uid
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from cc_remote.wrapper.claude_broker_history import (
@@ -466,11 +467,7 @@ def _quarantine_rebuildable_projection(
         )
         return False
     try:
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        platform_files.fsync_directory(path.parent)
     except OSError as exc:
         # The rename already made the unsafe projection unreachable. A failed
         # directory fsync affects crash durability, not this process's safety.
@@ -8869,12 +8866,8 @@ class WrapperMachine:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(tmp, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.replace(tmp, path)
+            platform_files.fsync_directory(path.parent)
         finally:
             try:
                 tmp.unlink()
@@ -9067,11 +9060,7 @@ class WrapperMachine:
                 os.fsync(stream.fileno())
             os.replace(tmp, path)
             # Make the rename durable, not merely atomic in the page cache.
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(path.parent)
         except Exception as exc:
             try:
                 tmp.unlink()
