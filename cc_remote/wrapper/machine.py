@@ -221,6 +221,7 @@ from cc_remote.wrapper.codex_daemon import (
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.platform import files as platform_files
+from cc_remote.platform import perms as platform_perms
 from cc_remote.platform.dirs import DirHandle
 from cc_remote.platform.identity import current_euid, current_uid
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
@@ -26787,8 +26788,8 @@ class WrapperMachine:
         Every path component is opened relative to an already-open cwd without
         following links. The replacement is written and fsynced in the same
         directory, then renamed over the file only after a second revision
-        check. Existing UTF-8 BOM, dominant LF/CRLF style, and mode bits are
-        preserved.
+        check. Existing UTF-8 BOM, dominant LF/CRLF style, and access control
+        (mode bits; on Windows the DACL and read-only attribute) are preserved.
         """
         if path.startswith("~"):
             raise ValueError("保存路径必须位于当前工作目录")
@@ -26824,8 +26825,12 @@ class WrapperMachine:
 
         directory: Optional[DirHandle] = None
         temp_name: Optional[str] = None
+        original_fd: Optional[int] = None
 
-        def read_current() -> tuple[bytes, os.stat_result, str]:
+        def read_current(
+            *, keep_open: bool = False,
+        ) -> tuple[bytes, os.stat_result, str]:
+            nonlocal original_fd
             try:
                 fd = directory.open_file(
                     parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -26860,9 +26865,12 @@ class WrapperMachine:
                         mtime_ns=final_stat.st_mtime_ns,
                         revision=revision,
                     )
+                if keep_open:
+                    original_fd, fd = fd, None
                 return data, final_stat, hashlib.sha256(data).hexdigest()
             finally:
-                os.close(fd)
+                if fd is not None:
+                    os.close(fd)
 
         def require_expected(file_stat: os.stat_result, revision: str) -> None:
             if (file_stat.st_size != expected_size
@@ -26885,7 +26893,8 @@ class WrapperMachine:
                 directory.close()
                 directory = child
 
-            original, original_stat, original_revision = read_current()
+            original, original_stat, original_revision = read_current(
+                keep_open=True)
             if (
                 capability is not None
                 and not capability.matches(
@@ -26918,10 +26927,12 @@ class WrapperMachine:
                 written = 0
                 while written < len(view):
                     written += os.write(temp_fd, view[written:])
-                os.fchmod(temp_fd, stat.S_IMODE(original_stat.st_mode))
+                platform_perms.copy_security_fd(original_fd, temp_fd)
                 os.fsync(temp_fd)
             finally:
                 os.close(temp_fd)
+                fd, original_fd = original_fd, None
+                os.close(fd)
 
             _, latest_stat, latest_revision = read_current()
             require_expected(latest_stat, latest_revision)
@@ -26936,11 +26947,18 @@ class WrapperMachine:
                 hashlib.sha256(payload).hexdigest(),
             )
         finally:
+            if original_fd is not None:
+                os.close(original_fd)
             if temp_name is not None and directory is not None:
+                # Only reached while an error propagates; never mask it.
                 try:
                     directory.unlink(temp_name)
                 except FileNotFoundError:
                     pass
+                except OSError as exc:
+                    log.warning(
+                        "markdown save temp cleanup failed",
+                        error_type=type(exc).__name__)
             if directory is not None:
                 directory.close()
 

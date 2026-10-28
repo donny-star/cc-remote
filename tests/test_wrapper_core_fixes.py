@@ -1878,7 +1878,7 @@ def test_codex_session_settings_reads_bounded_tail_of_oversized_source(
             "collaboration_mode": {"mode": "plan"},
         },
     }) + "\n"
-    rollout.write_text(old + ("x" * 4096) + "\n" + latest)
+    rollout.write_text(old + ("x" * 4096) + "\n" + latest, newline="\n")
     monkeypatch.setattr(
         codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
 
