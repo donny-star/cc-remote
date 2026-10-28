@@ -1,6 +1,9 @@
 """cc_remote.platform.ipc: same-user local endpoints."""
 from __future__ import annotations
 
+import base64
+import json
+import os
 import stat
 import subprocess
 import uuid
@@ -138,3 +141,114 @@ def test_profile_directory_ignores_environment_overrides(monkeypatch):
 def test_posix_directory_mode_is_0700(tmp_path):
     target = ipc.ensure_private_directory(tmp_path / "mode")
     assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+TOKEN = bytes(range(32))
+
+
+def _endpoint(**changes) -> ipc.Endpoint:
+    values = {"port": 43210, "token": TOKEN, "pid": os.getpid(), "start_time": 123456789}
+    values.update(changes)
+    return ipc.Endpoint(**values)
+
+
+def test_endpoint_record_round_trips():
+    raw = _endpoint().encode()
+    assert json.loads(raw) == {
+        "v": 1, "port": 43210, "token": base64.b64encode(TOKEN).decode("ascii"),
+        "pid": os.getpid(), "start_time": 123456789,
+    }
+    assert ipc.Endpoint.decode(raw) == _endpoint()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: value.update(v=2),
+    lambda value: value.update(v=True),
+    lambda value: value.update(extra=1),
+    lambda value: value.pop("token"),
+    lambda value: value.update(port=0),
+    lambda value: value.update(port=65536),
+    lambda value: value.update(port="43210"),
+    lambda value: value.update(pid=True),
+    lambda value: value.update(start_time=0),
+    lambda value: value.update(token=base64.b64encode(b"short").decode("ascii")),
+    lambda value: value.update(token="not base64!"),
+], ids=["version", "version-bool", "extra", "missing", "port-zero", "port-high", "port-text",
+        "pid-bool", "start-zero", "token-short", "token-text"])
+def test_endpoint_record_rejects_deviations(mutate):
+    value = json.loads(_endpoint().encode())
+    mutate(value)
+    with pytest.raises(ValueError):
+        ipc.Endpoint.decode(json.dumps(value).encode("ascii"))
+
+
+def test_endpoint_record_rejects_non_json():
+    with pytest.raises(ValueError):
+        ipc.Endpoint.decode(b"do not replace")
+
+
+windows_records = pytest.mark.windows_only(
+    reason="endpoint records stand in for AF_UNIX sockets only on Windows")
+
+
+@windows_records
+def test_write_endpoint_publishes_a_private_record(tmp_path):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    path = directory / "service.sock"
+    identity = ipc.write_endpoint(path, _endpoint())
+    info = path.lstat()
+    assert identity == (info.st_dev, info.st_ino)
+    assert perms.is_private(path)
+    assert ipc.read_endpoint(path) == _endpoint()
+    assert [entry.name for entry in directory.iterdir()] == ["service.sock"]
+
+
+@windows_records
+def test_write_endpoint_never_replaces_an_existing_record(tmp_path):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    path = directory / "service.sock"
+    ipc.write_endpoint(path, _endpoint())
+    with pytest.raises(ipc.AlreadyRunningError, match="already running"):
+        ipc.write_endpoint(path, _endpoint(port=1))
+    assert ipc.read_endpoint(path) == _endpoint()
+    assert [entry.name for entry in directory.iterdir()] == ["service.sock"]
+
+
+@windows_records
+def test_read_endpoint_refuses_a_record_readable_by_others(tmp_path):
+    path = ipc.ensure_private_directory(tmp_path / "ep") / "service.sock"
+    ipc.write_endpoint(path, _endpoint())
+    share_with_everyone(path)
+    with pytest.raises(ipc.UnsafeEndpointError, match="private"):
+        ipc.read_endpoint(path)
+
+
+@windows_records
+def test_read_endpoint_refuses_malformed_and_oversized_records(tmp_path):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    malformed = directory / "malformed.sock"
+    malformed.write_bytes(b"do not replace")
+    with pytest.raises(ipc.UnsafeEndpointError, match="malformed"):
+        ipc.read_endpoint(malformed)
+    oversized = directory / "oversized.sock"
+    oversized.write_bytes(b" " * (ipc.MAX_ENDPOINT_BYTES + 1))
+    with pytest.raises(ipc.UnsafeEndpointError, match="small regular file"):
+        ipc.read_endpoint(oversized)
+
+
+@windows_records
+def test_read_endpoint_reports_a_missing_record(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        ipc.read_endpoint(ipc.ensure_private_directory(tmp_path / "ep") / "absent.sock")
+
+
+@windows_records
+@pytest.mark.requires_symlink(reason="a symlinked endpoint record must be refused")
+def test_read_endpoint_refuses_a_symlink(tmp_path):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    real = directory / "real.sock"
+    ipc.write_endpoint(real, _endpoint())
+    link = directory / "link.sock"
+    link.symlink_to(real)
+    with pytest.raises(ipc.UnsafeEndpointError, match="link"):
+        ipc.read_endpoint(link)
