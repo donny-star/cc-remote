@@ -1428,8 +1428,9 @@ class PTYSession:
         if writer is not None and not writer.done():
             writer.cancel()
             # A Windows PTY write runs on a worker thread that neither
-            # cancellation nor close() can interrupt; never let it hold up
-            # teardown past this bound.
+            # cancellation nor close() can interrupt; never wait for it past
+            # this bound. The bound is on waiting: a stuck write keeps its
+            # pseudo console until it returns.
             await asyncio.wait({writer}, timeout=WRITER_STOP_TIMEOUT_SECONDS)
         if (self._transcript_watch_task is not None
                 and not self._transcript_watch_task.done()):

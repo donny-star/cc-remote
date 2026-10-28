@@ -356,7 +356,8 @@ class _WindowsPty(PtyProcess):
         self._reader_done: asyncio.Future[None] | None = None
         self._returncode: int | None = None
         self._write_lock = asyncio.Lock()
-        # Settled by close(): an abandoned write no longer holds the lock.
+        # Settled by close(): callers stop awaiting an abandoned write, which
+        # then no longer holds the lock (its worker thread still runs).
         self._released: asyncio.Future[None] | None = None
         # Opened while pywinpty still holds the child's handle, so the pid is
         # this child; the handle in turn keeps the pid from being reused.
@@ -488,8 +489,11 @@ class _WindowsPty(PtyProcess):
                     self._released.set_result(None)
             # The worker thread cannot be stopped: a cancelled caller keeps the
             # lock until it finished, so the next write cannot overtake it.
-            # Once close() released the console there is no order left to
-            # keep, and a write the console never takes is abandoned.
+            # Once close() ran there is no order left to keep, and a cancelled
+            # caller stops waiting for a write the console never takes. That
+            # bounds the waiting only: the stuck thread still holds pywinpty's
+            # terminal, so the pseudo console is released (and a child that
+            # outlived close() ends) only when that write returns.
             writing = _in_daemon_thread(
                 self._terminal.write, text, name=f"conpty-write-{self.pid}")
             try:
@@ -667,7 +671,9 @@ def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | Non
     out of this thread's arguments. ``cancel_io`` only cancels a read already
     in flight, and the reader may be between two reads; repeat it until the
     reader has left ``read()``. Only then is this the last reference, so
-    pywinpty closes the pseudo console, before the Job handle closes.
+    pywinpty closes the pseudo console, before the Job handle closes. A write
+    still stuck on its worker thread also holds the terminal: the console is
+    released only once that write returns.
     """
     terminal = console.pop()
     deadline = time.monotonic() + _READER_STOP_SECONDS
@@ -683,7 +689,7 @@ def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | Non
         # Its read() still holds the terminal: the pseudo console is released
         # only when that read returns. One console, bounded by its lifetime.
         _log.warning("conpty_reader_leaked", pid=pid)
-    del terminal  # the last reference: pywinpty closes the pseudo console
+    del terminal  # pywinpty closes the pseudo console once no write holds it
     if job is not None:
         job.Close()
 
@@ -984,6 +990,10 @@ class InputReader:
 
     POSIX waits for readiness with ``add_reader``. Windows reads on a daemon
     thread (it never holds up interpreter exit). ``read`` returns b"" at EOF.
+    Use exactly one reader per console and close the old one before creating
+    another: a second concurrent reader can drain the console between this
+    one's check and read, leaving that read (and ``close()``) waiting for the
+    next key.
 
     A Windows console is read as raw key events (meant for use inside
     ``RawTerminal``): the thread waits on the console handle and takes only
@@ -992,12 +1002,13 @@ class InputReader:
     and EOF is only a console error or a closed handle. Pipes and files are
     read with a blocking ``os.read``, which ends at their EOF.
 
-    ``close()`` stops reading and enqueues nothing more; cancel a pending
-    ``read()`` yourself. On a Windows console, once ``close()`` returns no
-    read is in flight or will be issued, so the next key reaches the
-    console's next reader. A pipe read already blocked in ``os.read`` cannot
-    be interrupted (non-interactive input): its data is dropped, and the
-    thread ends at that read's return.
+    ``close()`` stops the Windows reader: it enqueues nothing more and a
+    later ``read()`` returns b"". On POSIX it is a no-op and ``read()`` keeps
+    reading the fd. Either way, cancel a pending ``read()`` yourself. On a
+    Windows console, once ``close()`` returns no read is in flight or will be
+    issued, so the next key reaches the console's next reader. A pipe read
+    already blocked in ``os.read`` cannot be interrupted (non-interactive
+    input): its data is dropped, and the thread ends at that read's return.
     """
 
     def __init__(self, fd: int):
