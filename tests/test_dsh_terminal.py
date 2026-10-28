@@ -5,6 +5,10 @@ import pytest
 
 from cc_remote.protocol import ReadDsh, SetDshControl, is_downstream
 from tests.test_dsh_runtime import setup_runtime
+from tests.platform_paths import native_path
+
+
+TMP = native_path("/tmp")
 
 
 def cmd(action, browser="browser", sid="dsh@root", key="command", **data):
@@ -18,7 +22,7 @@ async def test_terminal_lifetime_private_cursor_input_ack_and_browser_boundary()
     calls = []
     async def rpc(endpoint, args=None):
         calls.append((endpoint, args))
-        return [{"id": "pty", "title": "shell", "state": "running", "cwd": "/tmp", "cols": 80, "rows": 24}] if endpoint == "terminal/list" else None
+        return [{"id": "pty", "title": "shell", "state": "running", "cwd": TMP, "cols": 80, "rows": 24}] if endpoint == "terminal/list" else None
     async def stream(endpoint, args, *, on_open):
         calls.append((endpoint, args))
         async def send(value):

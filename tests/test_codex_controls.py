@@ -39,6 +39,7 @@ from cc_remote.wrapper.work_prompt import (
     WORK_DEVELOPER_INSTRUCTIONS,
 )
 from cc_remote.workspaces import WorkStores
+from tests.platform_paths import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -4268,18 +4269,21 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
             spawned.extend(args)
             raise RuntimeError("captured work profile")
 
-        monkeypatch.setenv("CODEX_HOME", "/home/test/.codex-custom")
+        codex_home = native_path("/home/test/.codex-custom")
+        codex_bin = native_path("/usr/bin/codex")
+        monkeypatch.setenv("CODEX_HOME", codex_home)
         monkeypatch.setattr(
-            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+            codex_handle_module, "_resolve_codex_bin", lambda: codex_bin)
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec", capture)
-        cwd = "/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace"
+        cwd = native_path(
+            "/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace")
         with pytest.raises(RuntimeError, match="captured work profile"):
             await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
 
-        stdio_index = spawned.index("/usr/bin/codex")
+        stdio_index = spawned.index(codex_bin)
         assert spawned[stdio_index:stdio_index + 3] == [
-            "/usr/bin/codex", "app-server", "--stdio",
+            codex_bin, "app-server", "--stdio",
         ]
         if os.name == "posix":
             assert spawned[:3] == [
@@ -4298,9 +4302,10 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
             if value.startswith("permissions.cc_remote_work.filesystem="))
         assert '":minimal" = "read"' in filesystem
         assert '"~"' not in filesystem
-        assert '"/home/test/.codex-custom/tmp" = "read"' in filesystem
-        assert '"/usr/bin/codex" = "read"' in filesystem
-        assert f'"{cwd}" = "write"' in filesystem
+        runtime_tmp = os.path.join(codex_home, "tmp")
+        assert f'{json.dumps(runtime_tmp)} = "read"' in filesystem
+        assert f'{json.dumps(codex_bin)} = "read"' in filesystem
+        assert f'{json.dumps(cwd)} = "write"' in filesystem
         assert "permissions.cc_remote_work.network.enabled=false" in overrides
 
     asyncio.run(run())
