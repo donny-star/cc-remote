@@ -1520,6 +1520,7 @@ class _ExitTerminal(_StuckWriteTerminal):
         super().__init__()
         self.wait_error = wait_error
         self.kill_error = kill_error
+        self.kills: list[int] = []
 
     async def wait(self) -> int:
         if self.wait_error is not None:
@@ -1527,6 +1528,7 @@ class _ExitTerminal(_StuckWriteTerminal):
         return await super().wait()
 
     def kill_group(self, sig: int) -> None:
+        self.kills.append(sig)
         if self.kill_error is not None:
             raise self.kill_error
 
@@ -1555,10 +1557,33 @@ async def test_a_failed_exit_wait_ends_the_session_instead_of_leaving_it_running
     assert session.running is False
     assert session.returncode == 1  # the real status is unknown
     assert "ConPTY poll failed" in caplog.text
+    # Nothing later kills an exited session, so the tree must die now.
+    assert terminal.kills == [broker_session_module.procs.SIGKILL]
     events = []
     while not subscription.queue.empty():
         events.append(subscription.queue.get_nowait())
     assert [event.kind for event in events] == ["exit"]
+    await asyncio.wait_for(session.close(stop=True), 5)
+    assert terminal.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_exit_wait_still_ends_the_session_when_the_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+):
+    _set_home(monkeypatch, tmp_path)
+    terminal = _ExitTerminal(
+        wait_error=OSError("ConPTY poll failed: broken handle"),
+        kill_error=OSError("job already closed"),
+    )
+    session = _fake_session(terminal, tmp_path)
+    with caplog.at_level("WARNING", logger=broker_session_module.__name__):
+        session.start()
+        await asyncio.wait_for(asyncio.shield(session._wait_task), 5)
+    assert terminal.kills == [broker_session_module.procs.SIGKILL]
+    assert session.running is False
+    assert session.returncode == 1
+    assert "job already closed" in caplog.text
     await asyncio.wait_for(session.close(stop=True), 5)
     assert terminal.closed is True
 

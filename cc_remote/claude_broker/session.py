@@ -650,6 +650,12 @@ class PTYSession:
             # A broken exit poll (ConPTY) must not leave the session running
             # forever: report it exited with an unknown status (1).
             log.warning("PTY exit wait for session %s failed: %s", self.id, exc)
+            # stop()/close() skip an exited session, so kill the tree now or a
+            # resume could run a second Claude on the same transcript.
+            try:
+                self.terminal.kill_group(procs.SIGKILL)
+            except (ProcessLookupError, OSError) as kill_exc:
+                log.warning("PTY kill for session %s failed: %s", self.id, kill_exc)
             returncode = 1
         else:
             # Drain bytes that became readable immediately before wait() completed.
