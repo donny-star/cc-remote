@@ -135,7 +135,13 @@ class Endpoint:
     @classmethod
     def decode(cls, raw: bytes) -> Endpoint:
         """Parse a record; any deviation raises ``ValueError``."""
-        value = json.loads(raw.decode("ascii"))
+        try:
+            value = json.loads(raw.decode("ascii"))
+        except ValueError:
+            raise
+        except Exception:
+            # Deep nesting raises RecursionError; keep the ValueError contract.
+            raise ValueError("endpoint record is not valid JSON") from None
         if not isinstance(value, dict) or set(value) != {"v", "port", "token", "pid", "start_time"}:
             raise ValueError("endpoint record has unexpected fields")
         port, pid, start_time = value["port"], value["pid"], value["start_time"]
@@ -171,8 +177,11 @@ def read_endpoint(path: StrPath) -> Endpoint:
         os.close(fd)
     try:
         return Endpoint.decode(raw)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise UnsafeEndpointError("endpoint record is malformed") from exc
+    except (ValueError, UnicodeDecodeError):
+        pass
+    # Raised outside the handler so neither __cause__ nor __context__ keeps
+    # the raw record (and its token) reachable.
+    raise UnsafeEndpointError("endpoint record is malformed") from None
 
 
 def write_endpoint(path: StrPath, endpoint: Endpoint) -> tuple[int, int]:
@@ -180,6 +189,8 @@ def write_endpoint(path: StrPath, endpoint: Endpoint) -> tuple[int, int]:
 
     Returns the published file's ``(st_dev, st_ino)`` identity.
     """
+    if not IS_WINDOWS:
+        raise NotImplementedError("write_endpoint is Windows-only; POSIX publishes the Unix socket itself")
     target = Path(path)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = files.open_nofollow(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -191,6 +202,8 @@ def write_endpoint(path: StrPath, endpoint: Endpoint) -> tuple[int, int]:
             while data:
                 data = data[os.write(fd, data):]
             os.fsync(fd)
+            # NTFS rename keeps the file id, so the descriptor names the record.
+            info = os.fstat(fd)
         finally:
             os.close(fd)
         _publish(temporary, target)
@@ -198,7 +211,6 @@ def write_endpoint(path: StrPath, endpoint: Endpoint) -> tuple[int, int]:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
         raise
-    info = target.lstat()
     return info.st_dev, info.st_ino
 
 

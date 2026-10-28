@@ -88,7 +88,7 @@ def test_ensure_private_directory_requires_the_user_profile(tmp_path, monkeypatc
 
 @pytest.mark.windows_only(reason="the profile boundary only exists for Windows endpoints")
 def test_ensure_private_directory_rejects_another_drive(tmp_path, monkeypatch):
-    monkeypatch.setattr(ipc, "_profile_directory", lambda: "Z:\profile")
+    monkeypatch.setattr(ipc, "_profile_directory", lambda: r"Z:\profile")
     with pytest.raises(ipc.UnsafeEndpointError, match="profile") as caught:
         ipc.ensure_private_directory(tmp_path / "elsewhere")
     assert isinstance(caught.value, OSError)
@@ -187,6 +187,18 @@ def test_endpoint_record_rejects_non_json():
         ipc.Endpoint.decode(b"do not replace")
 
 
+def test_endpoint_record_rejects_deep_nesting_as_value_error():
+    with pytest.raises(ValueError):
+        ipc.Endpoint.decode(b"[" * 4000)
+
+
+@pytest.mark.posix_only(reason="POSIX publishes the Unix socket itself")
+def test_write_endpoint_is_windows_only(tmp_path):
+    with pytest.raises(NotImplementedError, match="Windows-only"):
+        ipc.write_endpoint(tmp_path / "service.sock", _endpoint())
+    assert not list(tmp_path.iterdir())
+
+
 windows_records = pytest.mark.windows_only(
     reason="endpoint records stand in for AF_UNIX sockets only on Windows")
 
@@ -234,6 +246,23 @@ def test_read_endpoint_refuses_malformed_and_oversized_records(tmp_path):
     oversized.write_bytes(b" " * (ipc.MAX_ENDPOINT_BYTES + 1))
     with pytest.raises(ipc.UnsafeEndpointError, match="small regular file"):
         ipc.read_endpoint(oversized)
+
+
+@windows_records
+def test_read_endpoint_hides_the_raw_record_of_a_malformed_record(tmp_path):
+    directory = ipc.ensure_private_directory(tmp_path / "ep")
+    nested = directory / "nested.sock"
+    nested.write_bytes(b"[" * 4000)
+    with pytest.raises(ipc.UnsafeEndpointError, match="malformed") as caught:
+        ipc.read_endpoint(nested)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    leaky = directory / "leaky.sock"
+    value = json.loads(_endpoint().encode())
+    value["extra"] = 1
+    leaky.write_bytes(json.dumps(value).encode("ascii") + b"}")
+    with pytest.raises(ipc.UnsafeEndpointError, match="malformed") as caught:
+        ipc.read_endpoint(leaky)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 @windows_records
