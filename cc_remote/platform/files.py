@@ -108,6 +108,8 @@ def replace(src: StrPath, dst: StrPath, *, attempts: int = 10) -> None:
     short-lived sharing violations antivirus scanners and indexers cause.
     Falls back to MoveFileEx where POSIX renames are unsupported (FAT, old OS).
     Other access errors, such as a directory target, raise immediately.
+    FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE needs Windows 10 1809+; older
+    builds fall back to ``os.replace``, where a read-only target then fails.
     """
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
@@ -186,6 +188,8 @@ def force_rmtree(path: StrPath) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+# The underscore Win32 helpers below (_kernel32, _win32_*, _FILE_*) are
+# package-internal: dirs.py and perms.py share them, nothing else should.
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_TAG_INFO = 9

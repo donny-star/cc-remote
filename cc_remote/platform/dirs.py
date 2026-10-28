@@ -33,6 +33,8 @@ from typing import Iterator
 
 from cc_remote.platform import IS_WINDOWS, files, perms
 
+# Uses files' package-internal Win32 helpers (_kernel32, _win32_*, _FILE_*).
+
 StrPath = str | PathLike[str]
 
 _POSIX_DIR_FLAGS = (

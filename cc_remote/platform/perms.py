@@ -10,6 +10,8 @@ from cc_remote.platform import IS_WINDOWS, files
 from cc_remote.platform._win32err import translated
 from cc_remote.platform.identity import current_euid, current_sid, current_uid
 
+# Uses files' package-internal Win32 helpers (_win32_*, _FILE_*).
+
 StrPath = str | PathLike[str]
 
 
