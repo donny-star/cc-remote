@@ -19,6 +19,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from cc_remote.log import logger
 from cc_remote.platform import IS_WINDOWS, procs
 
 READ_CHUNK_BYTES = 64 * 1024
@@ -34,6 +35,7 @@ if not IS_WINDOWS:
     import termios
 
 OutputCallback = Callable[[bytes], None]
+_log = logger("cc_remote.platform.pty")
 
 
 class PtyProcess:
@@ -42,7 +44,9 @@ class PtyProcess:
     ``start`` delivers output chunks on the running event loop. ``wait``
     returns the exit status; ``drain`` then yields bytes still buffered in the
     terminal. ``kill_group`` signals the whole process tree and raises
-    ``ProcessLookupError`` once it is gone.
+    ``ProcessLookupError`` once it is gone. On Windows ``wait`` also releases
+    the pseudo console (``close`` is idempotent), and concurrent ``write``
+    calls are applied one at a time in call order.
     """
 
     pid: int
@@ -239,6 +243,50 @@ class _PosixPty(PtyProcess):
 
 # --- Windows ConPTY -----------------------------------------------------------
 
+_PROCESS_TERMINATE_AND_QUOTA = 0x0001 | 0x0100 | 0x1000  # TERMINATE|SET_QUOTA|QUERY_LIMITED
+_PROCESS_QUERY_AND_SYNCHRONIZE = 0x1000 | 0x00100000  # QUERY_LIMITED|SYNCHRONIZE
+
+
+def _windows_job(pid: int) -> Any | None:
+    """Put the running child in its own Job so ``kill_group`` reaches its tree.
+
+    pywinpty cannot start the child suspended, so a descendant spawned before
+    this assignment can escape the Job. Releasing the pseudo console (on exit
+    in ``wait()``, or in ``close()``) still ends every process attached to it.
+    """
+    import win32api
+    import win32job
+
+    from cc_remote.platform._win32err import translated
+
+    try:
+        with translated():
+            process = win32api.OpenProcess(_PROCESS_TERMINATE_AND_QUOTA, False, pid)
+            try:
+                job = win32job.CreateJobObject(None, "")
+                try:
+                    win32job.AssignProcessToJobObject(job, process)
+                except BaseException:
+                    job.Close()
+                    raise
+                return job
+            finally:
+                process.Close()
+    except OSError:
+        return None  # kill_group falls back to terminating the process itself
+
+
+def _process_handle(pid: int) -> Any | None:
+    """Our own handle on the child: its exit status outlives the pseudo console."""
+    import pywintypes
+    import win32api
+
+    try:
+        return win32api.OpenProcess(_PROCESS_QUERY_AND_SYNCHRONIZE, False, pid)
+    except pywintypes.error:
+        return None
+
+
 def _terminate_process(pid: int) -> None:
     import win32api
 
@@ -274,6 +322,10 @@ class _WindowsPty(PtyProcess):
         self._stop = threading.Event()
         self._reader_done: asyncio.Future[None] | None = None
         self._returncode: int | None = None
+        self._write_lock = asyncio.Lock()
+        # Opened while pywinpty still holds the child's handle, so the pid is
+        # this child; the handle in turn keeps the pid from being reused.
+        self._process = _process_handle(self.pid)
 
     @classmethod
     def spawn(cls, argv: list[str], *, cwd: str, env: dict[str, str],
@@ -292,7 +344,7 @@ class _WindowsPty(PtyProcess):
             terminal.spawn(program, cmdline=arguments, cwd=cwd, env=_environment_block(env))
         except winpty.WinptyError as exc:
             raise OSError(f"ConPTY spawn failed: {exc}") from exc
-        return cls(terminal)
+        return cls(terminal, _windows_job(int(terminal.pid)))
 
     def start(self, on_output: OutputCallback) -> None:
         self._loop = asyncio.get_running_loop()
@@ -336,9 +388,16 @@ class _WindowsPty(PtyProcess):
         self._reading = False
 
     def poll(self) -> int | None:
-        if self._returncode is None and not self._terminal.isalive():
-            status = self._terminal.get_exitstatus()
-            self._returncode = 1 if status is None else int(status)
+        if self._returncode is None:
+            try:
+                alive = self._terminal.isalive()
+                status = None if alive else self._terminal.get_exitstatus()
+            except OSError:
+                raise
+            except Exception as exc:  # WinptyError
+                raise OSError(f"ConPTY poll failed: {exc}") from exc
+            if not alive:
+                self._returncode = 1 if status is None else int(status)
         return self._returncode
 
     async def wait(self) -> int:
@@ -346,6 +405,9 @@ class _WindowsPty(PtyProcess):
             await asyncio.sleep(_EXIT_POLL_SECONDS)
         await self._settle()
         await self._stop_reader()
+        # Like a POSIX hangup when the session leader exits: release the
+        # pseudo console so descendants that escaped the Job end with it.
+        self.close()
         assert self._returncode is not None
         return self._returncode
 
@@ -377,13 +439,16 @@ class _WindowsPty(PtyProcess):
         return []  # the reader delivered everything before wait() returned
 
     async def write(self, data: bytes) -> None:
-        text = self._decoder.decode(data)
-        if not text:
-            return  # an incomplete UTF-8 sequence waits for its next bytes
-        try:
-            await asyncio.to_thread(self._terminal.write, text)
-        except Exception as exc:  # WinptyError
-            raise OSError(f"ConPTY write failed: {exc}") from exc
+        # Each write runs on a worker thread: without the lock, concurrent
+        # callers could reach the console out of order (and share the decoder).
+        async with self._write_lock:
+            text = self._decoder.decode(data)
+            if not text:
+                return  # an incomplete UTF-8 sequence waits for its next bytes
+            try:
+                await asyncio.to_thread(self._terminal.write, text)
+            except Exception as exc:  # WinptyError
+                raise OSError(f"ConPTY write failed: {exc}") from exc
 
     def resize(self, rows: int, cols: int, xpixel: int = 0, ypixel: int = 0) -> None:
         del xpixel, ypixel  # ConPTY has no pixel geometry
@@ -394,10 +459,30 @@ class _WindowsPty(PtyProcess):
 
     def kill_group(self, sig: int) -> None:
         del sig  # Windows has no graceful signal for a console-less tree
-        if self.poll() is not None:
-            raise ProcessLookupError(self.pid)
-        # pywinpty keeps the process handle open, so the pid is not reused.
-        _terminate_process(self.pid)
+        import win32job
+
+        from cc_remote.platform._win32err import translated
+
+        if self._job is None:
+            if self.poll() is not None:
+                raise ProcessLookupError(self.pid)
+            # pywinpty and self._process keep the handle open: no pid reuse.
+            try:
+                _terminate_process(self.pid)
+            except PermissionError:
+                # TerminateProcess denies a child that exited after poll().
+                if self.poll() is not None:
+                    raise ProcessLookupError(self.pid) from None
+                raise
+            return
+        with translated():
+            accounting = win32job.QueryInformationJobObject(
+                self._job, win32job.JobObjectBasicAccountingInformation)
+            if int(accounting["ActiveProcesses"]) == 0:
+                raise ProcessLookupError(self.pid)
+            # A Job that drains after the query terminates as a no-op, like
+            # killpg reaching a group whose members are all zombies.
+            win32job.TerminateJobObject(self._job, 1)
 
     def close(self) -> None:
         self._reading = False
@@ -405,23 +490,51 @@ class _WindowsPty(PtyProcess):
         if self._closed:
             return
         self._closed = True
-        terminal, self._terminal = self._terminal, _ClosedTerminal()
+        try:
+            self.poll()  # keep an exit status pywinpty already knows
+        except OSError:
+            pass  # the process handle below still reports it
+        # _dispose pops the only other reference, so the pseudo console is
+        # released there, before the Job handle closes.
+        console = [self._terminal]
+        self._terminal = _ClosedTerminal(self._process)
         job, self._job = self._job, None
         # Releasing the pseudo console ends every attached process; on Windows
         # 10 that can wait for its output pipe, so never block the event loop.
         threading.Thread(
-            target=_dispose, args=(terminal, job, self._reader),
+            target=_dispose, args=(console, job, self._reader, self.pid),
             name=f"conpty-close-{self.pid}", daemon=True).start()
 
 
 class _ClosedTerminal:
-    """Stands in for a released pseudo console."""
+    """Stands in for a released pseudo console.
+
+    The child's own process handle still reports whether it runs and its real
+    exit status; without one (it could not be opened) it counts as exited.
+    """
+
+    def __init__(self, process: Any | None = None):
+        self._process = process
 
     def isalive(self) -> bool:
-        return False
+        if self._process is None:
+            return False
+        import win32event
 
-    def get_exitstatus(self) -> int:
-        return 1
+        from cc_remote.platform._win32err import translated
+
+        with translated():
+            return win32event.WaitForSingleObject(self._process, 0) == win32event.WAIT_TIMEOUT
+
+    def get_exitstatus(self) -> int | None:
+        if self._process is None:
+            return None
+        import win32process
+
+        from cc_remote.platform._win32err import translated
+
+        with translated():
+            return win32process.GetExitCodeProcess(self._process) & 0xFFFFFFFF
 
     def cancel_io(self) -> bool:
         return False
@@ -436,13 +549,17 @@ class _ClosedTerminal:
         raise OSError("pseudo console is closed")
 
 
-def _dispose(terminal: Any, job: Any | None, reader: threading.Thread | None) -> None:
+def _dispose(console: list[Any], job: Any | None, reader: threading.Thread | None,
+             pid: int) -> None:
     """Release a pseudo console off the event loop.
 
-    ``cancel_io`` only cancels a read already in flight, and the reader may be
-    between two reads; repeat it until the reader has left ``read()``. Only
-    then is this the last reference, so pywinpty closes the pseudo console.
+    ``console`` holds the only other reference; popping it keeps the terminal
+    out of this thread's arguments. ``cancel_io`` only cancels a read already
+    in flight, and the reader may be between two reads; repeat it until the
+    reader has left ``read()``. Only then is this the last reference, so
+    pywinpty closes the pseudo console, before the Job handle closes.
     """
+    terminal = console.pop()
     deadline = time.monotonic() + _READER_STOP_SECONDS
     while True:
         try:
@@ -452,6 +569,10 @@ def _dispose(terminal: Any, job: Any | None, reader: threading.Thread | None) ->
         if reader is None or not reader.is_alive() or time.monotonic() >= deadline:
             break
         reader.join(0.05)
+    if reader is not None and reader.is_alive():
+        # Its read() still holds the terminal: the pseudo console is released
+        # only when that read returns. One console, bounded by its lifetime.
+        _log.warning("conpty_reader_leaked", pid=pid)
     del terminal  # the last reference: pywinpty closes the pseudo console
     if job is not None:
         job.Close()

@@ -5,8 +5,11 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
+import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -326,4 +329,248 @@ async def test_wait_survives_cancel_io_with_no_read_in_flight():
     assert await asyncio.wait_for(terminal.wait(), 10) == 3
     assert console.cancels >= 1
     terminal.close()
+    assert await _conpty_threads_gone(terminal.pid)
+
+
+@pytest.mark.asyncio
+async def test_kill_group_ends_the_tree_and_then_reports_it_gone(tmp_path):
+    output = _Collector()
+    terminal = _spawn(tmp_path)
+    terminal.start(output)
+    await output.until(lambda data: b"READY" in data)
+    await terminal.write(b"SPAWN")
+    data = await output.until(lambda data: re.search(rb"GRANDCHILD=(\d+)\r?\n", data))
+    grandchild = int(re.search(rb"GRANDCHILD=(\d+)", data).group(1))
+    terminal.kill_group(procs.SIGKILL)
+    await asyncio.wait_for(terminal.wait(), 10)
+    assert await _gone(grandchild)
+    with pytest.raises(ProcessLookupError):
+        terminal.kill_group(procs.SIGKILL)
+    terminal.close()
+
+
+@pytest.mark.windows_only(reason="pywinpty starts the child before it can join a Job")
+@pytest.mark.asyncio
+async def test_descendants_outside_the_job_end_with_the_pseudo_console(tmp_path, monkeypatch):
+    # Simulate the residual race: a descendant that escaped the Job assignment.
+    monkeypatch.setattr(pty, "_windows_job", lambda _pid: None)
+    script = tmp_path / "child.py"
+    script.write_text(CHILD, encoding="utf-8")
+    # The base interpreter, like node.exe: a venv python.exe launcher holds its
+    # child in the launcher's own kill-on-close Job, which would mask the escape.
+    interpreter = getattr(sys, "_base_executable", sys.executable)
+    output = _Collector()
+    terminal = pty.spawn([interpreter, str(script)], cwd=str(tmp_path), env=dict(os.environ))
+    terminal.start(output)
+    await output.until(lambda data: b"READY" in data)
+    await terminal.write(b"SPAWN")
+    data = await output.until(lambda data: re.search(rb"GRANDCHILD=(\d+)\r?\n", data))
+    grandchild = int(re.search(rb"GRANDCHILD=(\d+)", data).group(1))
+    terminal.kill_group(procs.SIGKILL)  # without a Job this ends only the child
+    await asyncio.wait_for(terminal.wait(), 10)  # ...and wait() releases the console
+    assert await _gone(grandchild)
+    terminal.close()
+
+
+@pytest.mark.windows_only(reason="Job Objects are the Windows process tree")
+@pytest.mark.asyncio
+async def test_kill_group_reports_a_drained_job_gone_before_wait(tmp_path):
+    output = _Collector()
+    terminal = _spawn(tmp_path)
+    try:
+        terminal.start(output)
+        await output.until(lambda data: b"READY" in data)
+        terminal.kill_group(procs.SIGKILL)
+        assert await _gone(terminal.pid)
+        # The Job is still open (wait() has not released it) but empty.
+        with pytest.raises(ProcessLookupError):
+            terminal.kill_group(procs.SIGKILL)
+    finally:
+        await _finish(terminal)
+
+
+@pytest.mark.windows_only(reason="pywinpty's TerminateProcess denies an exited child")
+def test_kill_group_without_a_job_reports_a_child_that_just_exited_gone(monkeypatch):
+    console = _FakeConPty()
+
+    def exits_first(pid: int) -> None:
+        console.alive = False  # the child exits between poll() and TerminateProcess
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(pty, "_terminate_process", exits_first)
+    terminal = pty._WindowsPty(console)
+    with pytest.raises(ProcessLookupError):
+        terminal.kill_group(procs.SIGKILL)
+    terminal.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_and_wait_after_close_report_the_real_exit_status(tmp_path):
+    output = _Collector()
+    terminal = _spawn(tmp_path)
+    terminal.start(output)
+    await output.until(lambda data: b"READY" in data)
+    await terminal.write(b"\x04")
+    assert await _gone(terminal.pid)
+    terminal.close()  # nobody polled the exit before the console went away
+    assert terminal.poll() == 7
+    assert await asyncio.wait_for(terminal.wait(), 10) == 7
+
+
+class _FakeConPty:
+    """A pseudo console stand-in hosting a real process (this one by default)."""
+
+    def __init__(self, pid: int | None = None) -> None:
+        self.pid = os.getpid() if pid is None else pid
+        self.alive = True
+        self.written: list[str] = []
+        self.release = threading.Event()
+
+    def isalive(self) -> bool:
+        return self.alive
+
+    def get_exitstatus(self) -> int:
+        return 3
+
+    def read(self, blocking: bool = False) -> str:
+        self.release.wait(0.01)
+        return ""
+
+    def cancel_io(self) -> bool:
+        return False
+
+    def write(self, text: str) -> int:
+        self.written.append(text)
+        return 0
+
+
+@pytest.mark.windows_only(reason="exercises the ConPTY host directly")
+@pytest.mark.asyncio
+async def test_close_of_a_running_child_still_reports_its_real_status():
+    interpreter = getattr(sys, "_base_executable", sys.executable)
+    child = subprocess.Popen([interpreter, "-c", "import sys; sys.stdin.read(); sys.exit(5)"],
+                             stdin=subprocess.PIPE)
+    try:
+        terminal = pty._WindowsPty(_FakeConPty(child.pid))
+        terminal.start(lambda chunk: None)
+        terminal.close()  # the child outlives the pseudo console stand-in
+        assert terminal.poll() is None
+        child.stdin.close()
+        assert await asyncio.wait_for(terminal.wait(), 10) == 5
+        assert terminal.poll() == 5
+    finally:
+        child.kill()
+        child.wait()
+    assert await _conpty_threads_gone(terminal.pid)
+
+
+@pytest.mark.windows_only(reason="pywinpty raises WinptyError")
+def test_poll_reports_pywinpty_errors_as_oserror():
+    import winpty
+
+    console = _FakeConPty()
+
+    def broken() -> bool:
+        raise winpty.WinptyError("pseudo console gone")
+
+    console.isalive = broken
+    terminal = pty._WindowsPty(console)
+    with pytest.raises(OSError) as raised:
+        terminal.poll()
+    assert not isinstance(raised.value, winpty.WinptyError)
+    terminal.close()  # close() polls too, and must not raise
+
+
+@pytest.mark.windows_only(reason="ConPTY writes run on worker threads")
+@pytest.mark.asyncio
+async def test_concurrent_writes_keep_their_order():
+    console = _FakeConPty()
+    delays = iter([0.2, 0.1, 0.0])
+
+    def slow_write(text: str) -> int:
+        time.sleep(next(delays))
+        console.written.append(text)
+        return 0
+
+    console.write = slow_write
+    terminal = pty._WindowsPty(console)
+    try:
+        await asyncio.gather(terminal.write(b"a"), terminal.write(b"b"), terminal.write(b"c"))
+        assert console.written == ["a", "b", "c"]
+    finally:
+        terminal.close()
+
+
+class _RecordingJob:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def Close(self) -> None:  # noqa: N802 - mirrors the pywin32 handle
+        self.events.append("job")
+
+
+@pytest.mark.windows_only(reason="exercises the ConPTY release order")
+@pytest.mark.asyncio
+async def test_close_releases_the_pseudo_console_before_the_job():
+    events: list[str] = []
+    console = _FakeConPty()
+    weakref.finalize(console, events.append, "console")
+    terminal = pty._WindowsPty(console, _RecordingJob(events))
+    del console
+    terminal.start(lambda chunk: None)
+    terminal.close()
+    assert await _conpty_threads_gone(terminal.pid)
+    assert events == ["console", "job"]
+
+
+@pytest.mark.windows_only(reason="exercises the ConPTY release on exit")
+@pytest.mark.asyncio
+async def test_wait_releases_the_pseudo_console_once_the_child_exits():
+    # pywinpty's cancel_io already tears an idle console down, so the escape
+    # test above cannot tell; this one sees the release itself.
+    released = threading.Event()
+    console = _FakeConPty()
+    console.alive = False
+    weakref.finalize(console, released.set)
+    terminal = pty._WindowsPty(console)
+    del console
+    terminal.start(lambda chunk: None)
+    assert await asyncio.wait_for(terminal.wait(), 10) == 3
+    assert await asyncio.to_thread(released.wait, 5)
+    assert await _conpty_threads_gone(terminal.pid)
+    terminal.close()  # idempotent
+
+
+@pytest.mark.windows_only(reason="exercises the ConPTY reader bound")
+@pytest.mark.asyncio
+async def test_a_reader_stuck_past_the_bound_is_logged_as_a_leak(monkeypatch):
+    warnings: list[tuple[str, dict]] = []
+
+    class _Log:
+        def warning(self, msg: str, **fields) -> None:
+            warnings.append((msg, fields))
+
+    monkeypatch.setattr(pty, "_log", _Log(), raising=False)
+    monkeypatch.setattr(pty, "_READER_STOP_SECONDS", 0.2)
+    console = _FakeConPty()
+    stuck = threading.Event()
+
+    def blocked_read(blocking: bool = False) -> str:
+        stuck.set()
+        console.release.wait(10)  # cancel_io cannot reach this read
+        return ""
+
+    console.read = blocked_read
+    terminal = pty._WindowsPty(console)
+    terminal.start(lambda chunk: None)
+    try:
+        await asyncio.to_thread(stuck.wait, 5)
+        terminal.close()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not warnings and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        assert warnings == [("conpty_reader_leaked", {"pid": terminal.pid})]
+    finally:
+        console.release.set()
     assert await _conpty_threads_gone(terminal.pid)
