@@ -632,11 +632,18 @@ class PTYSession:
 
 
     async def _wait_for_exit(self) -> None:
-        returncode = await self.terminal.wait()
-        # Drain bytes that became readable immediately before wait() completed.
-        for data in self.terminal.drain():
-            self._append_history(data)
-            self._broadcast(SessionEvent("output", data))
+        try:
+            returncode = await self.terminal.wait()
+        except OSError as exc:
+            # A broken exit poll (ConPTY) must not leave the session running
+            # forever: report it exited with an unknown status (1).
+            log.warning("PTY exit wait for session %s failed: %s", self.id, exc)
+            returncode = 1
+        else:
+            # Drain bytes that became readable immediately before wait() completed.
+            for data in self.terminal.drain():
+                self._append_history(data)
+                self._broadcast(SessionEvent("output", data))
         self.terminal.stop_reading()
         self.returncode = returncode
         self.exited_at = time.time()
@@ -1393,8 +1400,14 @@ class PTYSession:
         if self._closed:
             return
         self._closed = True
-        if stop and self.running:
-            await self.stop(grace_seconds=0.5)
+        try:
+            if stop and self.running:
+                await self.stop(grace_seconds=0.5)
+        finally:
+            # A failed stop still releases the terminal; its error follows.
+            await self._teardown()
+
+    async def _teardown(self) -> None:
         if self._compose_timer is not None:
             self._compose_timer.cancel()
             self._compose_timer = None

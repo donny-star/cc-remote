@@ -1429,6 +1429,74 @@ async def test_close_does_not_wait_past_the_bound_for_a_stuck_pty_write(
     assert writer.cancelled()
 
 
+class _ExitTerminal(_StuckWriteTerminal):
+    """A PTY whose exit wait or group kill fails, like a broken ConPTY poll."""
+
+    def __init__(self, *, wait_error: OSError | None = None,
+                 kill_error: OSError | None = None) -> None:
+        super().__init__()
+        self.wait_error = wait_error
+        self.kill_error = kill_error
+
+    async def wait(self) -> int:
+        if self.wait_error is not None:
+            raise self.wait_error
+        return await super().wait()
+
+    def kill_group(self, sig: int) -> None:
+        if self.kill_error is not None:
+            raise self.kill_error
+
+
+def _fake_session(terminal, cwd: Path) -> PTYSession:
+    return PTYSession(
+        session_id=str(uuid.uuid4()), terminal=terminal, cwd=str(cwd), kind="new",
+        resume_id=None, history_limit=1024, generation="g", on_change=lambda: 0,
+        on_control_change=None, model=None, effort=None, permission_mode="default",
+        bypass_allowed=False, auto_compact=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_exit_wait_ends_the_session_instead_of_leaving_it_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+):
+    _set_home(monkeypatch, tmp_path)
+    terminal = _ExitTerminal(wait_error=OSError("ConPTY poll failed: broken handle"))
+    session = _fake_session(terminal, tmp_path)
+    subscription, _history, _returncode = session.subscribe(owner="mirror", want_keyboard=False)
+    assert subscription is not None
+    with caplog.at_level("WARNING", logger=broker_session_module.__name__):
+        session.start()
+        await asyncio.wait_for(asyncio.shield(session._wait_task), 5)
+    assert session.running is False
+    assert session.returncode == 1  # the real status is unknown
+    assert "ConPTY poll failed" in caplog.text
+    events = []
+    while not subscription.queue.empty():
+        events.append(subscription.queue.get_nowait())
+    assert [event.kind for event in events] == ["exit"]
+    await asyncio.wait_for(session.close(stop=True), 5)
+    assert terminal.closed is True
+
+
+@pytest.mark.asyncio
+async def test_close_finishes_teardown_when_stopping_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _set_home(monkeypatch, tmp_path)
+    terminal = _ExitTerminal(kill_error=PermissionError(1, "Operation not permitted"))
+    session = _fake_session(terminal, tmp_path)
+    session.start()
+    writer = session._writer_task
+    with pytest.raises(PermissionError):
+        await asyncio.wait_for(session.close(stop=True), 5)
+    assert terminal.closed is True
+    assert writer is not None and writer.cancelled()
+    terminal.exited.set()
+    await asyncio.wait_for(session._wait_task, 5)
+
+
 def test_control_store_round_trips_privately_and_rejects_a_shared_file(tmp_path: Path):
     directory = tmp_path / "broker"
     directory.mkdir()
