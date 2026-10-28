@@ -373,7 +373,15 @@ def is_reparse_point(path: StrPath) -> bool:
     :func:`open_nofollow` will succeed: call it and handle ``OSError``.
     Raises FileNotFoundError when ``path`` does not exist.
     """
-    info = os.lstat(path)
+    return is_reparse_point_info(os.lstat(path))
+
+
+def is_reparse_point_info(info: os.stat_result) -> bool:
+    """:func:`is_reparse_point` for an ``lstat`` result already in hand.
+
+    Lets a pinned walk decide from ``DirHandle.lstat`` without re-resolving
+    a path.
+    """
     if not IS_WINDOWS:
         return stat.S_ISLNK(info.st_mode)
     return bool(info.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)

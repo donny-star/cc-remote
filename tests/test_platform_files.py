@@ -185,6 +185,15 @@ def test_is_reparse_point_missing_path_raises(tmp_path) -> None:
         files.is_reparse_point(tmp_path / "missing")
 
 
+def test_is_reparse_point_info_decides_from_an_lstat_result(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_directory(target, link)
+    assert files.is_reparse_point_info(os.lstat(link)) is True
+    assert files.is_reparse_point_info(os.lstat(target)) is False
+
+
 def test_open_nofollow_reads_and_creates_regular_files(tmp_path) -> None:
     path = tmp_path / "f"
     fd = files.open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)

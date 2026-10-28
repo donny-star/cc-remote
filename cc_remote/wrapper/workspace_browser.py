@@ -29,8 +29,8 @@ def browse_workspace(
             info = directory.lstat(part)
             if stat.S_ISREG(info.st_mode) and index == len(parts) - 1:
                 return {"root": root, "path": candidate, "kind": "file"}
-            if not stat.S_ISDIR(info.st_mode) or platform_files.is_reparse_point(
-                    directory.child_path(part)):
+            if (not stat.S_ISDIR(info.st_mode)
+                    or platform_files.is_reparse_point_info(info)):
                 raise ValueError("不支持打开符号链接或特殊文件")
             child = directory.open_dir(part)
             directory.close()
