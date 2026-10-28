@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import shutil
+import sys
 import tempfile
 import uuid
 
@@ -41,48 +43,103 @@ from cc_remote.claude_broker.session import (
     PTYSession, SessionError, _launch_controls, _model_from_command_stdout,
     _parse_context_markdown,
 )
+from cc_remote.platform import IS_WINDOWS, perms
 from cc_remote.protocol import (
     AnswerQuestion, AskUser, Model, Perm, SetEffort, SetModel, SetPerm,
 )
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+from tests.ipc_helpers import share_with_everyone
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+
+RAW_TERMINAL = r'''
+def raw_terminal():
+    """Raw keyboard input on a POSIX tty or a Windows console (ConPTY)."""
+    if os.name != "nt":
+        import tty
+
+        tty.setraw(0)
+
+        def read_posix():
+            return os.read(0, 65536)
+
+        return read_posix
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32")
+    handle = msvcrt.get_osfhandle(0)
+    mode = ctypes.c_uint32()
+    kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+    # Clear processed/line/echo input; VT input delivers keys as bytes.
+    kernel32.SetConsoleMode(handle, (mode.value & ~0x7) | 0x200)
+
+    def read_console():
+        return sys.stdin.buffer.raw.read(65536)
+
+    return read_console
+'''
+
+
+def _install_fake(directory: Path, name: str, source: str) -> Path:
+    """An executable fake Claude: a script on POSIX, a .cmd shim on Windows."""
+    if not IS_WINDOWS:
+        executable = directory / name
+        executable.write_text(source, encoding="utf-8")
+        executable.chmod(0o700)
+        return executable
+    script = directory / f"{name}.py"
+    script.write_text(source, encoding="utf-8")
+    shim = directory / f"{name}.cmd"
+    shim.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    return shim
+
+
+def _set_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    # Path.home() reads USERPROFILE on Windows and HOME elsewhere.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
+def _args(output: bytes) -> list[str]:
+    return json.loads(re.search(rb"ARGS:(\[[^\r\n]*\])", output).group(1))
+
+
+def _echoed(output: bytes) -> bytes:
+    """Concatenate the fake's escaped echoes; a terminal may split one write."""
+    return "".join(
+        part.decode("unicode_escape") for part in re.findall(rb"OUT<(.*?)>", output)
+    ).encode("utf-8")
 
 
 @pytest.fixture
 def fake_claude(tmp_path: Path) -> Path:
-    executable = tmp_path / "fake-claude"
-    executable.write_text(
-        """#!/usr/bin/env python3
+    return _install_fake(tmp_path, "fake-claude", r'''#!/usr/bin/env python3
 import json
 import os
 import sys
-import tty
-
-tty.setraw(0)
-os.write(1, b"ARGS:" + json.dumps(sys.argv[1:]).encode() + b"\\n")
-os.write(1, b"\\x1b[31mREADY\\x1b[0m\\n")
+''' + RAW_TERMINAL + r'''
+read = raw_terminal()
+os.write(1, b"ARGS:" + json.dumps(sys.argv[1:]).encode() + b"\n")
+os.write(1, b"\x1b[31mREADY\x1b[0m\n")
 while True:
-    data = os.read(0, 65536)
-    if not data or data == b"\\x04":
+    data = read()
+    if not data or data == b"\x04":
         break
-    os.write(1, b"OUT<" + data + b">")
-""",
-        encoding="utf-8",
-    )
-    executable.chmod(0o700)
-    return executable
+    # Escape control bytes so a terminal emulator (ConPTY) passes them through.
+    os.write(1, b"OUT<" + data.decode("utf-8", "replace").encode("unicode_escape") + b">")
+''')
 
 
 @pytest.fixture
 def control_fake_claude(tmp_path: Path) -> Path:
     """Tiny raw TUI that records the same durable control rows as Claude."""
-    executable = tmp_path / "control-fake-claude"
-    executable.write_text(
+    source = (
         r'''#!/usr/bin/env python3
 import json
 import os
 import sys
-import tty
+''' + RAW_TERMINAL + r'''
 
 def arg(name, default=None):
     if name in sys.argv:
@@ -137,11 +194,11 @@ def command(name, value, stdout):
         "message": {"content": f"<local-command-stdout>{stdout}</local-command-stdout>"},
     })
 
-tty.setraw(0)
+read = raw_terminal()
 os.write(1, b"READY\n")
 pending = b""
 while True:
-    data = os.read(0, 65536)
+    data = read()
     if not data or data == b"\x04":
         break
     pending += data
@@ -223,11 +280,9 @@ while True:
                     "| Messages | 7.6k | 0.8% |\n"
                 )},
             })
-''',
-        encoding="utf-8",
+'''
     )
-    executable.chmod(0o700)
-    return executable
+    return _install_fake(tmp_path, "control-fake-claude", source)
 
 
 @pytest.fixture
@@ -271,7 +326,7 @@ async def control_broker(
 ):
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
     supports_auto, reports_manual = request.param
     monkeypatch.setenv("FAKE_CLAUDE_AUTO", "1" if supports_auto else "0")
     monkeypatch.setenv(
@@ -290,7 +345,7 @@ async def control_broker(
         await server.close()
 
 
-async def _output_until(attachment, needle: bytes, timeout: float = 3.0) -> bytes:
+async def _output_until(attachment, needle: bytes, timeout: float = 10.0) -> bytes:
     output = bytearray()
     async with asyncio.timeout(timeout):
         while needle not in output:
@@ -314,7 +369,7 @@ async def test_context_query_retries_one_ignored_startup_command(
 ):
     home = tmp_path / "retry-home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
     monkeypatch.setenv("FAKE_CLAUDE_DROP_FIRST_CONTEXT", "1")
     monkeypatch.setattr(
         broker_session_module, "CONTEXT_CONFIRM_TIMEOUT_SECONDS", 0.2)
@@ -350,7 +405,7 @@ async def test_model_control_confirms_changed_native_prompt_after_fresh_output(
 ):
     home = tmp_path / "model-confirm-home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
     monkeypatch.setenv("FAKE_CLAUDE_UNKNOWN_MODEL_PROMPT", "1")
     monkeypatch.setenv("FAKE_CLAUDE_IGNORE_FIRST_MODEL_CONFIRM", "1")
     monkeypatch.setattr(
@@ -466,8 +521,7 @@ async def test_new_attach_atomic_send_detach_and_resume(broker, tmp_path: Path):
     assert mirror.keyboard is False
     initial = await _output_until(primary, b"READY")
     assert b"\x1b[31mREADY\x1b[0m" in initial
-    args_line = next(line for line in initial.splitlines() if line.startswith(b"ARGS:"))
-    argv = json.loads(args_line.removeprefix(b"ARGS:").decode())
+    argv = _args(initial)
     assert argv[:2] == ["--session-id", sid]
     assert not any(value.startswith("--remote-control") for value in argv)
 
@@ -497,17 +551,17 @@ async def test_new_attach_atomic_send_detach_and_resume(broker, tmp_path: Path):
     assert replacement.keyboard is True
     interrupted = await client.interrupt(sid)
     assert interrupted["session"]["terminal_composing"] is False
-    assert b"OUT<\x03>" in await _output_until(replacement, b"OUT<\x03>")
+    assert b"\x03" in _echoed(await _output_until(replacement, b"OUT<\\x03>"))
     submitted = await client.send(sid, "remote prompt")
     assert submitted["session"]["id"] == sid
-    assert b"OUT<remote prompt\r>" in await _output_until(replacement, b"remote prompt\r")
+    assert b"remote prompt\r" in _echoed(await _output_until(replacement, b"\\r>"))
     with pytest.raises(BrokerClientError) as read_only:
         await mirror.write(b"nope")
     assert read_only.value.code == "input_read_only"
 
     await replacement.close()
     replay_attachment = await client.attach(sid)
-    replay = await _output_until(replay_attachment, b"remote prompt\r")
+    replay = await _output_until(replay_attachment, b"remote prompt")
     assert b"\x1b[31mREADY\x1b[0m" in replay
     await replay_attachment.close()
     await mirror.close()
@@ -519,10 +573,7 @@ async def test_new_attach_atomic_send_detach_and_resume(broker, tmp_path: Path):
     assert resumed["session"]["kind"] == "resume"
     resumed_attachment = await client.attach(sid)
     resumed_output = await _output_until(resumed_attachment, b"READY")
-    resumed_args = next(
-        line for line in resumed_output.splitlines() if line.startswith(b"ARGS:")
-    )
-    assert json.loads(resumed_args.removeprefix(b"ARGS:").decode())[:2] == ["--resume", sid]
+    assert _args(resumed_output)[:2] == ["--resume", sid]
     await resumed_attachment.close()
     await client.stop(sid)
 
@@ -543,7 +594,8 @@ async def test_terminal_focus_input_waits_for_remote_control_without_detaching(
     try:
         # Claude enables xterm focus reporting. Switching from the terminal to
         # Remote sends ESC[O at exactly the same time as a Remote control.
-        await terminal.write(b"\x1b[O")
+        # ConPTY consumes the focus report it requested itself; the trailing bytes prove the frame was serialized, not rejected.
+        await terminal.write(b"\x1b[Ofocus")
         await asyncio.sleep(0.05)
         status = await client.status(sid)
         assert status["session"]["attached_count"] == 1
@@ -551,7 +603,7 @@ async def test_terminal_focus_input_waits_for_remote_control_without_detaching(
         session._control_in_progress = False
         session._control_lock.release()
 
-    assert b"OUT<\x1b[O>" in await _output_until(terminal, b"OUT<\x1b[O>")
+    assert b"focus" in _echoed(await _output_until(terminal, b"focus>"))
     status = await client.status(sid)
     assert status["session"]["running"] is True
     assert status["session"]["keyboard_attached"] is True
@@ -690,8 +742,7 @@ async def test_broker_persists_sdk_controls_into_next_native_resume(
     assert resumed["session"]["bypass_allowed"] is True
     attachment = await client.attach(sid)
     output = await _output_until(attachment, b"READY")
-    args_line = next(line for line in output.splitlines() if line.startswith(b"ARGS:"))
-    args = json.loads(args_line.removeprefix(b"ARGS:").decode())
+    args = _args(output)
     assert args[:2] == ["--resume", sid]
     assert args[args.index("--model") + 1] == "claude-fable-5"
     assert args[args.index("--effort") + 1] == "max"
@@ -702,7 +753,7 @@ async def test_broker_persists_sdk_controls_into_next_native_resume(
     await client.stop(sid)
 
     store = Path(client.socket_path).with_name("session-controls.json")
-    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert perms.is_private(store)
 
 
 @pytest.mark.asyncio
@@ -856,7 +907,7 @@ async def test_control_confirmation_window_rejects_remote_send_and_interrupt():
 def test_transcript_fallback_fails_closed_for_duplicate_sid_across_cwds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_home(monkeypatch, tmp_path)
     sid = "11111111-1111-4111-8111-111111111111"
     root = tmp_path / ".claude" / "projects"
     for project in ("-old-cwd", "-copied-cwd"):
@@ -875,7 +926,7 @@ def test_transcript_lookup_uses_configured_claude_root(
 ):
     home = tmp_path / "home"
     active = tmp_path / "profiles" / "claude"
-    monkeypatch.setenv("HOME", str(home))
+    _set_home(monkeypatch, home)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(active))
     sid = "11111111-1111-4111-8111-111111111111"
     cwd = "/configured-root"
@@ -1064,3 +1115,135 @@ async def test_server_rejects_a_peer_uid_mismatch(
     with pytest.raises(BrokerClientError) as rejected:
         await client.status()
     assert rejected.value.code == "broker_disconnected"
+
+
+async def _events_until(subscription, needle: bytes, timeout: float = 10.0) -> bytes:
+    output = bytearray()
+    async with asyncio.timeout(timeout):
+        while needle not in output:
+            event = await subscription.queue.get()
+            if event.kind == "exit":
+                pytest.fail(f"session exited before {needle!r}: {event.data}")
+            output.extend(event.data)
+    return bytes(output)
+
+
+@pytest.mark.asyncio
+async def test_session_manager_hosts_the_tui_in_a_portable_pty(tmp_path: Path, fake_claude: Path):
+    manager = broker_session_module.SessionManager(
+        claude_binary=str(fake_claude), max_sessions=2, history_bytes=64 * 1024)
+    try:
+        session = await manager.create(cwd=str(tmp_path), args=[])
+        metadata = session.metadata()
+        assert metadata["pid"] == session.terminal.pid > 0
+        assert metadata["start_ticks"] > 0
+        subscription, snapshot, returncode = session.subscribe(owner="test", want_keyboard=True)
+        assert returncode is None
+        output = b"".join(snapshot)
+        if b"READY" not in output:
+            output += await _events_until(subscription, b"READY")
+        assert _args(output)[:2] == ["--session-id", session.id]
+        await session.write_terminal_input(subscription, "héllo".encode())
+        await _events_until(subscription, b"OUT<h\\xe9llo>")
+        session.resize(30, 100)
+        await session.stop()
+        assert session.running is False
+        assert session.returncode is not None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.windows_only(reason="the explicit claude-remote launcher is a .cmd file on Windows (P5)")
+def test_resolve_executable_refuses_the_claude_remote_launcher(tmp_path: Path):
+    launcher = tmp_path / "claude-remote.cmd"
+    launcher.write_text("@echo off\r\n", encoding="utf-8")
+    with pytest.raises(broker_session_module.SessionError, match="refusing to launch claude-remote"):
+        broker_session_module.resolve_executable(str(launcher))
+
+
+class _StuckWriteTerminal:
+    """A PTY whose write, like a Windows ConPTY worker thread, outlasts cancellation."""
+
+    pid = 4242
+    start_ticks = 1
+
+    def __init__(self) -> None:
+        self.writing = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = False
+        self.exited = asyncio.Event()
+
+    def start(self, on_output) -> None:
+        pass
+
+    def stop_reading(self) -> None:
+        pass
+
+    async def wait(self) -> int:
+        await self.exited.wait()
+        return 0
+
+    def drain(self) -> list[bytes]:
+        return []
+
+    async def write(self, data: bytes) -> None:
+        self.writing.set()
+        cancelled = False
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_wait_past_the_bound_for_a_stuck_pty_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+):
+    _set_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(broker_session_module, "WRITER_STOP_TIMEOUT_SECONDS", 0.2)
+    terminal = _StuckWriteTerminal()
+    session = PTYSession(
+        session_id=str(uuid.uuid4()), terminal=terminal, cwd=str(tmp_path), kind="new",
+        resume_id=None, history_limit=1024, generation="g", on_change=lambda: 0,
+        on_control_change=None, model=None, effort=None, permission_mode="default",
+        bypass_allowed=False, auto_compact=None,
+    )
+    session.start()
+    sending = asyncio.create_task(session._enqueue_input(b"x"))
+    await asyncio.wait_for(terminal.writing.wait(), 5)
+    writer = session._writer_task
+    started = asyncio.get_running_loop().time()
+    with caplog.at_level("WARNING", logger=broker_session_module.__name__):
+        await asyncio.wait_for(session.close(stop=False), 5)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert terminal.closed is True
+    assert writer is not None and not writer.done()
+    assert "did not stop" in caplog.text
+
+    terminal.release.set()
+    terminal.exited.set()
+    sending.cancel()
+    await asyncio.gather(writer, sending, session._wait_task, return_exceptions=True)
+    assert writer.cancelled()
+
+
+def test_control_store_round_trips_privately_and_rejects_a_shared_file(tmp_path: Path):
+    directory = tmp_path / "broker"
+    directory.mkdir()
+    perms.make_private(directory, directory=True)
+    path = directory / "session-controls.json"
+    sid = str(uuid.uuid4())
+    store = broker_session_module.ControlStore(str(path))
+    assert store.update(sid, model="claude-fable-5") == {"model": "claude-fable-5"}
+    assert perms.is_private(path)
+    assert broker_session_module.ControlStore(str(path)).get(sid) == {"model": "claude-fable-5"}
+
+    share_with_everyone(path)
+    with pytest.raises(broker_session_module.ControlStoreError, match="not a private"):
+        broker_session_module.ControlStore(str(path)).load()
