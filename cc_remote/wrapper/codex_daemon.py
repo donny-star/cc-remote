@@ -29,6 +29,7 @@ from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
 from cc_remote.platform import files as platform_files
+from cc_remote.platform import perms
 from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
@@ -333,19 +334,12 @@ def _text(value: Any, limit: int = 4096) -> Optional[str]:
 
 def _managed_pid(path: Path) -> Optional[int]:
     """Read one bounded, same-user daemon PID record without following links."""
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        return None
     descriptor: Optional[int] = None
     try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NONBLOCK", 0),
-        )
+        descriptor = platform_files.open_nofollow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != current_uid()
+                or not perms.owned_info(descriptor, file_stat)
                 or file_stat.st_size > _PID_RECORD_MAX):
             return None
         data = os.read(descriptor, _PID_RECORD_MAX + 1)

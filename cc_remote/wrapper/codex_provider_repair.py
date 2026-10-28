@@ -426,7 +426,7 @@ def _replacement_first_line(original: bytes) -> bytes:
 def _pwrite_all(descriptor: int, payload: bytes, offset: int = 0) -> None:
     written = 0
     while written < len(payload):
-        count = os.pwrite(descriptor, payload[written:], offset + written)
+        count = platform_files.pwrite(descriptor, payload[written:], offset + written)
         if count <= 0:
             raise OSError("short pwrite while repairing rollout metadata")
         written += count
@@ -496,22 +496,19 @@ def _patch_rollout(
     journal = _write_journal(
         journal_dir, candidate, original, replacement,
     )
-    flags = os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    descriptor = platform_files.open_nofollow(path, os.O_RDWR)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size < len(original):
             raise CodexProviderRepairError("rollout identity changed")
-        current = os.pread(descriptor, len(original), 0)
+        current = platform_files.pread(descriptor, len(original), 0)
         if current != original:
             raise CodexProviderRepairError(
                 "rollout metadata changed before write",
             )
         _pwrite_all(descriptor, replacement)
         os.fsync(descriptor)
-        if os.pread(descriptor, len(replacement), 0) != replacement:
+        if platform_files.pread(descriptor, len(replacement), 0) != replacement:
             raise CodexProviderRepairError(
                 "rollout metadata verification failed",
             )
@@ -596,17 +593,14 @@ def _recover_journals(
             raise CodexProviderRepairError(
                 "provider repair journal preimage does not match thread",
             )
-        flags = os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(rollout, flags)
+        descriptor = platform_files.open_nofollow(rollout, os.O_RDWR)
         try:
             identity = os.fstat(descriptor)
             if not stat.S_ISREG(identity.st_mode):
                 raise CodexProviderRepairError(
                     "journal rollout is not a regular file",
                 )
-            current = os.pread(descriptor, len(original), 0)
+            current = platform_files.pread(descriptor, len(original), 0)
             if current not in {original, replacement}:
                 _pwrite_all(descriptor, original)
                 os.fsync(descriptor)
@@ -781,12 +775,9 @@ def repair_http_provider_records(
                 connection.rollback()
             for original, replacement, _journal, path in reversed(patched):
                 try:
-                    flags = os.O_RDWR
-                    if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
-                    descriptor = os.open(path, flags)
+                    descriptor = platform_files.open_nofollow(path, os.O_RDWR)
                     try:
-                        current = os.pread(descriptor, len(replacement), 0)
+                        current = platform_files.pread(descriptor, len(replacement), 0)
                         if current == replacement:
                             _pwrite_all(descriptor, original)
                             os.fsync(descriptor)
