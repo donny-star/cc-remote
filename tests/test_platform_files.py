@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
+import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -115,3 +119,155 @@ def test_force_rmtree_removes_readonly_files(tmp_path) -> None:
 
 def test_fsync_directory_accepts_existing_directory(tmp_path) -> None:
     files.fsync_directory(tmp_path)
+
+
+def _link_directory(target, link) -> None:
+    """A directory link every platform can create without privileges."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_is_reparse_point_regular_file_and_directory(tmp_path) -> None:
+    regular = tmp_path / "regular"
+    regular.write_bytes(b"x")
+    assert files.is_reparse_point(regular) is False
+    assert files.is_reparse_point(tmp_path) is False
+
+
+def test_is_reparse_point_directory_link(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_directory(target, link)
+    assert files.is_reparse_point(link) is True
+
+
+@pytest.mark.requires_symlink(reason="checks a file symbolic link")
+def test_is_reparse_point_file_symlink(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert files.is_reparse_point(link) is True
+
+
+def test_is_reparse_point_missing_path_raises(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        files.is_reparse_point(tmp_path / "missing")
+
+
+def test_open_nofollow_reads_and_creates_regular_files(tmp_path) -> None:
+    path = tmp_path / "f"
+    fd = files.open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        os.write(fd, b"a\nb\x1ac")
+    finally:
+        os.close(fd)
+    fd = files.open_nofollow(path, os.O_RDONLY)
+    try:
+        assert os.read(fd, 16) == b"a\nb\x1ac"
+        assert stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
+def test_open_nofollow_keeps_share_delete(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"old")
+    fd = files.open_nofollow(path, os.O_RDONLY)
+    try:
+        replacement = tmp_path / "new"
+        replacement.write_bytes(b"new")
+        files.replace(replacement, path)
+        assert path.read_bytes() == b"new"
+    finally:
+        os.close(fd)
+
+
+def test_open_nofollow_exclusive_create_rejects_existing(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    with pytest.raises(FileExistsError):
+        files.open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+
+
+def test_open_nofollow_missing_file_raises(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        files.open_nofollow(tmp_path / "missing", os.O_RDONLY)
+
+
+@pytest.mark.requires_symlink(reason="opens through a file symbolic link")
+def test_open_nofollow_refuses_file_symlink(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"secret")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(OSError) as caught:
+        files.open_nofollow(link, os.O_RDONLY)
+    assert caught.value.errno == errno.ELOOP
+
+
+@pytest.mark.requires_symlink(reason="creates through a dangling symbolic link")
+def test_open_nofollow_refuses_to_create_through_dangling_symlink(tmp_path) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(OSError) as caught:
+        files.open_nofollow(link, os.O_WRONLY | os.O_CREAT)
+    assert caught.value.errno in (errno.ELOOP, errno.EEXIST)
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_open_nofollow_truncates_regular_files(tmp_path) -> None:
+    path = tmp_path / "f"
+    for flags in (os.O_WRONLY | os.O_TRUNC, os.O_WRONLY | os.O_CREAT | os.O_TRUNC):
+        path.write_bytes(b"old content")
+        fd = files.open_nofollow(path, flags)
+        try:
+            os.write(fd, b"n")
+        finally:
+            os.close(fd)
+        assert path.read_bytes() == b"n"
+
+
+def test_open_nofollow_refuses_a_directory_link(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_directory(target, link)
+    # POSIX: ELOOP from O_NOFOLLOW. Windows: a directory (junction) cannot be
+    # opened as a file at all (PermissionError); either way nothing is opened.
+    with pytest.raises(OSError):
+        files.open_nofollow(link, os.O_RDONLY)
+    assert files.is_reparse_point(link) is True
+
+
+@pytest.fixture
+def socket_dir():
+    from tests.unix_socket import short_temp_root
+
+    with tempfile.TemporaryDirectory(prefix="cc-p2a-", dir=short_temp_root()) as root:
+        yield Path(root)
+
+
+@pytest.mark.windows_only(reason="AF_UNIX socket files are reparse points only on Windows")
+@pytest.mark.parametrize("flags", [
+    os.O_RDONLY,
+    os.O_WRONLY | os.O_CREAT,
+    os.O_WRONLY | os.O_TRUNC,
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+], ids=["read", "create", "truncate", "create-truncate"])
+def test_open_nofollow_refuses_a_reparse_point_without_superseding_it(socket_dir, flags) -> None:
+    from tests.unix_socket import unix_listener
+
+    path = socket_dir / "s.sock"
+    with unix_listener(path):
+        assert files.is_reparse_point(path) is True
+        with pytest.raises(OSError) as caught:
+            files.open_nofollow(path, flags)
+        assert caught.value.errno == errno.ELOOP
+        # CREATE_ALWAYS would have replaced the socket with a regular file.
+        assert files.is_reparse_point(path) is True

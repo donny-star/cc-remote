@@ -26,6 +26,33 @@ def test_windows_only_marker_skips_on_posix() -> None:
     assert sys.platform == "win32"
 
 
+@pytest.mark.requires_symlink(reason="harness self-check: creates a symbolic link")
+def test_requires_symlink_marker_runs_only_when_links_work(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.write_text("x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert link.is_symlink()
+
+
+def test_requires_symlink_marker_needs_a_reason() -> None:
+    from tests import conftest
+
+    class _Item:
+        nodeid = "tests/test_x.py::test_x"
+
+        def get_closest_marker(self, name):
+            if name == "requires_symlink":
+                return pytest.mark.requires_symlink().mark
+            return None
+
+        def add_marker(self, marker):
+            raise AssertionError("a reason-less marker must fail before skipping")
+
+    with pytest.raises(pytest.UsageError, match="@requires_symlink requires reason="):
+        conftest.pytest_collection_modifyitems(None, [_Item()])
+
+
 def test_os_open_is_binary_after_importing_package(tmp_path) -> None:
     assert cc_remote.__version__
     path = tmp_path / "raw"
