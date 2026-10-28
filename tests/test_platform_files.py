@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from cc_remote.platform import files
+from cc_remote.platform import files, perms
+from tests.platform_assertions import assert_private_file, foreign_readable_dir
 
 
 def test_share_delete_descriptor_allows_unlink_and_replace(tmp_path) -> None:
@@ -286,3 +287,60 @@ def test_is_unix_socket_accepts_a_bound_listener(socket_dir) -> None:
     path = socket_dir / "s.sock"
     with unix_listener(path):
         assert files.is_unix_socket(path.lstat()) is True
+
+
+def test_create_private_temp_creates_a_new_private_file(tmp_path) -> None:
+    fd, name = files.create_private_temp(tmp_path, prefix=".p-", suffix=".json")
+    try:
+        assert os.get_inheritable(fd) is False
+        os.write(fd, b"secret")
+    finally:
+        os.close(fd)
+    path = Path(name)
+    assert path.is_absolute() and path.parent == tmp_path
+    assert path.name.startswith(".p-") and path.name.endswith(".json")
+    assert path.read_bytes() == b"secret"
+    assert_private_file(path)
+
+
+def test_create_private_temp_is_private_in_a_foreign_readable_directory(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"")
+    if sys.platform == "win32":
+        assert not perms.is_private(plain)  # control: inherited Everyone read
+    fd, name = files.create_private_temp(tmp_path)
+    try:
+        assert perms.is_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert_private_file(name)
+
+
+def test_create_private_temp_names_are_unique_and_share_delete(tmp_path) -> None:
+    first_fd, first = files.create_private_temp(tmp_path)
+    second_fd, second = files.create_private_temp(tmp_path)
+    try:
+        assert first != second
+        os.unlink(first)
+        assert not os.path.exists(first)
+    finally:
+        os.close(first_fd)
+        os.close(second_fd)
+
+
+def test_create_private_temp_missing_directory_raises(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        files.create_private_temp(tmp_path / "missing")
+
+
+@pytest.mark.windows_only(reason="exercises the Windows name-collision retry")
+def test_create_private_temp_retries_a_taken_name(tmp_path, monkeypatch) -> None:
+    names = iter(["a" * 16, "b" * 16, "c" * 16])
+    monkeypatch.setattr(files.secrets, "token_hex", lambda _n: next(names))
+    (tmp_path / ("t" + "a" * 16)).write_bytes(b"taken")
+    (tmp_path / ("t" + "b" * 16)).mkdir()
+    fd, name = files.create_private_temp(tmp_path, prefix="t")
+    os.close(fd)
+    assert Path(name).name == "t" + "c" * 16
+    assert (tmp_path / ("t" + "a" * 16)).read_bytes() == b"taken"

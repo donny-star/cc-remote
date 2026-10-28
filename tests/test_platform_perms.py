@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 
 import pytest
 
-from cc_remote.platform import identity, perms
+from cc_remote.platform import files, identity, perms
+from tests.platform_assertions import assert_private_file, foreign_readable_dir
 
 
 def test_current_uid_matches_stat_owner(tmp_path) -> None:
@@ -367,3 +369,88 @@ def test_info_helpers_fail_closed_for_missing_paths(tmp_path) -> None:
     assert not perms.owned_info(path, info)
     assert not perms.private_mode_info(path, info)
     assert not perms.no_foreign_write_info(path, info)
+
+
+def test_make_private_fd_restricts_a_file_in_a_foreign_readable_directory(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    path = tmp_path / "secret"
+    fd = files.open_nofollow(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if sys.platform == "win32":
+            assert not perms.is_private_fd(fd)  # control: inherited Everyone read
+        perms.make_private_fd(fd)
+        assert perms.is_private_fd(fd)
+        os.write(fd, b"x")
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"x"
+    assert_private_file(path)
+
+
+@pytest.mark.posix_only(reason="the creating open applies POSIX modes")
+def test_make_private_fd_is_a_noop_on_posix(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    os.chmod(path, 0o644)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
+
+
+@pytest.mark.windows_only(reason="only Windows resolves privacy through a reopened handle")
+def test_make_private_fd_does_not_re_resolve_the_path(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    path = tmp_path / "secret"
+    moved = tmp_path / "moved"
+    fd = files.open_nofollow(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        files.replace(path, moved)
+        path.write_bytes(b"")
+        perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert perms.is_private(moved)
+    assert not perms.is_private(path)
+
+
+@pytest.mark.windows_only(reason="pywin32 errors only exist on Windows")
+def test_make_private_fd_failure_raises_permission_error(tmp_path, monkeypatch) -> None:
+    import pywintypes
+    import win32security
+
+    def denied(*args):
+        raise pywintypes.error(5, "SetSecurityInfo", "denied")
+
+    monkeypatch.setattr(win32security, "SetSecurityInfo", denied)
+    fd = files.open_nofollow(tmp_path / "f", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(PermissionError):
+            perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_owned_info_fails_closed_on_any_inspection_error(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    info = path.lstat()
+    assert perms.owned_info(path, info)
+
+    def broken(_target):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(perms, "owned_by_current_user", broken)
+    assert perms.owned_info(path, info) is False
+
+
+@pytest.mark.windows_only(reason="SYSTEM ownership only exists on Windows")
+def test_info_helpers_reject_a_system_owned_directory() -> None:
+    root = os.environ.get("SystemDrive", "C:") + "\\"
+    info = os.stat(root)
+    assert perms.owned_info(root, info) is False
+    assert perms.private_mode_info(root, info) is False
+    assert perms.no_foreign_write_info(root, info) is False
