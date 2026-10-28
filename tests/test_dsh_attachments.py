@@ -6,12 +6,16 @@ import pytest
 from cc_remote.protocol import NewSession, Query, SetDshControl, Steer
 from tests.test_attachments import _b64, _complete_png, _png
 from tests.test_dsh_mutations import prepared
+from tests.platform_paths import native_path
+
+
+TMP = native_path("/tmp")
 
 
 def input_command(entry, **fields):
     ids = {"cmd_id": "input-command", "client_id": "browser"}
     if entry == "new":
-        return NewSession(engine="dsh", cwd="/tmp", request_id="create-request",
+        return NewSession(engine="dsh", cwd=TMP, request_id="create-request",
                           msg_id="input-message", **ids, **fields)
     if entry == "control":
         fields.pop("prompt", None)
@@ -80,7 +84,7 @@ async def test_empty_message_rejected_but_blank_session_creation_allowed(entry):
     assert len(client.calls) == before
     code = "not_steerable" if entry == "steer" else "bad_prompt"
     assert any(frame.type == "error" and frame.code == code for frame in output.sent)
-    await machine._handle(NewSession(engine="dsh", cwd="/tmp"))
+    await machine._handle(NewSession(engine="dsh", cwd=TMP))
     assert sum(call[0] == "session/create" for call in client.calls) == 1
     assert not any(call[0] == "session/prompt" for call in client.calls)
     await runtime.close()

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from cc_remote.platform import files
+from cc_remote.platform import files, perms
+from tests.platform_assertions import assert_private_file, foreign_readable_dir
 
 
 def test_share_delete_descriptor_allows_unlink_and_replace(tmp_path) -> None:
@@ -96,6 +97,30 @@ def test_replace_rejects_non_positive_attempts(tmp_path, attempts) -> None:
     assert not (tmp_path / "dst").exists()
 
 
+def test_replace_renames_a_link_at_the_source_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "secret").write_bytes(b"victim")
+    src = tmp_path / "src"
+    _link_directory(victim, src)
+    dst = tmp_path / "dst"
+    files.replace(src, dst)  # POSIX rename never follows its source
+    assert (victim / "secret").read_bytes() == b"victim"
+    assert files.is_reparse_point(dst)
+    assert not os.path.lexists(src)
+
+
+def test_replace_overwrites_a_read_only_destination(tmp_path) -> None:
+    dst = tmp_path / "dst"
+    dst.write_bytes(b"old")
+    os.chmod(dst, stat.S_IREAD)
+    src = tmp_path / "src"
+    src.write_bytes(b"new")
+    files.replace(src, dst)
+    assert dst.read_bytes() == b"new"
+    assert not src.exists()
+
+
 def test_pread_pwrite_keep_file_position(tmp_path) -> None:
     fd = os.open(tmp_path / "f", os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -115,6 +140,35 @@ def test_force_rmtree_removes_readonly_files(tmp_path) -> None:
     os.chmod(loose, stat.S_IREAD)
     files.force_rmtree(tmp_path / "tree")
     assert not (tmp_path / "tree").exists()
+
+
+@pytest.mark.windows_only(reason="POSIX rmtree refuses a top-level symlink, as before")
+def test_force_rmtree_removes_a_top_level_junction_not_its_target(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    kept = victim / "kept.txt"
+    kept.write_bytes(b"keep")
+    os.chmod(kept, stat.S_IREAD)
+    link = tmp_path / "link"
+    _link_directory(victim, link)
+    try:
+        files.force_rmtree(link)
+        assert not os.path.lexists(link)
+        assert kept.read_bytes() == b"keep"
+        assert not os.access(kept, os.W_OK)  # read-only bits outside are untouched
+    finally:
+        os.chmod(kept, stat.S_IREAD | stat.S_IWRITE)
+
+
+@pytest.mark.windows_only(reason="POSIX rmtree refuses a top-level symlink, as before")
+def test_force_rmtree_removes_a_dangling_top_level_junction(tmp_path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    link = tmp_path / "link"
+    _link_directory(victim, link)
+    victim.rmdir()
+    files.force_rmtree(link)
+    assert not os.path.lexists(link)
 
 
 def test_fsync_directory_accepts_existing_directory(tmp_path) -> None:
@@ -158,6 +212,15 @@ def test_is_reparse_point_file_symlink(tmp_path) -> None:
 def test_is_reparse_point_missing_path_raises(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         files.is_reparse_point(tmp_path / "missing")
+
+
+def test_is_reparse_point_info_decides_from_an_lstat_result(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_directory(target, link)
+    assert files.is_reparse_point_info(os.lstat(link)) is True
+    assert files.is_reparse_point_info(os.lstat(target)) is False
 
 
 def test_open_nofollow_reads_and_creates_regular_files(tmp_path) -> None:
@@ -271,3 +334,111 @@ def test_open_nofollow_refuses_a_reparse_point_without_superseding_it(socket_dir
         assert caught.value.errno == errno.ELOOP
         # CREATE_ALWAYS would have replaced the socket with a regular file.
         assert files.is_reparse_point(path) is True
+
+
+def test_is_unix_socket_rejects_regular_files_and_directories(tmp_path) -> None:
+    regular = tmp_path / "f"
+    regular.write_bytes(b"")
+    assert files.is_unix_socket(regular.lstat()) is False
+    assert files.is_unix_socket(tmp_path.lstat()) is False
+
+
+def test_is_unix_socket_accepts_a_bound_listener(socket_dir) -> None:
+    from tests.unix_socket import unix_listener
+
+    path = socket_dir / "s.sock"
+    with unix_listener(path):
+        assert files.is_unix_socket(path.lstat()) is True
+
+
+def test_create_private_temp_creates_a_new_private_file(tmp_path) -> None:
+    fd, name = files.create_private_temp(tmp_path, prefix=".p-", suffix=".json")
+    try:
+        assert os.get_inheritable(fd) is False
+        os.write(fd, b"secret")
+    finally:
+        os.close(fd)
+    path = Path(name)
+    assert path.is_absolute() and path.parent == tmp_path
+    assert path.name.startswith(".p-") and path.name.endswith(".json")
+    assert path.read_bytes() == b"secret"
+    assert_private_file(path)
+
+
+def test_create_private_temp_is_private_in_a_foreign_readable_directory(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"")
+    if sys.platform == "win32":
+        assert not perms.is_private(plain)  # control: inherited Everyone read
+    fd, name = files.create_private_temp(tmp_path)
+    try:
+        assert perms.is_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert_private_file(name)
+
+
+def test_create_private_temp_names_are_unique_and_share_delete(tmp_path) -> None:
+    first_fd, first = files.create_private_temp(tmp_path)
+    second_fd, second = files.create_private_temp(tmp_path)
+    try:
+        assert first != second
+        os.unlink(first)
+        assert not os.path.exists(first)
+    finally:
+        os.close(first_fd)
+        os.close(second_fd)
+
+
+def test_create_private_temp_missing_directory_raises(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        files.create_private_temp(tmp_path / "missing")
+
+
+@pytest.mark.windows_only(reason="exercises the Windows name-collision retry")
+def test_create_private_temp_retries_a_taken_name(tmp_path, monkeypatch) -> None:
+    names = iter(["a" * 16, "b" * 16, "c" * 16])
+    monkeypatch.setattr(files.secrets, "token_hex", lambda _n: next(names))
+    (tmp_path / ("t" + "a" * 16)).write_bytes(b"taken")
+    (tmp_path / ("t" + "b" * 16)).mkdir()
+    fd, name = files.create_private_temp(tmp_path, prefix="t")
+    os.close(fd)
+    assert Path(name).name == "t" + "c" * 16
+    assert (tmp_path / ("t" + "a" * 16)).read_bytes() == b"taken"
+
+
+def _attrib(*args: str) -> None:
+    import subprocess
+
+    subprocess.run(["attrib", *args], check=True, capture_output=True)
+
+
+def _read_only(path) -> bool:
+    return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+
+
+@pytest.mark.windows_only(reason="read-only links and directories are Windows attributes")
+@pytest.mark.parametrize("nested", [False, True])
+def test_force_rmtree_removes_read_only_junctions_without_touching_targets(
+        tmp_path, nested) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "kept.txt").write_bytes(b"keep")
+    tree = tmp_path / "tree"
+    if nested:
+        tree.mkdir()
+        link = tree / "link"
+    else:
+        link = tree
+    _link_directory(victim, link)
+    _attrib("+R", str(victim))
+    _attrib("+R", "/L", str(link))
+    assert _read_only(link) and _read_only(victim)
+    try:
+        files.force_rmtree(tree)
+        assert not os.path.lexists(tree)
+        assert (victim / "kept.txt").read_bytes() == b"keep"
+        assert _read_only(victim)
+    finally:
+        _attrib("-R", str(victim))

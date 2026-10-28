@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from cc_remote.platform import files as platform_files
 from cc_remote.protocol import RateLimitUpdate, StatusRateLimitWindow
 
 
@@ -187,13 +188,9 @@ class ClaudeRateLimitStore:
                 except OSError:
                     pass
                 raise
-            os.replace(temporary, self.path)
+            platform_files.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(parent)
         except Exception as exc:
             try:
                 temporary.unlink()

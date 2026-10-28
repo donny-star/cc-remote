@@ -793,6 +793,7 @@ def test_get_diff_with_explicit_unknown_sid_never_reads_focused_repo():
     asyncio.run(run())
 
 
+@pytest.mark.posix_only(reason="named pipes (os.mkfifo) only exist on POSIX file systems")
 def test_diff_rejects_untracked_fifo_without_opening_it(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -870,7 +871,10 @@ def test_background_job_scan_caps_entries_and_state_file_size(
         monkeypatch, tmp_path):
     jobs = tmp_path / ".claude" / "jobs"
     jobs.mkdir(parents=True)
+    # Path.home() reads USERPROFILE on Windows; never scan the real ~/.claude.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     valid = jobs / "valid"
     valid.mkdir()
@@ -1877,7 +1881,7 @@ def test_codex_session_settings_reads_bounded_tail_of_oversized_source(
             "collaboration_mode": {"mode": "plan"},
         },
     }) + "\n"
-    rollout.write_text(old + ("x" * 4096) + "\n" + latest)
+    rollout.write_text(old + ("x" * 4096) + "\n" + latest, newline="\n")
     monkeypatch.setattr(
         codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
 

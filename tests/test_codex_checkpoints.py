@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from cc_remote.wrapper.codex_checkpoints import (
     CodexCheckpointJournal,
     NotGitWorkspaceError,
     cleanup_codex_checkpoint_session,
+    migrate_codex_checkpoint_profiles,
 )
 
 
@@ -689,3 +691,139 @@ def test_cleanup_session_removes_journals_from_every_repository(tmp_path):
     assert not first_journal.session_dir.exists()
     assert not second_journal.session_dir.exists()
     assert cleanup_codex_checkpoint_session(state, "cold-child") == 0
+
+
+def test_journal_lock_location_comes_from_the_platform_helper(tmp_path):
+    from cc_remote.platform import dirs
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "session-lock")
+    assert str(journal.lock_path) == dirs.lock_path(journal.session_dir, "journal.lock")
+    if sys.platform != "win32":
+        assert journal.lock_path == journal.session_dir / "journal.lock"
+
+
+def test_session_cleanup_leaves_no_journal_lock_behind(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "lock-residue")
+    journal.cleanup()
+    assert not journal.lock_path.exists()
+    assert list(journal.session_dir.parent.iterdir()) == []
+
+    cold = CodexCheckpointJournal(str(root), state, "cold-lock-residue")
+    assert cleanup_codex_checkpoint_session(state, "cold-lock-residue") == 1
+    assert not cold.lock_path.exists()
+    assert list(cold.session_dir.parent.iterdir()) == []
+
+
+def test_profile_migration_leaves_no_lock_for_the_former_session_key(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    former = CodexCheckpointJournal(str(root), state, "former-session")
+
+    assert migrate_codex_checkpoint_profiles(
+        state, lambda sid: sid.replace("former", "migrated"), profile_revision=1
+    ) == 1
+    migrated = CodexCheckpointJournal(
+        str(root), state, "migrated-session", profile_revision=1
+    )
+    assert not former.session_dir.exists()
+    assert not former.lock_path.exists()
+    assert migrated.completed_turn_ids() == ()
+
+
+def test_atomic_journal_write_replaces_a_read_only_target_like_posix(tmp_path):
+    target = tmp_path / "state" / "manifest.json"
+    target.parent.mkdir()
+    target.write_bytes(b"old")
+    target.chmod(0o400)
+
+    checkpoint_module._atomic_write(target, b"new")
+
+    assert target.read_bytes() == b"new"
+    assert [path.name for path in target.parent.iterdir()] == ["manifest.json"]
+
+
+def test_cleanup_removes_journals_holding_read_only_git_objects(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    state = tmp_path / "state"
+    for session_id in ("captured-warm", "captured-cold"):
+        journal = CodexCheckpointJournal(str(root), state, session_id)
+        journal.begin_turn("turn-1")
+        journal.accept_turn("turn-1")
+        (root / "tracked.txt").write_text(f"{session_id}\n", encoding="utf-8")
+        journal.finish_turn("turn-1")
+        assert any(
+            path.is_file() and path.parent.name not in ("info", "pack")
+            for path in journal.objects_dir.rglob("*")
+        )
+        if session_id == "captured-warm":
+            journal.cleanup()
+        else:
+            assert cleanup_codex_checkpoint_session(state, session_id) == 1
+        assert not journal.session_dir.exists()
+        assert not journal.lock_path.exists()
+
+
+@pytest.mark.windows_only(reason="only Windows discards a sibling lock file")
+def test_journal_lock_open_rides_out_a_concurrent_discard(tmp_path):
+    import threading
+
+    from cc_remote.platform import dirs
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "lock-race")
+    stop = threading.Event()
+
+    def discard_forever():
+        while not stop.is_set():
+            dirs.discard_lock(journal.session_dir, "journal.lock")
+
+    discarder = threading.Thread(target=discard_forever)
+    discarder.start()
+    try:
+        for _ in range(2000):
+            with journal._locked():
+                pass
+    finally:
+        stop.set()
+        discarder.join()
+
+
+def test_cold_cleanup_losing_the_race_leaves_no_journal_lock(tmp_path, monkeypatch):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "raced-cold")
+    replace = os.replace
+
+    def another_remover_got_there_first(src, dst):
+        if Path(src) == journal.session_dir:
+            checkpoint_module.platform_files.force_rmtree(src)
+            raise FileNotFoundError(2, "already removed", str(src))
+        replace(src, dst)
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", another_remover_got_there_first)
+
+    assert cleanup_codex_checkpoint_session(state, "raced-cold") == 0
+    assert not journal.session_dir.exists()
+    assert not journal.lock_path.exists()
+
+
+@pytest.mark.windows_only(reason="POSIX refuses a symlinked session directory before cleanup")
+def test_cold_cleanup_removes_a_junction_session_directory_not_its_target(tmp_path):
+    import _winapi
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "junction-cold")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "kept.txt").write_bytes(b"keep")
+    checkpoint_module.platform_files.force_rmtree(journal.session_dir)
+    _winapi.CreateJunction(str(victim), str(journal.session_dir))
+
+    assert cleanup_codex_checkpoint_session(state, "junction-cold") == 1
+    assert (victim / "kept.txt").read_bytes() == b"keep"
+    assert not os.path.lexists(journal.session_dir)
+    assert list(journal.session_dir.parent.iterdir()) == []

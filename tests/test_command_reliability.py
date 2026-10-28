@@ -52,6 +52,10 @@ from cc_remote.wrapper import machine as machine_module
 from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.relay.pairing import RelayHub
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_paths import native_path
+
+
+COMPONENT = native_path("/repo/component")
 
 
 def test_command_envelope_and_routed_ack_roundtrip():
@@ -1125,7 +1129,7 @@ def test_deleted_claude_fork_retry_only_acks_without_resurrecting(monkeypatch):
         parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         child = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-        cwd = "/repo/component"
+        cwd = COMPONENT
         machine._claude_forks.begin(
             "fork-request", parent, cutoff, cwd)
         machine._claude_forks.claim_submission("fork-request")
@@ -1167,7 +1171,7 @@ def test_failed_claude_fork_delete_restores_complete_journal(monkeypatch):
         parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         machine._claude_forks.begin(
-            "fork-request", parent, cutoff, "/repo/component")
+            "fork-request", parent, cutoff, COMPONENT)
         machine._claude_forks.claim_submission("fork-request")
         machine._claude_forks.complete("fork-request", child)
 
@@ -1177,7 +1181,7 @@ def test_failed_claude_fork_delete_restores_complete_journal(monkeypatch):
         machine._is_codex_session = not_codex
         monkeypatch.setattr(
             machine_module, "get_session_info",
-            lambda _sid: SimpleNamespace(cwd="/repo/component"),
+            lambda _sid: SimpleNamespace(cwd=COMPONENT),
         )
         monkeypatch.setattr(
             machine_module, "delete_session",

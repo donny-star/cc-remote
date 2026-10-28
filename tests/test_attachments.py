@@ -7,16 +7,25 @@ import binascii
 import os
 import re
 import struct
+import subprocess
 import time
 import zlib
 from pathlib import Path
+
+import pytest
 
 from cc_remote.attachments import (
     MAX_ATTACHMENT_COUNT,
     MAX_SINGLE_ATTACHMENT_BYTES,
     validate_attachments,
 )
+from cc_remote.platform import perms
 from cc_remote.protocol import ERR_BAD_PROMPT, Query, Steer, TurnSteered
+from tests.platform_assertions import (
+    assert_private_dir,
+    assert_private_file,
+    foreign_readable_dir,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -28,6 +37,12 @@ def _png(width: int = 1, height: int = 1, extra: bytes = b"") -> str:
     header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(
         ">II", width, height)
     return base64.b64encode(header + extra).decode()
+
+
+def _junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=True, capture_output=True)
 
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -123,6 +138,7 @@ def test_stashed_files_are_private_unique_and_path_safe(tmp_path):
     machine, _ = _mk_machine()
     turn_dir = tmp_path / "turn"
     turn_dir.mkdir(mode=0o700)
+    foreign_readable_dir(turn_dir)
     prompt = machine._stash_files("inspect", [
         {"filename": "../same.txt", "data": _b64(3)},
         {"filename": "same.txt", "data": _b64(4)},
@@ -132,7 +148,8 @@ def test_stashed_files_are_private_unique_and_path_safe(tmp_path):
     assert len(paths) == 2 and len(set(paths)) == 2
     assert all(os.path.dirname(path) == str(turn_dir) for path in paths)
     assert [open(path, "rb").read() for path in paths] == [b"x" * 3, b"x" * 4]
-    assert all((os.stat(path).st_mode & 0o777) == 0o600 for path in paths)
+    for path in paths:
+        assert_private_file(path)
 
 
 def test_turn_temp_directory_is_removed_when_query_fails():
@@ -171,6 +188,9 @@ def test_turn_temp_directory_is_removed_when_query_fails():
 def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
+    # Children inherit foreign read unless restricted, so the privacy
+    # assertion below cannot pass by inheritance from a private tmp_path.
+    foreign_readable_dir(workspace)
 
     class FailingSdk:
         effort = "high"
@@ -179,7 +199,9 @@ def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
         async def query(self, messages):
             payloads = [item async for item in messages]
             text = payloads[0]["message"]["content"][0]["text"]
-            assert f"@{workspace}/uploads/work-message/00-note.txt" in text
+            note = os.path.join(
+                str(workspace), "uploads", "work-message", "00-note.txt")
+            assert f"@{note}" in text
             assert (workspace / "uploads" / "work-message" /
                     "image-00.png").is_file()
             raise RuntimeError("synthetic failure")
@@ -203,7 +225,7 @@ def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
         upload_dir = workspace / "uploads" / "work-message"
         assert (upload_dir / "00-note.txt").read_bytes() == b"x" * 8
         assert (upload_dir / "image-00.png").read_bytes().startswith(b"\x89PNG")
-        assert upload_dir.stat().st_mode & 0o777 == 0o700
+        assert_private_dir(upload_dir)
         assert not (workspace.parent / "uploads").exists()
 
     asyncio.run(run())
@@ -268,6 +290,8 @@ def test_history_strips_legacy_and_workspace_work_attachment_paths():
         )
 
 
+@pytest.mark.requires_symlink(
+    reason="swaps the upload directory for a symbolic link")
 def test_work_attachment_write_stays_bound_after_directory_symlink_swap(
         monkeypatch, tmp_path):
     machine, _ = _mk_machine()
@@ -279,12 +303,12 @@ def test_work_attachment_write_stays_bound_after_directory_symlink_swap(
     original = machine._stash_files
 
     def swap_then_stash(
-        prompt, files, temp_dir, engine="claude", *, dir_fd=None,
+        prompt, files, temp_dir, engine="claude", *, directory=None,
     ):
         Path(temp_dir).rename(relocated)
         Path(temp_dir).symlink_to(outside, target_is_directory=True)
         return original(
-            prompt, files, temp_dir, engine, dir_fd=dir_fd)
+            prompt, files, temp_dir, engine, directory=directory)
 
     monkeypatch.setattr(machine, "_stash_files", swap_then_stash)
 
@@ -301,16 +325,51 @@ def test_work_attachment_write_stays_bound_after_directory_symlink_swap(
     assert (relocated / "00-note.txt").read_bytes() == b"x" * 8
 
 
-def test_work_upload_refuses_symlinked_or_unmanaged_root(tmp_path):
+@pytest.mark.windows_only(reason="NTFS pins open directories and has junctions")
+def test_work_attachment_write_stays_bound_after_workspace_junction_swap(
+        monkeypatch, tmp_path):
     machine, _ = _mk_machine()
-    workspace = tmp_path / "workspace"
+    real = tmp_path / "real"
     outside = tmp_path / "outside"
-    workspace.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    real.mkdir(mode=0o700)
     outside.mkdir(mode=0o700)
-    uploads = workspace / "uploads"
-    uploads.symlink_to(outside, target_is_directory=True)
+    (real / "workspace").mkdir(mode=0o700)
+    (outside / "workspace").mkdir(mode=0o700)
+    _junction(link, real)
+    original = machine._stash_files
 
-    for setup in ("symlink", "unmanaged"):
+    def swap_then_stash(
+        prompt, files, temp_dir, engine="claude", *, directory=None,
+    ):
+        # The pinned message directory cannot be moved away ...
+        with pytest.raises(PermissionError):
+            os.rename(temp_dir, real / "workspace" / "relocated-message")
+        # ... and retargeting a junction above it is not followed.
+        os.rmdir(link)
+        _junction(link, outside)
+        return original(
+            prompt, files, temp_dir, engine, directory=directory)
+
+    monkeypatch.setattr(machine, "_stash_files", swap_then_stash)
+
+    machine._stash_work_attachments(
+        "inspect",
+        [{"filename": "note.txt", "data": _b64(8)}],
+        None,
+        str(link / "workspace"),
+        "message-1",
+        "claude",
+    )
+
+    assert not list((outside / "workspace").iterdir())
+    assert (real / "workspace" / "uploads" / "message-1" /
+            "00-note.txt").read_bytes() == b"x" * 8
+
+
+def _assert_refuses_linked_or_unmanaged_root(machine, workspace, outside):
+    uploads = workspace / "uploads"
+    for setup in ("link", "unmanaged"):
         try:
             machine._stash_work_attachments(
                 "inspect",
@@ -324,7 +383,7 @@ def test_work_upload_refuses_symlinked_or_unmanaged_root(tmp_path):
             pass
         else:
             raise AssertionError("unsafe Work upload root was accepted")
-        if setup == "symlink":
+        if setup == "link":
             uploads.unlink()
             uploads.mkdir(mode=0o700)
             (uploads / "user-file.txt").write_text(
@@ -333,6 +392,69 @@ def test_work_upload_refuses_symlinked_or_unmanaged_root(tmp_path):
     assert (uploads / "user-file.txt").read_text(encoding="utf-8") == (
         "must remain user-owned")
     assert not list(outside.iterdir())
+
+
+@pytest.mark.windows_only(reason="NTFS junctions are Windows reparse points")
+def test_work_upload_refuses_junctioned_or_unmanaged_root(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    _junction(workspace / "uploads", outside)
+    _assert_refuses_linked_or_unmanaged_root(machine, workspace, outside)
+
+
+@pytest.mark.windows_only(reason="Win32 refuses these names; POSIX accepts them")
+def test_work_upload_refuses_message_ids_windows_cannot_name(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    for msg_id in ("message:stream", "message.", "NUL", "com1.txt"):
+        with pytest.raises(RuntimeError) as raised:
+            machine._stash_work_attachments(
+                "inspect",
+                [{"filename": "note.txt", "data": _b64(8)}],
+                None,
+                str(workspace),
+                msg_id,
+                "claude",
+            )
+        assert str(raised.value) == "Work upload directory is unsafe"
+    assert [path.name for path in (workspace / "uploads").iterdir()] == [
+        ".cc-remote-upload-root"]
+
+
+@pytest.mark.windows_only(reason="POSIX already re-tightens uploads with fchmod")
+def test_work_upload_retightens_a_loosened_existing_uploads_directory(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    note = [{"filename": "note.txt", "data": _b64(8)}]
+    machine._stash_work_attachments(
+        "inspect", note, None, str(workspace), "message-1", "claude")
+    uploads = workspace / "uploads"
+    foreign_readable_dir(uploads)  # a foreign ACE on the existing directory
+    assert not perms.is_private(uploads)
+
+    machine._stash_work_attachments(
+        "inspect", note, None, str(workspace), "message-2", "claude")
+
+    assert_private_dir(uploads)
+    assert_private_dir(uploads / "message-2")
+    assert (uploads / "message-2" / "00-note.txt").read_bytes() == b"x" * 8
+
+
+@pytest.mark.requires_symlink(
+    reason="plants a symlinked Work uploads directory")
+def test_work_upload_refuses_symlinked_or_unmanaged_root(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    (workspace / "uploads").symlink_to(outside, target_is_directory=True)
+    _assert_refuses_linked_or_unmanaged_root(machine, workspace, outside)
 
 
 def test_rejected_work_steer_keeps_persistent_uploads(tmp_path):

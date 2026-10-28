@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,10 +14,15 @@ from cc_remote.wrapper.claude_forks import (
     claude_fork_marker,
     find_claude_fork,
 )
+from tests.platform_assertions import assert_private_file
+from tests.platform_paths import native_path
+
+
+REPO = native_path("/repo")
 
 
 def _begin(journal: ClaudeForkJournal, request: str = "request-1"):
-    return journal.begin(request, "parent", "message-1", "/repo")
+    return journal.begin(request, "parent", "message-1", REPO)
 
 
 def test_journal_persists_claim_uncertain_and_complete(tmp_path):
@@ -27,7 +31,7 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
 
     assert intent["status"] == "intent"
     assert intent["marker"] == "cc-remote-fork:request-1"
-    assert stat.S_IMODE((tmp_path / "claude-forks.json").stat().st_mode) == 0o600
+    assert_private_file(tmp_path / "claude-forks.json")
     assert journal.claim_submission("request-1") is True
     assert journal.claim_submission("request-1") is False
     assert journal.mark_uncertain("request-1")["status"] == "uncertain"
@@ -40,7 +44,7 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
     assert reloaded.claim_submission("request-1") is False
 
     with pytest.raises(ClaudeForkJournalError, match="another source message"):
-        reloaded.begin("request-1", "parent", "message-2", "/repo")
+        reloaded.begin("request-1", "parent", "message-2", REPO)
     with pytest.raises(ClaudeForkJournalError, match="not claimed"):
         fresh = ClaudeForkJournal(tmp_path / "fresh")
         _begin(fresh)
@@ -49,7 +53,7 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
 
 def test_profile_migration_revision_prevents_swap_replay(tmp_path):
     journal = ClaudeForkJournal(tmp_path)
-    journal.begin("request-1", "a@parent", "message-1", "/repo")
+    journal.begin("request-1", "a@parent", "message-1", REPO)
     assert journal.claim_submission("request-1") is True
     journal.complete("request-1", "a@child")
 
@@ -109,7 +113,7 @@ def test_begin_rejects_invalid_controls_without_mutating_the_journal(tmp_path):
             "request-invalid",
             "parent",
             "message-1",
-            "/repo",
+            REPO,
             {
                 "auto_compact_mode": "custom",
                 "auto_compact_threshold_tokens": 99_999,
@@ -130,7 +134,7 @@ def test_fork_journal_preserves_pending_autocompact_transaction(tmp_path):
     }
 
     entry = journal.begin(
-        "request-pending", "parent", "message-1", "/repo", controls)
+        "request-pending", "parent", "message-1", REPO, controls)
 
     assert entry["controls"] == controls
     assert ClaudeForkJournal(tmp_path).get(
@@ -144,7 +148,7 @@ def test_fork_journal_preserves_pending_autocompact_transaction(tmp_path):
             "request-invalid-applied",
             "parent",
             "message-2",
-            "/repo",
+            REPO,
             {
                 "auto_compact_mode": "custom",
                 "auto_compact_threshold_tokens": 300_000,
@@ -220,7 +224,7 @@ def test_concurrent_refreshes_have_one_submission_owner(tmp_path):
         "request-1": {
             "parent_session_id": "parent",
             "cutoff_message_id": "message-1",
-            "cwd": "/repo",
+            "cwd": REPO,
             "marker": "cc-remote-fork:request-1",
             "status": "intent",
             "created_at": 1,
@@ -263,9 +267,9 @@ def test_capacity_compacts_terminal_alias_group_but_keeps_unresolved(
     journal.claim_submission("request-old")
     _begin(journal, "request-alias")
     journal.complete("request-alias", "old-child")
-    journal.begin("request-keep", "parent", "message-keep", "/repo")
+    journal.begin("request-keep", "parent", "message-keep", REPO)
 
-    journal.begin("request-new", "parent", "message-new", "/repo")
+    journal.begin("request-new", "parent", "message-new", REPO)
 
     assert set(journal.entries) == {"request-keep", "request-new"}
     assert set(ClaudeForkJournal(tmp_path).entries) == {
@@ -274,11 +278,11 @@ def test_capacity_compacts_terminal_alias_group_but_keeps_unresolved(
 
     blocked_dir = tmp_path / "blocked"
     blocked = ClaudeForkJournal(blocked_dir)
-    blocked.begin("request-1", "parent", "message-1", "/repo")
-    blocked.begin("request-2", "parent", "message-2", "/repo")
-    blocked.begin("request-3", "parent", "message-3", "/repo")
+    blocked.begin("request-1", "parent", "message-1", REPO)
+    blocked.begin("request-2", "parent", "message-2", REPO)
+    blocked.begin("request-3", "parent", "message-3", REPO)
     with pytest.raises(ClaudeForkJournalError, match="capacity exhausted"):
-        blocked.begin("request-4", "parent", "message-4", "/repo")
+        blocked.begin("request-4", "parent", "message-4", REPO)
 
 
 def _write_fork(
@@ -328,20 +332,20 @@ def test_find_claude_fork_requires_exact_marker_and_raw_boundary(
     _write_fork(child_path, child="child", marker=marker)
     infos = [
         SimpleNamespace(
-            session_id="substring", custom_title=marker + "-extra", cwd="/repo"),
-        SimpleNamespace(session_id="child", custom_title=marker, cwd="/repo"),
+            session_id="substring", custom_title=marker + "-extra", cwd=REPO),
+        SimpleNamespace(session_id="child", custom_title=marker, cwd=REPO),
     ]
     _install_recovery_fakes(
         monkeypatch, infos, {"child": child_path})
 
     found = find_claude_fork(
-        marker, "parent", "message-cutoff", "/repo")
+        marker, "parent", "message-cutoff", REPO)
 
     assert found == {
-        "session_id": "child", "cwd": "/repo", "marker": marker,
+        "session_id": "child", "cwd": REPO, "marker": marker,
     }
-    assert find_claude_fork(marker, "parent", "wrong-cutoff", "/repo") is None
-    assert find_claude_fork(marker, "wrong-parent", "message-cutoff", "/repo") is None
+    assert find_claude_fork(marker, "parent", "wrong-cutoff", REPO) is None
+    assert find_claude_fork(marker, "wrong-parent", "message-cutoff", REPO) is None
 
 
 def test_find_claude_fork_fails_closed_on_ambiguous_marker(
@@ -349,13 +353,13 @@ def test_find_claude_fork_fails_closed_on_ambiguous_marker(
 ):
     marker = claude_fork_marker("request-1")
     infos = [
-        SimpleNamespace(session_id="child-1", custom_title=marker, cwd="/repo"),
-        SimpleNamespace(session_id="child-2", custom_title=marker, cwd="/repo"),
+        SimpleNamespace(session_id="child-1", custom_title=marker, cwd=REPO),
+        SimpleNamespace(session_id="child-2", custom_title=marker, cwd=REPO),
     ]
     _install_recovery_fakes(monkeypatch, infos, {})
 
     with pytest.raises(ClaudeForkJournalError, match="multiple sessions"):
-        find_claude_fork(marker, "parent", "message-cutoff", "/repo")
+        find_claude_fork(marker, "parent", "message-cutoff", REPO)
 
 
 def test_find_claude_fork_rejects_wrong_cwd_corrupt_tail_and_list_error(
@@ -364,29 +368,29 @@ def test_find_claude_fork_rejects_wrong_cwd_corrupt_tail_and_list_error(
     marker = claude_fork_marker("request-1")
     child_path = tmp_path / "child.jsonl"
     _write_fork(child_path, child="child", marker=marker)
-    info = SimpleNamespace(session_id="child", custom_title=marker, cwd="/other")
+    info = SimpleNamespace(session_id="child", custom_title=marker, cwd=native_path("/other"))
     _install_recovery_fakes(monkeypatch, [info], {"child": child_path})
-    assert find_claude_fork(marker, "parent", "message-cutoff", "/repo") is None
+    assert find_claude_fork(marker, "parent", "message-cutoff", REPO) is None
 
-    info.cwd = "/repo"
+    info.cwd = REPO
     child_path.write_text("{}\n")
-    assert find_claude_fork(marker, "parent", "message-cutoff", "/repo") is None
+    assert find_claude_fork(marker, "parent", "message-cutoff", REPO) is None
 
     def unavailable(**_kwargs):
         raise OSError("session store unavailable")
 
     monkeypatch.setattr(forks_module, "list_sessions", unavailable)
     with pytest.raises(ClaudeForkJournalError, match="list is unavailable"):
-        find_claude_fork(marker, "parent", "message-cutoff", "/repo")
+        find_claude_fork(marker, "parent", "message-cutoff", REPO)
 
 
 @pytest.mark.parametrize("args", [
-    ("bad-marker", "parent", "message", "/repo", 1000),
-    ("cc-remote-fork:request-1", "bad id!", "message", "/repo", 1000),
-    ("cc-remote-fork:request-1", "parent", "bad id!", "/repo", 1000),
+    ("bad-marker", "parent", "message", REPO, 1000),
+    ("cc-remote-fork:request-1", "bad id!", "message", REPO, 1000),
+    ("cc-remote-fork:request-1", "parent", "bad id!", REPO, 1000),
     ("cc-remote-fork:request-1", "parent", "message", "relative", 1000),
-    ("cc-remote-fork:request-1", "parent", "message", "/repo", 0),
-    ("cc-remote-fork:request-1", "parent", "message", "/repo", 5000),
+    ("cc-remote-fork:request-1", "parent", "message", REPO, 0),
+    ("cc-remote-fork:request-1", "parent", "message", REPO, 5000),
 ])
 def test_find_claude_fork_bounds_inputs(monkeypatch, args):
     monkeypatch.setattr(forks_module, "list_sessions", lambda **_kwargs: [])

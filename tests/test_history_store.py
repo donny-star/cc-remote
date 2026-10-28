@@ -15,6 +15,7 @@ from cc_remote.wrapper.history_store import (
     history_turn_snapshot_hash,
     materialize_history_turns,
 )
+from tests.platform_assertions import assert_private_file
 
 
 def _page(label: str, *, more: bool = False) -> MaterializedHistoryPage:
@@ -593,7 +594,7 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     store.invalidate_session("session-2")
     assert store.get_page(
         "session-2", "claude", source, before=None, limit=4) is None
-    assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
+    assert_private_file(store.path)
 
 
 def test_agent_detail_cache_is_source_bound_and_invalidatable(tmp_path):

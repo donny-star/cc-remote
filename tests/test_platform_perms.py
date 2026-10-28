@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import os
+import stat
+import sys
 
 import pytest
 
-from cc_remote.platform import identity, perms
+from cc_remote.platform import files, identity, perms
+from tests.platform_assertions import (
+    assert_private_file,
+    foreign_readable_dir,
+    grant_foreign_read,
+    security_snapshot,
+)
 
 
 def test_current_uid_matches_stat_owner(tmp_path) -> None:
@@ -279,3 +287,310 @@ def test_make_private_failure_raises_permission_error(tmp_path, monkeypatch) -> 
     with pytest.raises(PermissionError) as caught:
         perms.make_private(path, directory=False)
     assert caught.value.filename == str(path)
+
+
+def test_info_helpers_accept_a_private_file(tmp_path) -> None:
+    path = tmp_path / "secret"
+    path.write_bytes(b"x")
+    perms.make_private(path, directory=False)
+    info = path.lstat()
+    assert perms.owned_info(path, info)
+    assert perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        opened = os.fstat(fd)
+        assert perms.owned_info(fd, opened)
+        assert perms.private_mode_info(fd, opened)
+        assert perms.no_foreign_write_info(fd, opened)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.posix_only(reason="mode bits are the POSIX privacy mechanism")
+def test_info_helpers_read_only_the_given_mode_bits(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    os.chmod(path, 0o640)
+    info = path.lstat()
+    assert not perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)
+    os.chmod(path, 0o620)
+    info = path.lstat()
+    assert not perms.no_foreign_write_info(path, info)
+    # The decision comes from ``info``, not a fresh stat of ``target``.
+    os.chmod(path, 0o600)
+    assert not perms.private_mode_info(path, info)
+    fake = os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, os.getuid() + 1, 0, 0, 0, 0, 0))
+    assert not perms.owned_info(path, fake)
+    assert not perms.owned_info(path, fake, effective=True)
+
+
+@pytest.mark.posix_only(reason="real and effective uids only differ on POSIX")
+def test_owned_info_effective_compares_the_effective_uid(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    info = path.lstat()
+    monkeypatch.setattr(perms, "current_euid", lambda: info.st_uid + 1)
+    assert perms.owned_info(path, info)
+    assert not perms.owned_info(path, info, effective=True)
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_info_helpers_reject_everyone_write(tmp_path) -> None:
+    import ntsecuritycon
+    import win32security
+
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    perms.make_private(path, directory=False)
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION)
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    world = win32security.CreateWellKnownSid(win32security.WinWorldSid)
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_READ, world)
+    win32security.SetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION, None, None, dacl, None)
+    info = path.lstat()
+    assert not perms.private_mode_info(path, info)
+    assert perms.no_foreign_write_info(path, info)  # read-only grant
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_WRITE, world)
+    win32security.SetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION, None, None, dacl, None)
+    assert not perms.no_foreign_write_info(path, path.lstat())
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_info_helpers_fail_closed_for_missing_paths(tmp_path) -> None:
+    path = tmp_path / "gone"
+    path.write_bytes(b"")
+    info = path.lstat()
+    path.unlink()
+    assert not perms.owned_info(path, info)
+    assert not perms.private_mode_info(path, info)
+    assert not perms.no_foreign_write_info(path, info)
+
+
+def test_make_private_fd_restricts_a_file_in_a_foreign_readable_directory(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    path = tmp_path / "secret"
+    fd = files.open_nofollow(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if sys.platform == "win32":
+            assert not perms.is_private_fd(fd)  # control: inherited Everyone read
+        perms.make_private_fd(fd)
+        assert perms.is_private_fd(fd)
+        os.write(fd, b"x")
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"x"
+    assert_private_file(path)
+
+
+@pytest.mark.posix_only(reason="the creating open applies POSIX modes")
+def test_make_private_fd_is_a_noop_on_posix(tmp_path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    os.chmod(path, 0o644)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
+
+
+@pytest.mark.windows_only(reason="only Windows resolves privacy through a reopened handle")
+def test_make_private_fd_does_not_re_resolve_the_path(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    path = tmp_path / "secret"
+    moved = tmp_path / "moved"
+    fd = files.open_nofollow(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        files.replace(path, moved)
+        path.write_bytes(b"")
+        perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+    assert perms.is_private(moved)
+    assert not perms.is_private(path)
+
+
+@pytest.mark.windows_only(reason="pywin32 errors only exist on Windows")
+def test_make_private_fd_failure_raises_permission_error(tmp_path, monkeypatch) -> None:
+    import pywintypes
+    import win32security
+
+    def denied(*args):
+        raise pywintypes.error(5, "SetSecurityInfo", "denied")
+
+    monkeypatch.setattr(win32security, "SetSecurityInfo", denied)
+    fd = files.open_nofollow(tmp_path / "f", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(PermissionError):
+            perms.make_private_fd(fd)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.windows_only(reason="ACL entries are the Windows privacy mechanism")
+def test_owned_info_fails_closed_on_any_inspection_error(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"")
+    info = path.lstat()
+    assert perms.owned_info(path, info)
+
+    def broken(_target):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(perms, "owned_by_current_user", broken)
+    assert perms.owned_info(path, info) is False
+
+
+@pytest.mark.windows_only(reason="SYSTEM ownership only exists on Windows")
+def test_info_helpers_reject_a_system_owned_directory() -> None:
+    root = os.environ.get("SystemDrive", "C:") + "\\"
+    info = os.stat(root)
+    assert perms.owned_info(root, info) is False
+    assert perms.private_mode_info(root, info) is False
+    assert perms.no_foreign_write_info(root, info) is False
+
+
+def _private_and_shared_files(tmp_path):
+    """A private ``src`` and a freshly created, foreign-readable ``dst``."""
+    foreign_readable_dir(tmp_path)
+    src = tmp_path / "src"
+    src.write_bytes(b"original")
+    perms.make_private(src, directory=False)
+    dst = tmp_path / "dst"
+    dst.write_bytes(b"replacement")
+    if sys.platform != "win32":
+        os.chmod(dst, 0o644)
+    return src, dst
+
+
+def test_copy_security_fd_carries_a_private_original_onto_a_new_file(tmp_path) -> None:
+    src, dst = _private_and_shared_files(tmp_path)
+    assert not perms.is_private(dst)  # control: inherited/default access
+    src_fd = os.open(src, os.O_RDONLY)
+    dst_fd = files.open_nofollow(dst, os.O_WRONLY)
+    try:
+        perms.copy_security_fd(src_fd, dst_fd)
+        os.write(dst_fd, b"!")  # the descriptor stays writable
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert_private_file(dst)
+    assert security_snapshot(dst) == security_snapshot(src)
+
+
+def test_copy_security_fd_carries_a_shared_original_onto_a_private_file(tmp_path) -> None:
+    foreign_readable_dir(tmp_path)
+    src = tmp_path / "src"
+    src.write_bytes(b"original")
+    grant_foreign_read(src)
+    dst_fd, dst = files.create_private_temp(tmp_path)
+    src_fd = os.open(src, os.O_RDONLY)
+    try:
+        perms.copy_security_fd(src_fd, dst_fd)
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert not perms.is_private(dst)
+    assert security_snapshot(dst) == security_snapshot(src)
+
+
+@pytest.mark.posix_only(reason="mode bits are the POSIX access mechanism")
+def test_copy_security_fd_copies_exactly_the_mode_bits_on_posix(tmp_path) -> None:
+    src = tmp_path / "src"
+    src.write_bytes(b"")
+    os.chmod(src, 0o4750)
+    dst = tmp_path / "dst"
+    dst.write_bytes(b"")
+    src_fd = os.open(src, os.O_RDONLY)
+    dst_fd = os.open(dst, os.O_RDONLY)
+    try:
+        perms.copy_security_fd(src_fd, dst_fd)
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert stat.S_IMODE(os.stat(dst).st_mode) == stat.S_IMODE(os.stat(src).st_mode)
+
+
+def test_copy_security_fd_carries_read_only(tmp_path) -> None:
+    src = tmp_path / "src"
+    src.write_bytes(b"original")
+    os.chmod(src, stat.S_IREAD)
+    dst_fd, dst = files.create_private_temp(tmp_path)
+    src_fd = os.open(src, os.O_RDONLY)
+    try:
+        perms.copy_security_fd(src_fd, dst_fd)
+        os.write(dst_fd, b"still writable through the open descriptor")
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    try:
+        assert not os.access(dst, os.W_OK)
+        assert security_snapshot(dst) == security_snapshot(src)
+    finally:
+        os.chmod(src, stat.S_IREAD | stat.S_IWRITE)
+        os.chmod(dst, stat.S_IREAD | stat.S_IWRITE)
+
+
+@pytest.mark.windows_only(reason="the read-only bit is a separate attribute only on Windows")
+def test_copy_security_fd_clears_read_only_when_the_original_is_writable(tmp_path) -> None:
+    src = tmp_path / "src"
+    src.write_bytes(b"original")
+    dst = tmp_path / "dst"
+    dst.write_bytes(b"")
+    dst_fd = files.open_nofollow(dst, os.O_WRONLY)
+    os.chmod(dst, stat.S_IREAD)
+    src_fd = os.open(src, os.O_RDONLY)
+    try:
+        perms.copy_security_fd(src_fd, dst_fd)
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert os.access(dst, os.W_OK)
+    assert security_snapshot(dst) == security_snapshot(src)
+
+
+@pytest.mark.windows_only(reason="only Windows applies security through a reopened handle")
+def test_copy_security_fd_does_not_re_resolve_either_path(tmp_path) -> None:
+    src, dst = _private_and_shared_files(tmp_path)
+    src_fd = os.open(src, os.O_RDONLY)
+    dst_fd = files.open_nofollow(dst, os.O_WRONLY)
+    try:
+        files.replace(dst, tmp_path / "moved")
+        dst.write_bytes(b"")
+        perms.copy_security_fd(src_fd, dst_fd)
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert perms.is_private(tmp_path / "moved")
+    assert not perms.is_private(dst)
+
+
+@pytest.mark.windows_only(reason="pywin32 errors only exist on Windows")
+def test_copy_security_fd_failure_raises_permission_error(tmp_path, monkeypatch) -> None:
+    import pywintypes
+    import win32security
+
+    def denied(*args):
+        raise pywintypes.error(5, "SetSecurityInfo", "denied")
+
+    src, dst = _private_and_shared_files(tmp_path)
+    monkeypatch.setattr(win32security, "SetSecurityInfo", denied)
+    src_fd = os.open(src, os.O_RDONLY)
+    dst_fd = files.open_nofollow(dst, os.O_WRONLY)
+    try:
+        with pytest.raises(PermissionError):
+            perms.copy_security_fd(src_fd, dst_fd)
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)

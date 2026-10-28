@@ -9,6 +9,7 @@ from cc_remote.wrapper.codex_process_clocks import (
     CodexProcessClockStore,
     CodexProcessClockStoreError,
 )
+from tests.platform_assertions import assert_private_file
 
 
 def _rollout(tmp_path, name: str = "rollout.jsonl"):
@@ -101,7 +102,7 @@ def test_process_clock_store_is_private_and_fails_closed(tmp_path):
     store = CodexProcessClockStore(tmp_path / "state")
     store.observe_start(source, "browser-message", "native-turn", 10_000)
 
-    assert store.path.stat().st_mode & 0o077 == 0
+    assert_private_file(store.path)
     payload = json.loads(store.path.read_text())
     payload["sources"][0]["clocks"][0]["started_ms"] = -1
     store.path.write_text(json.dumps(payload))

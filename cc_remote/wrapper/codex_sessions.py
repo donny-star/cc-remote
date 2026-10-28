@@ -19,6 +19,7 @@ import stat
 from typing import Any, Iterable, Optional
 
 from cc_remote.log import logger
+from cc_remote.platform import files as platform_files
 from cc_remote.wrapper.codex_rpc import codex_rpc
 
 
@@ -517,13 +518,8 @@ def _catalog_rollout_fork_parent(
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         return False, None
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(expanded, flags)
+        descriptor = platform_files.open_nofollow(expanded, os.O_RDONLY)
     except OSError:
         return False, None
     try:

@@ -17,6 +17,8 @@ import re
 import stat
 from typing import Any, Iterator
 
+from cc_remote.platform import files as platform_files
+
 
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 # ``@`` is reserved for the browser routing namespace (``profile@native``).
@@ -578,13 +580,9 @@ class CodexProfileTopologyStore:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
+            platform_files.replace(temporary, path)
             path.chmod(0o600)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            platform_files.fsync_directory(path.parent)
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -637,11 +635,7 @@ class CodexProfileTopologyStore:
             self.pending_path.unlink()
         except FileNotFoundError:
             return
-        directory_fd = os.open(self.pending_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        platform_files.fsync_directory(self.pending_path.parent)
 
     def _load(self) -> _StoredTopology | None:
         try:

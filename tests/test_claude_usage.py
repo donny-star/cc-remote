@@ -13,6 +13,7 @@ from cc_remote.protocol import GetStatus, StatusReport, deserialize, serialize
 from cc_remote.wrapper import claude_usage
 from cc_remote.wrapper.claude_rate_limits import ClaudeRateLimitStore
 from cc_remote.wrapper.claude_usage import ClaudeUsageError, ClaudeUsageReader
+from tests.platform_assertions import grant_foreign_read
 from tests.test_claude_rate_limits import _event
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -97,7 +98,7 @@ async def test_real_helper_receives_only_profile_binding(monkeypatch, tmp_path):
     other = replace(profile, config_dir=tmp_path / "other-account")
     with pytest.raises(ClaudeUsageError, match="configuration invalid"):
         await reader.refresh(other, apply)
-    reader.path.chmod(0o644)
+    grant_foreign_read(reader.path)
     with pytest.raises(ClaudeUsageError, match="configuration invalid"):
         await reader.refresh(profile, apply)
 
