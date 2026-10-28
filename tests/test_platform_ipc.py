@@ -594,7 +594,7 @@ def _leave_stale_endpoint(path: Path) -> None:
     """What a killed server leaves behind: an owned endpoint nobody listens on."""
     ipc.ensure_private_directory(path.parent)
     if IS_WINDOWS:
-        _record(path, _closed_port(), os.urandom(32))
+        _record(path, _closed_port(), os.urandom(32), pid=_dead_pid(), start_time=1)
         return
     old_umask = os.umask(0o177)
     try:
@@ -630,6 +630,21 @@ async def _stop(listener) -> None:
     await listener.wait_closed()
 
 
+def _spy_refusals(monkeypatch) -> list:
+    refusals = []
+    original = asyncio.open_connection
+
+    async def spy(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        except ConnectionRefusedError:
+            refusals.append(True)
+            raise
+
+    monkeypatch.setattr(ipc.asyncio, "open_connection", spy)
+    return refusals
+
+
 windows_reclaim = pytest.mark.windows_only(
     reason="endpoint records and their reclaim rules exist only on Windows")
 
@@ -656,10 +671,49 @@ async def test_reclaim_refuses_a_live_server(endpoint_path):
 
 @windows_reclaim
 @pytest.mark.asyncio
-async def test_reclaim_removes_a_record_whose_port_is_closed(endpoint_path):
-    # The owner (this process) is alive; nothing listens: Windows refuses after ~2 s.
+async def test_reclaim_removes_a_record_whose_port_is_closed(endpoint_path, monkeypatch):
+    # The owner is dead and nothing listens; wait for the ~2 s Windows refusal.
+    monkeypatch.setattr(ipc, "_PROBE_QUICK_CONNECT_TIMEOUT", ipc._PROBE_CONNECT_TIMEOUT)
+    refusals = _spy_refusals(monkeypatch)
     _leave_stale_endpoint(endpoint_path)
     await ipc._reclaim_windows(endpoint_path)
+    assert refusals
+    assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_a_live_owner_whose_full_backlog_refuses(endpoint_path, monkeypatch):
+    # A stalled server with a full backlog refuses like a closed port (~2 s on
+    # Windows); while its owner runs, that must not hand the endpoint over.
+    refusals = _spy_refusals(monkeypatch)
+    stalled = socket.socket()
+    stalled.bind(("127.0.0.1", 0))
+    stalled.listen(1)
+    port = stalled.getsockname()[1]
+    filler = socket.create_connection(("127.0.0.1", port), timeout=1)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        with pytest.raises(ipc.UnsafeEndpointError, match="cannot verify"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        filler.close()
+        stalled.close()
+    assert refusals
+    assert ipc.read_endpoint(endpoint_path).port == port
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_treats_a_reused_pid_as_a_dead_owner(endpoint_path, monkeypatch):
+    # Same pid, another creation time: the recorded owner is gone, so the
+    # refused port is stale.
+    monkeypatch.setattr(ipc, "_PROBE_QUICK_CONNECT_TIMEOUT", ipc._PROBE_CONNECT_TIMEOUT)
+    refusals = _spy_refusals(monkeypatch)
+    _record(endpoint_path, _closed_port(), os.urandom(32),
+            pid=os.getpid(), start_time=_own_start_time() + 1)
+    await ipc._reclaim_windows(endpoint_path)
+    assert refusals
     assert not endpoint_path.exists()
 
 
@@ -681,11 +735,43 @@ async def test_reclaim_of_a_dead_owner_does_not_wait_for_the_refusal(endpoint_pa
 async def test_reclaim_removes_a_record_whose_port_was_taken_by_another_process(endpoint_path):
     listener, port = await _listen(_random_reply)
     try:
-        _record(endpoint_path, port, os.urandom(32))
+        _record(endpoint_path, port, os.urandom(32), pid=_dead_pid(), start_time=1)
         await ipc._reclaim_windows(endpoint_path)
     finally:
         await _stop(listener)
     assert not endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_refuses_a_wrong_proof_while_the_owner_runs(endpoint_path):
+    # A listener sharing a live owner's port is no evidence the owner stopped.
+    listener, port = await _listen(_random_reply)
+    try:
+        _record(endpoint_path, port, os.urandom(32))
+        with pytest.raises(ipc.UnsafeEndpointError, match="cannot verify"):
+            await ipc._reclaim_windows(endpoint_path)
+    finally:
+        await _stop(listener)
+    assert endpoint_path.exists()
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_reclaim_keeps_a_record_replaced_while_probing(endpoint_path, monkeypatch):
+    _record(endpoint_path, _closed_port(), os.urandom(32), pid=_dead_pid(), start_time=1)
+    newer = ipc.Endpoint(port=_closed_port(), token=os.urandom(32),
+                         pid=os.getpid(), start_time=_own_start_time())
+
+    async def republished(endpoint):
+        endpoint_path.unlink()
+        ipc.write_endpoint(endpoint_path, newer)
+        return "gone"
+
+    monkeypatch.setattr(ipc, "_probe", republished)
+    with pytest.raises(ipc.UnsafeEndpointError, match="changed while probing"):
+        await ipc._reclaim_windows(endpoint_path)
+    assert ipc.read_endpoint(endpoint_path) == newer
 
 
 @windows_reclaim
@@ -751,3 +837,31 @@ async def test_start_lock_serializes_starters_and_gives_up(endpoint_path, monkey
     with pytest.raises(ipc.AlreadyRunningError, match="another server is starting"):
         await starter("d", 0)
     await holder
+
+
+@windows_reclaim
+@pytest.mark.asyncio
+async def test_start_lock_is_released_on_error_and_cancellation(endpoint_path, monkeypatch):
+    ipc.ensure_private_directory(endpoint_path.parent)
+    monkeypatch.setattr(ipc, "_START_LOCK_TIMEOUT", 0.5)
+
+    with pytest.raises(RuntimeError):
+        async with ipc._start_lock(endpoint_path):
+            raise RuntimeError("publish failed")
+    async with ipc._start_lock(endpoint_path):
+        pass
+
+    held = asyncio.Event()
+
+    async def hold_forever() -> None:
+        async with ipc._start_lock(endpoint_path):
+            held.set()
+            await asyncio.sleep(3600)
+
+    holder = asyncio.create_task(hold_forever())
+    await asyncio.wait_for(held.wait(), 1.0)
+    holder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+    async with ipc._start_lock(endpoint_path):
+        pass

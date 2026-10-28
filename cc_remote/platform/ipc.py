@@ -44,8 +44,9 @@ MAC_BYTES = 32
 _FAILURE_LOG_INTERVAL = 60.0
 _SHARING_VIOLATION = 32
 # A listening server accepts a loopback connect at once, but Windows reports a
-# refused one only after ~2 s of SYN retries. A dead owner's port gets the
-# quick bound; a live owner's gets one long enough to see the refusal.
+# refused one only after ~2 s of SYN retries -- for a closed port and equally
+# for a live listener whose backlog is full. A dead owner's port gets the quick
+# bound; a live owner's gets one long enough for a busy server to accept.
 _PROBE_QUICK_CONNECT_TIMEOUT = 0.5
 _PROBE_CONNECT_TIMEOUT = 3.0
 _START_LOCK_TIMEOUT = 10.0
@@ -381,7 +382,13 @@ def _require_live(endpoint: Endpoint) -> None:
 
 
 async def _probe(endpoint: Endpoint) -> str:
-    """``live`` (proved the token), ``gone`` (stale) or ``unknown``."""
+    """``live`` (proved the token), ``gone`` (stale) or ``unknown``.
+
+    Neither a refusal nor a wrong proof is evidence against a recorded owner
+    that is still running: a stalled server with a full backlog refuses, and
+    any listener sharing its port can answer with garbage. Both are stale only
+    once the owner is provably gone.
+    """
     connection = None
     for timeout in (_PROBE_QUICK_CONNECT_TIMEOUT, _PROBE_CONNECT_TIMEOUT):
         try:
@@ -389,10 +396,10 @@ async def _probe(endpoint: Endpoint) -> str:
                 asyncio.open_connection("127.0.0.1", endpoint.port), timeout)
             break
         except ConnectionRefusedError:
-            return "gone"
+            return "unknown" if _owner_alive(endpoint) else "gone"
         except (OSError, asyncio.TimeoutError):
-            # Only a live owner earns the long wait that tells a refused port
-            # from a full backlog; a dead owner's silent port is simply stale.
+            # Only a live owner earns the long wait for a busy server to
+            # accept; a dead owner's silent port is simply stale.
             if not _owner_alive(endpoint):
                 return "gone"
     if connection is None:
@@ -403,11 +410,21 @@ async def _probe(endpoint: Endpoint) -> str:
             _client_handshake(reader, writer, endpoint.token), HANDSHAKE_TIMEOUT)
         return "live"
     except AuthenticationError:
-        return "gone"
+        return "unknown" if _owner_alive(endpoint) else "gone"
     except (OSError, EOFError, asyncio.TimeoutError):
         return "unknown"
     finally:
         await _close_quietly(writer)
+
+
+def _read_existing(target: Path) -> Endpoint | None:
+    try:
+        return read_endpoint(target)  # also proves the file is ours
+    except FileNotFoundError:
+        return None
+    except OSError as exc:  # unsafe, malformed, a directory, unreadable
+        raise UnsafeEndpointError(
+            "refusing to replace a non-owned or non-endpoint path") from exc
 
 
 async def _reclaim_windows(target: Path) -> None:
@@ -417,18 +434,21 @@ async def _reclaim_windows(target: Path) -> None:
     owner whose process cannot be inspected (e.g. elevated). An inconclusive
     probe only counts as stale once the recorded owner is provably gone.
     """
-    try:
-        endpoint = read_endpoint(target)  # also proves the file is ours
-    except FileNotFoundError:
+    endpoint = _read_existing(target)
+    if endpoint is None:
         return
-    except OSError as exc:  # unsafe, malformed, a directory, unreadable
-        raise UnsafeEndpointError(
-            "refusing to replace a non-owned or non-endpoint path") from exc
     verdict = await _probe(endpoint)
     if verdict == "live":
         raise AlreadyRunningError(f"endpoint is already running at {target}")
     if verdict == "unknown" and _owner_alive(endpoint):
         raise UnsafeEndpointError(f"cannot verify the existing endpoint at {target}")
+    # The probe took up to seconds: delete only the record that was judged.
+    current = _read_existing(target)
+    if current is None:
+        return
+    if current != endpoint:
+        raise UnsafeEndpointError(
+            f"cannot verify the existing endpoint at {target}: it changed while probing")
     with contextlib.suppress(FileNotFoundError):
         target.unlink()
 
@@ -437,7 +457,9 @@ async def _reclaim_windows(target: Path) -> None:
 async def _start_lock(target: Path):
     """Serialize reclaim-and-publish between servers starting at ``target``.
 
-    The lock file is never removed: deleting it would let a third starter lock
+    Precondition: the directory is already private (call only after
+    ``ensure_private_directory``). The lock file carries no secret and simply
+    inherits the directory's ACL. It is never removed: deleting it would let a third starter lock
     a fresh file while the second still holds the old one.
     """
     fd = files.open_nofollow(target.with_name(target.name + ".lock"),
