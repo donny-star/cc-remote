@@ -227,6 +227,42 @@ def test_markdown_save_keeps_a_private_file_private_in_a_shared_directory(tmp_pa
     assert _temp_files(shared) == []
 
 
+@pytest.mark.windows_only(reason="a Windows temp inherits its directory's DACL; POSIX creates it 0600")
+def test_markdown_save_temp_is_private_before_the_new_contents_are_written(
+        tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    foreign_readable_dir(shared)  # new files there are readable by others
+    path = shared / "private.md"
+    path.write_bytes(b"# secret\n")
+    perms.make_private(path, directory=False)
+    machine, _ = _mk_machine()
+    temps: dict[int, str] = {}
+    private_at_first_write: list[bool] = []
+    open_file = machine_module.DirHandle.open_file
+    write = os.write
+
+    def recording_open_file(self, name, flags, mode=0o600):
+        fd = open_file(self, name, flags, mode)
+        if name.startswith(".cc-remote-"):
+            temps[fd] = self.child_path(name)
+        return fd
+
+    def checking_write(fd, data):
+        if fd in temps and not private_at_first_write:
+            private_at_first_write.append(perms.is_private(temps[fd]))
+        return write(fd, data)
+
+    monkeypatch.setattr(machine_module.DirHandle, "open_file", recording_open_file)
+    monkeypatch.setattr(machine_module.os, "write", checking_write)
+
+    _save_unchanged(machine, shared, "private.md", "# still secret\n")
+
+    assert private_at_first_write == [True]
+    assert path.read_bytes() == b"# still secret\n"
+    assert_private_file(path)
+
+
 def test_markdown_save_over_a_read_only_file_keeps_it_read_only(tmp_path):
     path = tmp_path / "locked.md"
     path.write_bytes(b"# old\n")

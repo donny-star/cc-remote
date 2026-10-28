@@ -26923,6 +26923,9 @@ class WrapperMachine:
             temp_fd = directory.open_file(
                 temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
+                # Windows creates the temp with the directory's inherited
+                # DACL; restrict it before any new content reaches it.
+                platform_perms.make_private_fd(temp_fd)
                 view = memoryview(payload)
                 written = 0
                 while written < len(view):
