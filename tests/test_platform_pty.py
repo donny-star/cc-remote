@@ -1092,6 +1092,33 @@ def test_termios_is_restored_on_every_exit(monkeypatch, escape):
     assert calls == [("setraw", 0), ("tcsetattr", 0, termios.TCSAFLUSH, ["original", 0])]
 
 
+@pytest.mark.windows_only(reason="Ctrl+Break is a Windows console signal")
+@pytest.mark.asyncio
+async def test_a_watched_console_break_runs_the_callback_instead_of_exiting():
+    import signal
+
+    before = signal.getsignal(signal.SIGBREAK)
+    broken = asyncio.Event()
+    unwatch = pty.watch_break(broken.set)
+    try:
+        signal.raise_signal(signal.SIGBREAK)  # the default handler would end pytest
+        await asyncio.wait_for(broken.wait(), 5)
+    finally:
+        unwatch()
+    assert signal.getsignal(signal.SIGBREAK) == before
+
+
+@pytest.mark.posix_only(reason="POSIX raw mode clears ISIG: no key signals")
+@pytest.mark.asyncio
+async def test_watch_break_leaves_posix_signals_alone():
+    import signal
+
+    before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    unwatch = pty.watch_break(lambda: None)
+    assert {signum: signal.getsignal(signum) for signum in before} == before
+    unwatch()
+
+
 @pytest.mark.windows_only(reason="Windows has no SIGWINCH and polls the size")
 @pytest.mark.asyncio
 async def test_watch_resize_polls_until_unwatched(monkeypatch):

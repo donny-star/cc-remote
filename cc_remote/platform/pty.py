@@ -855,6 +855,26 @@ def watch_resize(fd: int, callback: Callable[[], None]) -> Callable[[], None]:
     return task.cancel
 
 
+def watch_break(callback: Callable[[], None]) -> Callable[[], None]:
+    """Run ``callback`` on the running loop instead of dying on a console break.
+
+    Windows: raw console input turns Ctrl+C into a byte, but Ctrl+Break is
+    always a signal, and by default it ends the process without restoring the
+    console. While watched, Ctrl+Break, Ctrl+C and closing the console window
+    run ``callback`` instead. POSIX raw mode clears ISIG, so no key signals:
+    nothing is installed. Returns an ``unwatch()`` callable; off the main
+    thread nothing can be installed and it is a no-op.
+    """
+    if not IS_WINDOWS:
+        return lambda: None
+    from cc_remote.platform import signals
+
+    try:
+        return signals.install_shutdown_handler(asyncio.get_running_loop(), callback)
+    except ValueError:  # signal handlers can only be set on the main thread
+        return lambda: None
+
+
 _KEY_EVENT = 0x0001
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_TIMEOUT = 0x00000102
@@ -1068,5 +1088,5 @@ class InputReader:
 
 __all__ = [
     "DETACHED_CREATIONFLAGS", "InputReader", "JOB_BREAKAWAY_CREATIONFLAG", "PtyProcess",
-    "READ_CHUNK_BYTES", "RawTerminal", "spawn", "terminal_size", "watch_resize",
+    "READ_CHUNK_BYTES", "RawTerminal", "spawn", "terminal_size", "watch_break", "watch_resize",
 ]

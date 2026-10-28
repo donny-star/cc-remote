@@ -138,6 +138,7 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     resize_event = asyncio.Event()
+    broken = asyncio.Event()
     unwatch: Callable[[], None] | None = None
     # One reader per attach. It must be closed before the terminal leaves raw
     # mode: on Windows a console read still in flight would otherwise swallow
@@ -173,14 +174,12 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
                 )
 
     async def input_loop() -> None:
-        if reader is None:
-            await asyncio.Future()
-            return
-        while True:
+        while reader is not None:
             data = await reader.read()
             if not data:
                 return
             await attachment.write(data)
+        await asyncio.Future()  # a mirror never ends on its own input
 
     async def resize_loop() -> None:
         while True:
@@ -189,31 +188,54 @@ async def _interactive_attach(client: BrokerClient, session_id: str, *, keyboard
             await attachment.resize(*pty.terminal_size(stdin_fd))
 
     try:
-        with pty.RawTerminal(stdin_fd, stdout_fd, keyboard=attachment.keyboard):
-            try:
-                if os.isatty(stdin_fd):
-                    await attachment.resize(*pty.terminal_size(stdin_fd))
-                    unwatch = pty.watch_resize(stdin_fd, resize_event.set)
-                output_task = asyncio.create_task(output_loop())
-                input_task = asyncio.create_task(input_loop())
-                tasks = [output_task, input_task, asyncio.create_task(resize_loop())]
-                done, _pending = await asyncio.wait(
-                    {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED,
-                )
-                if output_task in done:
-                    return await output_task
-                return 0  # stdin disconnected: detach, but leave Claude running
-            finally:
-                # Synchronous, so no cancellation can skip it on the way out.
-                if reader is not None:
-                    reader.close()
-                if unwatch is not None:
-                    unwatch()
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+        # Ctrl+Break (Windows) detaches instead of killing claude-remote, so
+        # the console is restored; it covers the whole raw-mode window.
+        unguard = pty.watch_break(broken.set)
+        try:
+            with pty.RawTerminal(stdin_fd, stdout_fd, keyboard=attachment.keyboard):
+                try:
+                    if os.isatty(stdin_fd):
+                        await attachment.resize(*pty.terminal_size(stdin_fd))
+                        unwatch = pty.watch_resize(stdin_fd, resize_event.set)
+                    output_task = asyncio.create_task(output_loop())
+                    input_task = asyncio.create_task(input_loop())
+                    break_task = asyncio.create_task(broken.wait())
+                    tasks = [output_task, input_task, break_task,
+                             asyncio.create_task(resize_loop())]
+                    done, _pending = await asyncio.wait(
+                        {output_task, input_task, break_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if output_task in done:
+                        return await output_task
+                    if break_task in done:
+                        return 130  # detach like an interrupt; Claude keeps running
+                    return 0  # stdin disconnected: detach, but leave Claude running
+                finally:
+                    # Synchronous, so no cancellation can skip it on the way out.
+                    if reader is not None:
+                        reader.close()
+                    if unwatch is not None:
+                        unwatch()
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            unguard()
     finally:
         await attachment.close()
+
+
+def _install_shutdown_handler(callback: Callable[[], None]) -> Callable[[], None]:
+    """Hook process shutdown requests where the running loop supports it.
+
+    A loop without signal support (not the main thread, or a POSIX loop
+    without ``add_signal_handler``) simply runs without the hook, as before.
+    """
+    try:
+        return signals.install_shutdown_handler(asyncio.get_running_loop(), callback)
+    except (NotImplementedError, RuntimeError):
+        return lambda: None
 
 
 async def _serve(args: argparse.Namespace) -> int:
@@ -226,7 +248,7 @@ async def _serve(args: argparse.Namespace) -> int:
     await server.start()
     print(f"claude-remote broker listening on {server.socket_path}", file=sys.stderr)
     stopped = asyncio.Event()
-    uninstall = signals.install_shutdown_handler(asyncio.get_running_loop(), stopped.set)
+    uninstall = _install_shutdown_handler(stopped.set)
     try:
         await stopped.wait()
     finally:

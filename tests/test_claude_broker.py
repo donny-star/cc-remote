@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Callable
 
 import pytest
 import pytest_asyncio
@@ -1743,3 +1744,118 @@ async def test_ensure_broker_reports_why_its_directory_cannot_be_created(
     assert error.value.code == "broker_start_failed"
     assert "private" not in str(error.value)
     assert str(blocker / "broker") in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_serve_runs_without_shutdown_signals_where_the_loop_has_none(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events: list[str] = []
+
+    class Server:
+        socket_path = "fake.sock"
+
+        def __init__(self, _config):
+            pass
+
+        async def start(self):
+            events.append("start")
+
+        async def close(self):
+            events.append("close")
+
+    def unsupported(_loop, _callback):
+        raise NotImplementedError  # e.g. a loop that has no add_signal_handler
+
+    monkeypatch.setattr(broker_cli, "BrokerServer", Server)
+    monkeypatch.setattr(broker_cli.signals, "install_shutdown_handler", unsupported)
+    args = _parser().parse_args(["serve"])
+    serve = asyncio.create_task(broker_cli._serve(args))
+    await asyncio.sleep(0.05)
+    assert not serve.done(), "serve must keep running without signal handlers"
+    serve.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await serve
+    assert events == ["start", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyboard", [True, False], ids=["keyboard", "mirror"])
+async def test_cli_attach_detaches_cleanly_on_a_console_break(
+    monkeypatch: pytest.MonkeyPatch, keyboard: bool,
+):
+    # Raw console input cannot stop Ctrl+Break on Windows; without a handler it
+    # kills claude-remote and leaves the user's console raw.
+    events: list[str] = []
+    breaks: list[Callable[[], None]] = []
+
+    class RawTerminal:
+        def __init__(self, _stdin_fd, _stdout_fd, *, keyboard):
+            pass
+
+        def __enter__(self):
+            events.append("raw")
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("restored")
+
+    class InputReader:
+        def __init__(self, _fd):
+            pass
+
+        async def read(self):
+            await asyncio.Future()
+
+        def close(self):
+            events.append("reader-closed")
+
+    class Attachment:
+        def __init__(self, keyboard):
+            self.keyboard = keyboard
+
+        async def read(self):
+            await asyncio.Future()
+
+        async def write(self, _data):
+            return None
+
+        async def resize(self, *_args):
+            return None
+
+        async def close(self):
+            events.append("detached")
+
+    class Client:
+        async def attach(self, _session_id, *, keyboard=True):
+            return Attachment(keyboard)
+
+    class Stream:
+        def __init__(self, fd):
+            self.fd = fd
+
+        def fileno(self):
+            return self.fd
+
+    def watch_break(callback):
+        events.append("guarded")
+        breaks.append(callback)
+        return lambda: events.append("unguarded")
+
+    monkeypatch.setattr(broker_cli.pty, "RawTerminal", RawTerminal)
+    monkeypatch.setattr(broker_cli.pty, "InputReader", InputReader)
+    monkeypatch.setattr(broker_cli.pty, "watch_break", watch_break, raising=False)
+    monkeypatch.setattr(broker_cli.os, "isatty", lambda _fd: False)
+    monkeypatch.setattr(broker_cli.sys, "stdin", Stream(0))
+    monkeypatch.setattr(broker_cli.sys, "stdout", Stream(1))
+    attach = asyncio.create_task(broker_cli._interactive_attach(
+        Client(), "11111111-1111-4111-8111-111111111111", keyboard=keyboard))
+    async with asyncio.timeout(5):
+        while not breaks:
+            await asyncio.sleep(0.01)
+    breaks[0]()  # what the platform handler runs on the loop for Ctrl+Break
+    assert await asyncio.wait_for(attach, 5) == 130
+    expected = ["guarded", "raw", "restored", "unguarded", "detached"]
+    if keyboard:
+        expected.insert(2, "reader-closed")
+    assert events == expected
