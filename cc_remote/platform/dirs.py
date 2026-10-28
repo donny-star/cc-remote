@@ -121,6 +121,35 @@ def _win32_check_component(name: str) -> None:
         raise OSError(errno.EINVAL, "not a single path component", name)
 
 
+def lock_path(directory: StrPath, name: str) -> str:
+    """Where to lock ``directory`` when it may be renamed while locked.
+
+    POSIX keeps the lock inside the directory, as before. Windows refuses to
+    rename a directory that contains an open handle, so the lock is the
+    sibling file ``.<directory name>.<name>`` next to it.
+    """
+    directory = os.fspath(directory)
+    if not IS_WINDOWS:
+        return os.path.join(directory, name)
+    parent, base = os.path.split(os.path.normpath(directory))
+    return os.path.join(parent, f".{base}.{name}")
+
+
+def discard_lock(directory: StrPath, name: str) -> None:
+    """Best-effort removal of a sibling lock once ``directory`` is gone.
+
+    POSIX locks were removed with the directory. On Windows plain handles
+    lack FILE_SHARE_DELETE, so the unlink fails while anyone still holds or
+    waits on the lock; it never splits a lock that is in use.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        os.unlink(lock_path(directory, name))
+    except (FileNotFoundError, PermissionError):
+        pass
+
+
 class DirHandle:
     """An open directory whose children are resolved without following links."""
 
@@ -229,4 +258,4 @@ class DirHandle:
         self.close()
 
 
-__all__ = ["DirHandle"]
+__all__ = ["DirHandle", "discard_lock", "lock_path"]

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from cc_remote.platform import files as platform_files, locks
+from cc_remote.platform import dirs, files as platform_files, locks
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 
@@ -242,7 +242,7 @@ def cleanup_codex_checkpoint_session(
         try:
             lock_flags = os.O_RDWR | os.O_CREAT
             lock_flags |= getattr(os, "O_NOFOLLOW", 0)
-            lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
+            lock_fd = os.open(dirs.lock_path(candidate, "journal.lock"), lock_flags, 0o600)
             locks.flock(lock_fd, locks.LOCK_EX)
             tombstone = candidate.with_name(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
@@ -267,6 +267,7 @@ def cleanup_codex_checkpoint_session(
                 raise CheckpointError(
                     "Unable to remove Codex checkpoint journal"
                 ) from exc
+            dirs.discard_lock(candidate, "journal.lock")
             removed += 1
     return removed
 
@@ -351,6 +352,7 @@ def migrate_codex_checkpoint_profiles(
                         raise CheckpointError(
                             "Checkpoint profile migration has a staged collision")
                     os.replace(directory, stage)
+                    dirs.discard_lock(directory, "journal.lock")
                     directory = stage
                     manifest_path = directory / "manifest.json"
                 manifest["session_id"] = target_session_id
@@ -425,7 +427,7 @@ class CodexCheckpointJournal:
         self.objects_dir = self.session_dir / "objects"
         self.temp_dir = self.session_dir / "tmp"
         self.manifest_path = self.session_dir / "manifest.json"
-        self.lock_path = self.session_dir / "journal.lock"
+        self.lock_path = Path(dirs.lock_path(self.session_dir, "journal.lock"))
         self._closed = False
 
         self.temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1644,3 +1646,4 @@ class CodexCheckpointJournal:
             self._closed = True
         if tombstone is not None:
             shutil.rmtree(tombstone, ignore_errors=False)
+            dirs.discard_lock(self.session_dir, "journal.lock")

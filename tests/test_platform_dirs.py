@@ -322,3 +322,57 @@ def test_windows_failed_private_path_releases_the_pin(tmp_path, monkeypatch) -> 
     with pytest.raises(OSError):
         DirHandle.open_root(tmp_path / "d")
     os.rename(tmp_path / "d", tmp_path / "moved")  # the handle was closed
+
+
+def test_lock_path_stays_inside_on_posix_and_beside_on_windows(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    session = tmp_path / "repo" / "abc"
+    if sys.platform == "win32":
+        assert dirs.lock_path(session, "journal.lock") == str(tmp_path / "repo" / ".abc.journal.lock")
+    else:
+        assert dirs.lock_path(session, "journal.lock") == str(session / "journal.lock")
+
+
+def test_directory_can_be_renamed_while_its_lock_is_held(tmp_path) -> None:
+    from cc_remote.platform import dirs, locks
+
+    session = tmp_path / "repo" / "abc"
+    session.mkdir(parents=True)
+    (session / "manifest.json").write_text("{}")
+    fd = os.open(dirs.lock_path(session, "journal.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        locks.flock(fd, locks.LOCK_EX)
+        os.replace(session, tmp_path / "repo" / ".abc.delete-1")
+    finally:
+        locks.flock(fd, locks.LOCK_UN)
+        os.close(fd)
+    assert not session.exists()
+
+
+@pytest.mark.windows_only(reason="sibling lock files only exist on Windows")
+def test_discard_lock_never_removes_a_lock_in_use(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    session = tmp_path / "abc"
+    path = dirs.lock_path(session, "journal.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        dirs.discard_lock(session, "journal.lock")
+        assert os.path.exists(path)
+    finally:
+        os.close(fd)
+    dirs.discard_lock(session, "journal.lock")
+    assert not os.path.exists(path)
+    dirs.discard_lock(session, "journal.lock")  # already gone: no error
+
+
+@pytest.mark.posix_only(reason="POSIX keeps the lock inside the removed directory")
+def test_discard_lock_is_a_no_op_on_posix(tmp_path) -> None:
+    from cc_remote.platform import dirs
+
+    marker = tmp_path / "abc" / "journal.lock"
+    marker.parent.mkdir()
+    marker.write_text("")
+    dirs.discard_lock(tmp_path / "abc", "journal.lock")
+    assert marker.exists()

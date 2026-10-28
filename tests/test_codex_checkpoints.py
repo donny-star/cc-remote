@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from cc_remote.wrapper.codex_checkpoints import (
     CodexCheckpointJournal,
     NotGitWorkspaceError,
     cleanup_codex_checkpoint_session,
+    migrate_codex_checkpoint_profiles,
 )
 
 
@@ -689,3 +691,43 @@ def test_cleanup_session_removes_journals_from_every_repository(tmp_path):
     assert not first_journal.session_dir.exists()
     assert not second_journal.session_dir.exists()
     assert cleanup_codex_checkpoint_session(state, "cold-child") == 0
+
+
+def test_journal_lock_location_comes_from_the_platform_helper(tmp_path):
+    from cc_remote.platform import dirs
+
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "session-lock")
+    assert str(journal.lock_path) == dirs.lock_path(journal.session_dir, "journal.lock")
+    if sys.platform != "win32":
+        assert journal.lock_path == journal.session_dir / "journal.lock"
+
+
+def test_session_cleanup_leaves_no_journal_lock_behind(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    journal = CodexCheckpointJournal(str(root), state, "lock-residue")
+    journal.cleanup()
+    assert not journal.lock_path.exists()
+    assert list(journal.session_dir.parent.iterdir()) == []
+
+    cold = CodexCheckpointJournal(str(root), state, "cold-lock-residue")
+    assert cleanup_codex_checkpoint_session(state, "cold-lock-residue") == 1
+    assert not cold.lock_path.exists()
+    assert list(cold.session_dir.parent.iterdir()) == []
+
+
+def test_profile_migration_leaves_no_lock_for_the_former_session_key(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "x"})
+    state = tmp_path / "state"
+    former = CodexCheckpointJournal(str(root), state, "former-session")
+
+    assert migrate_codex_checkpoint_profiles(
+        state, lambda sid: sid.replace("former", "migrated"), profile_revision=1
+    ) == 1
+    migrated = CodexCheckpointJournal(
+        str(root), state, "migrated-session", profile_revision=1
+    )
+    assert not former.session_dir.exists()
+    assert not former.lock_path.exists()
+    assert migrated.completed_turn_ids() == ()
