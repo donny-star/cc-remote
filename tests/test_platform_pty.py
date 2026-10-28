@@ -903,8 +903,28 @@ def test_terminal_size_honours_columns_and_lines(monkeypatch):
 def test_detached_servers_leave_the_launching_console():
     import subprocess
 
-    expected = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+    expected = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
     assert pty.DETACHED_CREATIONFLAGS == expected
+
+
+@pytest.mark.windows_only(reason="console windows are a Windows concept")
+def test_detached_server_never_gets_a_console_window(tmp_path):
+    import subprocess
+    import sys
+
+    from cc_remote.platform import procs
+
+    # A venv python.exe is a launcher that re-spawns the real interpreter; a
+    # DETACHED_PROCESS launcher would hand that child a fresh, visible console.
+    report = tmp_path / "window.txt"
+    code = ("import ctypes, sys; open(sys.argv[1], 'w').write("
+            "str(ctypes.windll.kernel32.GetConsoleWindow() or 0))")
+    child = procs.popen_group(
+        [sys.executable, "-c", code, str(report)], stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+        creationflags=pty.DETACHED_CREATIONFLAGS)
+    assert child.wait(30) == 0
+    assert report.read_text() == "0"
 
 
 class _FakeConsole:

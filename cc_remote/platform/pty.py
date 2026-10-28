@@ -43,7 +43,10 @@ _READER_STOP_SECONDS = 2.0
 _RESIZE_POLL_SECONDS = 0.25
 # An auto-started server must not die with the console that launched it.
 # POSIX needs nothing here: start_new_session already leaves the terminal.
-DETACHED_CREATIONFLAGS = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+# Windows gives it a console of its own without a window, not DETACHED_PROCESS:
+# a venv python.exe is a launcher that re-spawns the real interpreter, and a
+# console-less launcher would hand that child a fresh, visible console window.
+DETACHED_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 if IS_WINDOWS:
     import ctypes
