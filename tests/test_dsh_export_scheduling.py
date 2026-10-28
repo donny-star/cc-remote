@@ -6,13 +6,17 @@ import pytest
 
 from cc_remote.protocol import DownloadDsh, NewSession, SwitchSession
 from tests.test_dsh_mutations import prepared
+from tests.platform_paths import native_path
+
+
+TMP = native_path("/tmp")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("next_command,focused", [
     (SwitchSession(session_id="dsh@root", engine="dsh"), "dsh@root"),
     (SwitchSession(session_id="dsh@other", engine="dsh"), "dsh@other"),
-    (NewSession(engine="dsh", cwd="/tmp", request_id="new"), "dsh@created"),
+    (NewSession(engine="dsh", cwd=TMP, request_id="new"), "dsh@created"),
 ])
 async def test_export_keeps_focus_create_and_owner_cancellation_responsive(next_command, focused):
     machine, output, runtime, client = prepared()

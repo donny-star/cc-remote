@@ -6,9 +6,11 @@ import os
 import stat
 from os import PathLike
 
-from cc_remote.platform import IS_WINDOWS
+from cc_remote.platform import IS_WINDOWS, files
 from cc_remote.platform._win32err import translated
 from cc_remote.platform.identity import current_euid, current_sid, current_uid
+
+# Uses files' package-internal Win32 helpers (_win32_*, _FILE_*).
 
 StrPath = str | PathLike[str]
 
@@ -59,6 +61,77 @@ def make_private_fd(fd: int) -> None:
             handle.Close()
 
 
+def make_private_dir_fd(fd: int) -> None:
+    """Restrict an open directory to its owner through its descriptor.
+
+    POSIX is ``os.fchmod(fd, 0o700)``. On Windows the descriptor's handle
+    must already carry WRITE_DAC, because ReOpenFile refuses directories
+    (:meth:`cc_remote.platform.dirs.DirHandle.make_private` opens one); it
+    gets a protected current-user + SYSTEM DACL that new children inherit.
+    Failures raise ``OSError``.
+    """
+    if not IS_WINDOWS:
+        os.fchmod(fd, 0o700)
+        return
+    import msvcrt
+
+    import win32security
+
+    with translated():
+        win32security.SetSecurityInfo(
+            msvcrt.get_osfhandle(fd), win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, _private_dacl(directory=True), None)
+
+
+def copy_security_fd(src_fd: int, dst_fd: int) -> None:
+    """Give ``dst_fd``'s file the access control of ``src_fd``'s file.
+
+    POSIX copies the mode bits. Windows copies the DACL, whether it is
+    protected from inheritance (an unprotected one keeps its explicit
+    entries and re-inherits from the destination's directory), and the
+    read-only attribute; the destination handle is reopened with WRITE_DAC
+    like :func:`make_private_fd`. Neither path is re-resolved. Failures
+    raise ``OSError`` and may leave the destination partly updated.
+    """
+    if not IS_WINDOWS:
+        os.fchmod(dst_fd, stat.S_IMODE(os.fstat(src_fd).st_mode))
+        return
+    import msvcrt
+
+    import win32file
+    import win32security
+
+    with translated():
+        descriptor = _handle_security_info(
+            src_fd, win32security.DACL_SECURITY_INFORMATION)
+        control, _revision = descriptor.GetSecurityDescriptorControl()
+        protection = (
+            win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            if control & win32security.SE_DACL_PROTECTED
+            else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
+        read_only = bool(
+            files._win32_handle_attributes(msvcrt.get_osfhandle(src_fd))
+            & files._FILE_ATTRIBUTE_READONLY)
+        handle = win32file.ReOpenFile(
+            msvcrt.get_osfhandle(dst_fd),
+            _WRITE_DAC | _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_WRITE_ATTRIBUTES,
+            win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE
+            | win32file.FILE_SHARE_DELETE,
+            0)
+        try:
+            win32security.SetSecurityInfo(
+                handle, win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION | protection,
+                None, None, descriptor.GetSecurityDescriptorDacl(), None)
+            files._win32_set_read_only(int(handle), read_only)
+        finally:
+            handle.Close()
+
+
+_FILE_READ_ATTRIBUTES = 0x0080
+_FILE_WRITE_ATTRIBUTES = 0x0100
 _READ_CONTROL = 0x00020000
 _WRITE_DAC = 0x00040000
 

@@ -1,16 +1,35 @@
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from cc_remote.workspaces import WorkRegistry, WorkStores
 from tests.platform_assertions import assert_private_dir, assert_private_file
+
+
+@contextmanager
+def _sqlite(path):
+    """``sqlite3.connect`` as a context manager that also closes it.
+
+    The connection's own context manager only commits; an open connection
+    keeps Windows from deleting the database during tearDown.
+    """
+    db = sqlite3.connect(path)
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
 
 
 class WorkRegistryTests(unittest.TestCase):
@@ -46,7 +65,7 @@ class WorkRegistryTests(unittest.TestCase):
     def test_legacy_schema_migration_is_safe_under_concurrent_initialize(self):
         store = WorkRegistry(self.root, "codex")
         self.root.mkdir(parents=True)
-        with sqlite3.connect(store.db_path) as db:
+        with _sqlite(store.db_path) as db:
             db.execute(
                 """CREATE TABLE work_sessions (
                     work_id TEXT PRIMARY KEY,
@@ -71,7 +90,7 @@ class WorkRegistryTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(lambda _index: initialize(), range(workers)))
 
-        with sqlite3.connect(store.db_path) as db:
+        with _sqlite(store.db_path) as db:
             columns = [row[1] for row in db.execute(
                 "PRAGMA table_info(work_sessions)"
             )]
@@ -431,7 +450,7 @@ class WorkRegistryTests(unittest.TestCase):
         store = WorkRegistry(self.root / "legacy-codex", "codex")
         store.initialize()
         now = time.time()
-        with sqlite3.connect(store.db_path) as db:
+        with _sqlite(store.db_path) as db:
             db.execute(
                 """INSERT INTO work_schedules
                    (schedule_id, title, prompt, next_run_at, enabled,
@@ -451,7 +470,7 @@ class WorkRegistryTests(unittest.TestCase):
         # A second startup remains a no-op even though no topology revision was
         # created for this schema-only ownership migration.
         self.assertEqual(store.assign_legacy_codex_profile("primary"), 0)
-        with sqlite3.connect(store.db_path) as db:
+        with _sqlite(store.db_path) as db:
             schedule_owner = db.execute(
                 "SELECT codex_profile_id FROM work_schedules "
                 "WHERE schedule_id = 'legacy'",
@@ -478,7 +497,7 @@ class WorkRegistryTests(unittest.TestCase):
                 run["run_id"], "session-finished", None, now=now + 1),
             "succeeded",
         )
-        with sqlite3.connect(self.store.db_path) as db:
+        with _sqlite(self.store.db_path) as db:
             self.assertIsNone(db.execute(
                 "SELECT 1 FROM work_schedules WHERE schedule_id = ?",
                 (schedule_id,),
@@ -536,6 +555,7 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(records[os.path.realpath(unbound.cwd)].work_id,
                          unbound.work_id)
 
+    @pytest.mark.requires_symlink(reason="plants a symlinked file in the workspace")
     def test_artifacts_list_only_user_deliverables_inside_private_workspace(self):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")
@@ -569,6 +589,27 @@ class WorkRegistryTests(unittest.TestCase):
             self.assertEqual(by_path[name]["kind"], "document")
         self.assertTrue(by_path["output/deck.pptx"]["previewable"])
         self.assertEqual(by_path["output/deck.pptx"]["kind"], "presentation")
+
+    @pytest.mark.windows_only(reason="NTFS junctions are Windows reparse points")
+    def test_artifacts_skip_managed_uploads_and_junctions(self):
+        record = self.store.create_session()
+        self.store.bind_session(record.work_id, "session-1")
+        workspace = Path(record.cwd)
+        upload = workspace / "uploads" / "message-1" / "00-source.txt"
+        upload.parent.mkdir()
+        upload.write_text("user input", encoding="utf-8")
+        (workspace / "report.md").write_text("# result", encoding="utf-8")
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text("outside", encoding="utf-8")
+        subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J",
+             str(workspace / "linked"), str(outside)],
+            check=True, capture_output=True)
+
+        artifacts = self.store.artifacts("session-1")
+
+        self.assertEqual({item["path"] for item in artifacts}, {"report.md"})
 
     def test_new_session_creates_private_uploads_inside_workspace(self):
         record = self.store.create_session()
@@ -634,7 +675,7 @@ class WorkRegistryTests(unittest.TestCase):
 
     def test_repeated_initialize_does_not_rebuild_profile_identity_index(self):
         self.store.initialize()
-        with sqlite3.connect(self.store.db_path) as db:
+        with _sqlite(self.store.db_path) as db:
             before = db.execute("PRAGMA schema_version").fetchone()[0]
             index_sql = db.execute(
                 "SELECT sql FROM sqlite_master "
@@ -643,7 +684,7 @@ class WorkRegistryTests(unittest.TestCase):
 
         self.store.initialize()
 
-        with sqlite3.connect(self.store.db_path) as db:
+        with _sqlite(self.store.db_path) as db:
             after = db.execute("PRAGMA schema_version").fetchone()[0]
         self.assertIn("claude_profile_id", index_sql)
         self.assertEqual(after, before)

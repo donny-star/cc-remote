@@ -1,10 +1,17 @@
 import asyncio
 import os
+import subprocess
 
 import pytest
 
 from cc_remote.protocol import BrowseFiles, FilesListed, deserialize, serialize
 from cc_remote.wrapper.workspace_browser import browse_workspace
+
+
+def _junction(link, target):
+    subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=True, capture_output=True)
 
 
 def test_directory_navigation_paging_and_hidden_files(tmp_path):
@@ -25,6 +32,8 @@ def test_directory_navigation_paging_and_hidden_files(tmp_path):
     assert file["kind"] == "file" and file["path"] == str(tmp_path / "a.txt")
 
 
+@pytest.mark.requires_symlink(reason="plants a symlinked workspace entry")
+@pytest.mark.posix_only(reason="creates a FIFO special file")
 def test_escape_symlinks_special_files_and_changed_page_are_rejected(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -40,12 +49,27 @@ def test_escape_symlinks_special_files_and_changed_page_are_rejected(tmp_path):
         browse_workspace(str(root), ".", offset=1, revision="old")
 
 
+@pytest.mark.windows_only(reason="NTFS junctions are Windows reparse points")
+def test_escape_and_junctions_are_rejected(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "outside.txt").write_text("outside")
+    _junction(root / "link", tmp_path)
+    for path in ("..", "../outside.txt", "link", "link/outside.txt"):
+        with pytest.raises(ValueError):
+            browse_workspace(str(root), path)
+    listed = browse_workspace(str(root), ".")
+    assert [(entry["name"], entry["kind"]) for entry in listed["entries"]] == [
+        ("link", "unsupported")]
+
+
 def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("outside")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows expanduser
     start = browse_workspace(str(root), ".", confine_to_cwd=False)
     assert start["root"] == os.path.abspath(os.sep)
     assert start["path"] == str(root)
@@ -61,12 +85,25 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     assert top["parent"] is None
 
 
+@pytest.mark.requires_symlink(reason="plants a symlinked directory beside the project")
+@pytest.mark.posix_only(reason="creates a FIFO special file")
 def test_code_external_browsing_still_rejects_symlinks_and_special_files(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
     (tmp_path / "link").symlink_to(root, target_is_directory=True)
     os.mkfifo(tmp_path / "pipe")
     for path in ("../link", "../link/child", "../pipe"):
+        with pytest.raises(ValueError, match="符号链接或特殊文件"):
+            browse_workspace(str(root), path, confine_to_cwd=False)
+
+
+@pytest.mark.windows_only(reason="NTFS junctions are Windows reparse points")
+def test_code_external_browsing_rejects_junctions(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "child").mkdir()
+    _junction(tmp_path / "link", root)
+    for path in ("../link", "../link/child"):
         with pytest.raises(ValueError, match="符号链接或特殊文件"):
             browse_workspace(str(root), path, confine_to_cwd=False)
 

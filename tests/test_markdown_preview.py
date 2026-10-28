@@ -32,8 +32,16 @@ from cc_remote.protocol import (
     ToolResult,
     ToolUse,
 )
+from cc_remote.platform import perms
+from cc_remote.platform.identity import current_euid
 from cc_remote.wrapper.git_diff import read_git_diff
 from cc_remote.wrapper.preview_capabilities import PreviewCapabilityStore
+from tests.platform_assertions import (
+    assert_private_file,
+    foreign_readable_dir,
+    grant_foreign_read,
+    security_snapshot,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -41,7 +49,7 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 def test_mermaid_artifact_reads_exact_source_as_text(tmp_path, extension):
     source = "flowchart TD\n  camera[双目相机] --> decoder[硬件解码]\n"
     path = tmp_path / f"camera_navigation_pipeline.{extension}"
-    path.write_text(source, encoding="utf-8")
+    path.write_text(source, encoding="utf-8", newline="\n")
     preview = machine_module.WrapperMachine._read_file_preview(str(tmp_path), path.name)
     assert preview["format"] == "text"
     assert preview["content"] == source
@@ -64,7 +72,7 @@ def test_code_open_reads_os_readable_files_outside_session(
         if foreign_owner and result.st_ino == target_stat.st_ino:
             values = {key: getattr(result, key) for key in dir(result)
                       if key.startswith("st_")}
-            values["st_uid"] = os.geteuid() + 1
+            values["st_uid"] = current_euid() + 1
             return SimpleNamespace(**values)
         return result
 
@@ -141,7 +149,7 @@ def test_markdown_preview_reads_utf8_and_normalizes_paths(tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()
     readme = docs / "README.md"
-    readme.write_text("\ufeff# 标题\n\n正文", encoding="utf-8")
+    readme.write_text("\ufeff# 标题\n\n正文", encoding="utf-8", newline="\n")
     machine, _ = _mk_machine()
 
     relative = machine._read_markdown_preview(str(tmp_path), "docs/README.md")
@@ -156,7 +164,7 @@ def test_markdown_preview_reads_utf8_and_normalizes_paths(tmp_path):
 
 def test_source_preview_reads_utf8_and_reports_text_format(tmp_path):
     source = tmp_path / "module.py"
-    source.write_text("def answer():\n    return 42\n", encoding="utf-8")
+    source.write_text("def answer():\n    return 42\n", encoding="utf-8", newline="\n")
     machine, _ = _mk_machine()
 
     result = machine._read_text_preview(str(tmp_path), "module.py")
@@ -170,7 +178,8 @@ def test_source_preview_reads_utf8_and_reports_text_format(tmp_path):
 def test_markdown_save_is_atomic_and_preserves_bom_crlf_and_mode(tmp_path):
     path = tmp_path / "README.md"
     path.write_bytes(b"\xef\xbb\xbf# old\r\nline\r\n")
-    path.chmod(0o640)
+    grant_foreign_read(path)  # mode 0640, or an explicit Everyone read ACE
+    access = security_snapshot(path)
     before = path.stat()
     revision = hashlib.sha256(path.read_bytes()).hexdigest()
     machine, _ = _mk_machine()
@@ -182,10 +191,112 @@ def test_markdown_save_is_atomic_and_preserves_bom_crlf_and_mode(tmp_path):
 
     assert result[0] == "README.md"
     assert path.read_bytes() == b"\xef\xbb\xbf# new\r\nline\r\n"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert security_snapshot(path) == access
     assert result[1] == path.stat().st_size
     assert result[2] == path.stat().st_mtime_ns
     assert result[3] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _save_unchanged(machine, root, name, content):
+    path = Path(root) / name
+    before = path.stat()
+    return machine._write_markdown_file(
+        str(root), name, content, before.st_size, before.st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def _temp_files(directory):
+    return sorted(path.name for path in Path(directory).glob(".cc-remote-*.tmp"))
+
+
+def test_markdown_save_keeps_a_private_file_private_in_a_shared_directory(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    foreign_readable_dir(shared)  # new files there are readable by others
+    path = shared / "private.md"
+    path.write_bytes(b"# secret\n")
+    perms.make_private(path, directory=False)
+    access = security_snapshot(path)
+    machine, _ = _mk_machine()
+
+    _save_unchanged(machine, shared, "private.md", "# still secret\n")
+
+    assert path.read_bytes() == b"# still secret\n"
+    assert_private_file(path)
+    assert security_snapshot(path) == access
+    assert _temp_files(shared) == []
+
+
+@pytest.mark.windows_only(reason="a Windows temp inherits its directory's DACL; POSIX creates it 0600")
+def test_markdown_save_temp_is_private_before_the_new_contents_are_written(
+        tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    foreign_readable_dir(shared)  # new files there are readable by others
+    path = shared / "private.md"
+    path.write_bytes(b"# secret\n")
+    perms.make_private(path, directory=False)
+    machine, _ = _mk_machine()
+    temps: dict[int, str] = {}
+    private_at_first_write: list[bool] = []
+    open_file = machine_module.DirHandle.open_file
+    write = os.write
+
+    def recording_open_file(self, name, flags, mode=0o600):
+        fd = open_file(self, name, flags, mode)
+        if name.startswith(".cc-remote-"):
+            temps[fd] = self.child_path(name)
+        return fd
+
+    def checking_write(fd, data):
+        if fd in temps and not private_at_first_write:
+            private_at_first_write.append(perms.is_private(temps[fd]))
+        return write(fd, data)
+
+    monkeypatch.setattr(machine_module.DirHandle, "open_file", recording_open_file)
+    monkeypatch.setattr(machine_module.os, "write", checking_write)
+
+    _save_unchanged(machine, shared, "private.md", "# still secret\n")
+
+    assert private_at_first_write == [True]
+    assert path.read_bytes() == b"# still secret\n"
+    assert_private_file(path)
+
+
+def test_markdown_save_over_a_read_only_file_keeps_it_read_only(tmp_path):
+    path = tmp_path / "locked.md"
+    path.write_bytes(b"# old\n")
+    os.chmod(path, stat.S_IREAD)
+    access = security_snapshot(path)
+    machine, _ = _mk_machine()
+
+    try:
+        _save_unchanged(machine, tmp_path, "locked.md", "# new\n")
+        assert path.read_bytes() == b"# new\n"
+        assert security_snapshot(path) == access
+        assert not os.access(path, os.W_OK)
+        assert _temp_files(tmp_path) == []
+    finally:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_markdown_save_cleanup_failure_never_masks_the_original_error(
+        tmp_path, monkeypatch):
+    path = tmp_path / "README.md"
+    path.write_bytes(b"# old\n")
+    machine, _ = _mk_machine()
+
+    def replace_fails(self, src, dst):
+        raise RuntimeError("replace failed")
+
+    def unlink_fails(self, name):
+        raise PermissionError(13, "cleanup denied")
+
+    monkeypatch.setattr(machine_module.DirHandle, "replace", replace_fails)
+    monkeypatch.setattr(machine_module.DirHandle, "unlink", unlink_fails)
+    with pytest.raises(RuntimeError, match="replace failed"):
+        _save_unchanged(machine, tmp_path, "README.md", "# new\n")
+    assert path.read_bytes() == b"# old\n"
 
 
 def test_markdown_save_conflict_never_overwrites_newer_content(tmp_path):
@@ -205,27 +316,84 @@ def test_markdown_save_conflict_never_overwrites_newer_content(tmp_path):
     assert path.read_text(encoding="utf-8") == "newer external content"
 
 
-def test_markdown_save_rejects_non_markdown_and_symlink(tmp_path):
-    outside = tmp_path / "outside.md"
-    outside.write_text("outside", encoding="utf-8")
+def test_markdown_save_rejects_non_markdown(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     source = root / "note.txt"
     source.write_text("text", encoding="utf-8")
-    link = root / "link.md"
-    link.symlink_to(outside)
     machine, _ = _mk_machine()
     source_stat = source.stat()
-    link_stat = outside.stat()
 
     with pytest.raises(ValueError, match="Markdown"):
         machine._write_markdown_file(
             str(root), "note.txt", "draft", source_stat.st_size,
             source_stat.st_mtime_ns, hashlib.sha256(source.read_bytes()).hexdigest())
+
+
+@pytest.mark.requires_symlink(reason="plants a symbolic link escaping the session root")
+def test_markdown_save_rejects_symlink(tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    link = root / "link.md"
+    link.symlink_to(outside)
+    machine, _ = _mk_machine()
+    link_stat = outside.stat()
+
     with pytest.raises(ValueError, match="符号链接"):
         machine._write_markdown_file(
             str(root), "link.md", "draft", link_stat.st_size,
             link_stat.st_mtime_ns, hashlib.sha256(outside.read_bytes()).hexdigest())
+
+
+def _link_directory(target, link) -> None:
+    """A directory link every platform can create without privileges."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _escaping_directory_link(tmp_path, monkeypatch):
+    """``root/sub`` links to ``outside``; realpath no longer sees through it.
+
+    With ``realpath`` reduced to ``abspath`` the containment check passes,
+    so only the no-follow directory walk can refuse the escape.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    note = outside / "note.md"
+    note.write_bytes(b"# outside secret\n")
+    root = tmp_path / "root"
+    root.mkdir()
+    _link_directory(outside, root / "sub")
+    monkeypatch.setattr(
+        os.path, "realpath", lambda path, *args, **kwargs: os.path.abspath(path))
+    return root, note
+
+
+def test_markdown_save_walk_refuses_an_escaping_directory_link(tmp_path, monkeypatch):
+    root, note = _escaping_directory_link(tmp_path, monkeypatch)
+    before = note.stat()
+    machine, _ = _mk_machine()
+
+    with pytest.raises(ValueError, match="符号链接"):
+        machine._write_markdown_file(
+            str(root), "sub/note.md", "# overwritten\n", before.st_size,
+            before.st_mtime_ns, hashlib.sha256(note.read_bytes()).hexdigest())
+    assert note.read_bytes() == b"# outside secret\n"
+    assert _temp_files(note.parent) == []
+
+
+def test_markdown_preview_walk_refuses_an_escaping_directory_link(tmp_path, monkeypatch):
+    root, _note = _escaping_directory_link(tmp_path, monkeypatch)
+    machine, _ = _mk_machine()
+
+    with pytest.raises(ValueError, match="无法打开该文件"):
+        machine._read_markdown_preview(str(root), "sub/note.md")
 
 
 def test_source_preview_rejects_binary_content(tmp_path):
@@ -464,7 +632,19 @@ def test_markdown_preview_rejects_paths_outside_cwd(tmp_path, path):
         machine._read_markdown_preview(str(tmp_path), path)
 
 
-def test_markdown_preview_rejects_absolute_and_symlink_escape(tmp_path):
+def test_markdown_preview_rejects_absolute_escape(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret", encoding="utf-8")
+    machine, _ = _mk_machine()
+
+    with pytest.raises(ValueError, match="确认"):
+        machine._read_markdown_preview(str(root), str(outside))
+
+
+@pytest.mark.requires_symlink(reason="plants a symbolic link escaping the session root")
+def test_markdown_preview_rejects_symlink_escape(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     outside = tmp_path / "outside.md"
@@ -472,8 +652,6 @@ def test_markdown_preview_rejects_absolute_and_symlink_escape(tmp_path):
     (root / "escape.md").symlink_to(outside)
     machine, _ = _mk_machine()
 
-    with pytest.raises(ValueError, match="确认"):
-        machine._read_markdown_preview(str(root), str(outside))
     with pytest.raises(ValueError, match="确认"):
         machine._read_markdown_preview(str(root), "escape.md")
 
@@ -1187,6 +1365,7 @@ def test_concurrent_preview_revokes_preserve_unrelated_grants(tmp_path):
         "claude", "code", "session-2")
 
 
+@pytest.mark.requires_symlink(reason="the fixture plants a symbolic link lock file")
 def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -1194,12 +1373,7 @@ def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     target.write_text("do not touch", encoding="utf-8")
     target.chmod(0o640)
     before = target.stat().st_mode & 0o777
-    try:
-        (state / ".preview-capabilities.lock").symlink_to(target)
-    except OSError as exc:
-        if sys.platform == "win32":
-            pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
-        raise
+    (state / ".preview-capabilities.lock").symlink_to(target)
 
     store = PreviewCapabilityStore(state)
 
@@ -1541,8 +1715,8 @@ def test_successful_codex_patch_grants_multiple_exact_cross_cwd_paths(tmp_path):
     root.mkdir()
     first = tmp_path / "one.txt"
     second = tmp_path / "two.md"
-    first.write_text("1\n", encoding="utf-8")
-    second.write_text("# two\n", encoding="utf-8")
+    first.write_text("1\n", encoding="utf-8", newline="\n")
+    second.write_text("# two\n", encoding="utf-8", newline="\n")
     machine, _ = _mk_machine()
     ctx = _mk_ctx("session-1", session_id="session-1")
     ctx.cwd = str(root)
@@ -1617,13 +1791,13 @@ def test_external_diff_never_reopens_capability_checked_path(
             return
         try:
             os.replace(replacement, outside)
-        except OSError:
+        except OSError as exc:
             # Windows denies replacing a path while another descriptor holds
-            # it open without share-delete, so the race this test injects
-            # cannot land there at all. That is consistent with (and even
-            # stronger than) the invariant under test: the read snapshot is
-            # never affected by a racing replace.
-            if sys.platform != "win32":
+            # it open without share-delete (ERROR_SHARING_VIOLATION) or while
+            # the target is pinned (ERROR_ACCESS_DENIED), so the race this test
+            # injects cannot land there at all. That is consistent with (and
+            # even stronger than) the invariant under test.
+            if getattr(exc, "winerror", None) not in (32, 5):
                 raise
         replaced = True
 
@@ -1708,6 +1882,7 @@ def test_external_binary_diff_never_decodes_capability_snapshot(tmp_path):
     assert "PRIVATE_BINARY_PAYLOAD" not in diff
 
 
+@pytest.mark.posix_only(reason="named pipes (os.mkfifo) only exist on POSIX file systems")
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):
     fifo = tmp_path / "pipe.md"
     os.mkfifo(fifo)

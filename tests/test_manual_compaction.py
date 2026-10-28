@@ -18,6 +18,7 @@ from tests.test_claude_compaction_flow import boundary, result, status
 from tests.test_claude_service import environment, released
 from tests.test_codex_spontaneous_stream import _notification
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_paths import native_path
 
 
 def test_only_compact_command_is_visible_and_stdout_cannot_claim_its_identity():
@@ -323,7 +324,7 @@ def test_codex_compact_history_is_account_scoped_and_survives_control_updates(tm
         sid = "primary@thread-compact"
         store.remember_compaction(sid, "native-compact")
         store.update(sid, approval_policy="never", permission_profile=None, web_search="disabled")
-        store.set_cwd_override(sid, "/tmp/project")
+        store.set_cwd_override(sid, native_path("/tmp/project"))
         store.set_context(sid, 200_000, 300_000)
         machine._codex_controls = CodexControlStore(tmp_path)
         assert machine._manual_codex_compact_users("other@thread-compact", ("native-compact",)) == {}

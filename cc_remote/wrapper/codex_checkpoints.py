@@ -22,7 +22,6 @@ import copy
 import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -33,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from cc_remote.platform import files as platform_files, locks
+from cc_remote.platform import dirs, files as platform_files, locks
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 
@@ -182,7 +181,7 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        platform_files.replace(temporary, path)
     finally:
         try:
             os.unlink(temporary)
@@ -242,7 +241,7 @@ def cleanup_codex_checkpoint_session(
         try:
             lock_flags = os.O_RDWR | os.O_CREAT
             lock_flags |= getattr(os, "O_NOFOLLOW", 0)
-            lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
+            lock_fd = dirs.open_lock(candidate, "journal.lock", lock_flags, 0o600)
             locks.flock(lock_fd, locks.LOCK_EX)
             tombstone = candidate.with_name(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
@@ -251,7 +250,6 @@ def cleanup_codex_checkpoint_session(
                 os.replace(candidate, tombstone)
             except FileNotFoundError:
                 tombstone = None
-                continue
         except OSError as exc:
             raise CheckpointError(
                 "Unable to retire Codex checkpoint journal"
@@ -260,14 +258,18 @@ def cleanup_codex_checkpoint_session(
             if lock_fd is not None:
                 locks.flock(lock_fd, locks.LOCK_UN)
                 os.close(lock_fd)
-        if tombstone is not None:
-            try:
-                shutil.rmtree(tombstone, ignore_errors=False)
-            except OSError as exc:
-                raise CheckpointError(
-                    "Unable to remove Codex checkpoint journal"
-                ) from exc
-            removed += 1
+        if tombstone is None:
+            # Another remover won; its discard failed while this lock was open.
+            dirs.discard_lock(candidate, "journal.lock")
+            continue
+        try:
+            platform_files.force_rmtree(tombstone)
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to remove Codex checkpoint journal"
+            ) from exc
+        dirs.discard_lock(candidate, "journal.lock")
+        removed += 1
     return removed
 
 
@@ -351,6 +353,7 @@ def migrate_codex_checkpoint_profiles(
                         raise CheckpointError(
                             "Checkpoint profile migration has a staged collision")
                     os.replace(directory, stage)
+                    dirs.discard_lock(directory, "journal.lock")
                     directory = stage
                     manifest_path = directory / "manifest.json"
                 manifest["session_id"] = target_session_id
@@ -425,7 +428,7 @@ class CodexCheckpointJournal:
         self.objects_dir = self.session_dir / "objects"
         self.temp_dir = self.session_dir / "tmp"
         self.manifest_path = self.session_dir / "manifest.json"
-        self.lock_path = self.session_dir / "journal.lock"
+        self.lock_path = Path(dirs.lock_path(self.session_dir, "journal.lock"))
         self._closed = False
 
         self.temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -476,7 +479,8 @@ class CodexCheckpointJournal:
     def _locked(self) -> Iterator[None]:
         self._ensure_open()
         self.session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = dirs.open_lock(
+            self.session_dir, "journal.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             locks.flock(fd, locks.LOCK_EX)
             yield
@@ -705,7 +709,7 @@ class CodexCheckpointJournal:
         try:
             os.replace(self.objects_dir, retired)
             self._initialize_object_store()
-            shutil.rmtree(retired, ignore_errors=False)
+            platform_files.force_rmtree(retired)
         except OSError as exc:
             raise CheckpointError("Unable to compact checkpoint object store") from exc
 
@@ -1643,4 +1647,5 @@ class CodexCheckpointJournal:
             os.replace(self.session_dir, tombstone)
             self._closed = True
         if tombstone is not None:
-            shutil.rmtree(tombstone, ignore_errors=False)
+            platform_files.force_rmtree(tombstone)
+            dirs.discard_lock(self.session_dir, "journal.lock")

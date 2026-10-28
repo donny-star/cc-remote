@@ -13,13 +13,15 @@ from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournalError,
     claude_fork_marker,
 )
+from tests.platform_paths import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 PARENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 CUTOFF = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 CHILD = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-CWD = "/repo/component"
+CWD = native_path("/repo/component")
+COLD_CWD = native_path("/cold/repository")
 
 
 def _info(
@@ -635,7 +637,7 @@ def test_cold_claude_source_uses_session_info_cwd_without_spawning(monkeypatch):
             source_lookups.append((session_id, directory))
             return _info(
                 session_id,
-                cwd="/cold/repository",
+                cwd=COLD_CWD,
                 title=("Cold source" if session_id == PARENT
                        else "Cold source (fork)"),
             )
@@ -653,10 +655,10 @@ def test_cold_claude_source_uses_session_info_cwd_without_spawning(monkeypatch):
 
         assert source_lookups[0] == (PARENT, None)
         assert fork_calls == [(
-            PARENT, "/cold/repository", CUTOFF,
+            PARENT, COLD_CWD, CUTOFF,
             claude_fork_marker("request-1"),
         )]
-        assert result.cwd == "/cold/repository"
+        assert result.cwd == COLD_CWD
         assert result.session_id == CHILD
         assert machine.sessions == {}
         assert "request-1" not in machine._claude_fork_locks

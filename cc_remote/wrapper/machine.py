@@ -221,7 +221,9 @@ from cc_remote.wrapper.codex_daemon import (
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.platform import files as platform_files
-from cc_remote.platform.identity import current_euid, current_uid
+from cc_remote.platform import perms as platform_perms
+from cc_remote.platform.dirs import DirHandle
+from cc_remote.platform.identity import current_uid
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
@@ -26417,25 +26419,18 @@ class WrapperMachine:
         if relative in ("", "."):
             raise ValueError("预览目标必须是普通文件")
         parts = relative.split(os.sep)
-        file_flags = os.O_RDONLY
-        file_flags |= getattr(os, "O_CLOEXEC", 0)
-        file_flags |= getattr(os, "O_NONBLOCK", 0)
-        file_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_flags = os.O_RDONLY
-        dir_flags |= getattr(os, "O_CLOEXEC", 0)
-        dir_flags |= getattr(os, "O_DIRECTORY", 0)
-        dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_fd: Optional[int] = None
+        directory: Optional[DirHandle] = None
         try:
             # Walk from an already-open cwd and refuse symlinks at every hop.
             # This closes the realpath/open race where a parent directory could
             # otherwise be replaced by an escaping symlink between both calls.
-            dir_fd = os.open(access_root, dir_flags)
+            directory = DirHandle.open_root(access_root)
             for part in parts[:-1]:
-                next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
-                os.close(dir_fd)
-                dir_fd = next_fd
-            fd = os.open(parts[-1], file_flags, dir_fd=dir_fd)
+                child = directory.open_dir(part)
+                directory.close()
+                directory = child
+            fd = directory.open_file(
+                parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError as exc:
             raise ValueError("文件不存在") from exc
         except PermissionError as exc:
@@ -26443,8 +26438,8 @@ class WrapperMachine:
         except OSError as exc:
             raise ValueError("无法打开该文件") from exc
         finally:
-            if dir_fd is not None:
-                os.close(dir_fd)
+            if directory is not None:
+                directory.close()
 
         try:
             file_stat = os.fstat(fd)
@@ -26790,11 +26785,11 @@ class WrapperMachine:
     ) -> tuple[str, int, int, str]:
         """CAS-style atomic save for one existing Markdown regular file.
 
-        Every path component is opened relative to an already-open cwd with
-        ``O_NOFOLLOW``. The replacement is written and fsynced in the same
+        Every path component is opened relative to an already-open cwd without
+        following links. The replacement is written and fsynced in the same
         directory, then renamed over the file only after a second revision
-        check. Existing UTF-8 BOM, dominant LF/CRLF style, and mode bits are
-        preserved.
+        check. Existing UTF-8 BOM, dominant LF/CRLF style, and access control
+        (mode bits; on Windows the DACL and read-only attribute) are preserved.
         """
         if path.startswith("~"):
             raise ValueError("保存路径必须位于当前工作目录")
@@ -26828,20 +26823,17 @@ class WrapperMachine:
         if relative in ("", ".") or any(part in ("", ".", "..") for part in parts):
             raise ValueError("保存路径无效")
 
-        dir_flags = os.O_RDONLY
-        dir_flags |= getattr(os, "O_CLOEXEC", 0)
-        dir_flags |= getattr(os, "O_DIRECTORY", 0)
-        dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-        file_flags = os.O_RDONLY
-        file_flags |= getattr(os, "O_CLOEXEC", 0)
-        file_flags |= getattr(os, "O_NONBLOCK", 0)
-        file_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_fd: Optional[int] = None
+        directory: Optional[DirHandle] = None
         temp_name: Optional[str] = None
+        original_fd: Optional[int] = None
 
-        def read_current() -> tuple[bytes, os.stat_result, str]:
+        def read_current(
+            *, keep_open: bool = False,
+        ) -> tuple[bytes, os.stat_result, str]:
+            nonlocal original_fd
             try:
-                fd = os.open(parts[-1], file_flags, dir_fd=dir_fd)
+                fd = directory.open_file(
+                    parts[-1], os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
             except FileNotFoundError as exc:
                 raise ValueError("文件不存在") from exc
             except PermissionError as exc:
@@ -26873,9 +26865,12 @@ class WrapperMachine:
                         mtime_ns=final_stat.st_mtime_ns,
                         revision=revision,
                     )
+                if keep_open:
+                    original_fd, fd = fd, None
                 return data, final_stat, hashlib.sha256(data).hexdigest()
             finally:
-                os.close(fd)
+                if fd is not None:
+                    os.close(fd)
 
         def require_expected(file_stat: os.stat_result, revision: str) -> None:
             if (file_stat.st_size != expected_size
@@ -26889,16 +26884,17 @@ class WrapperMachine:
                 )
 
         try:
-            dir_fd = os.open(root, dir_flags)
+            directory = DirHandle.open_root(root)
             for part in parts[:-1]:
                 try:
-                    next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
+                    child = directory.open_dir(part)
                 except OSError as exc:
                     raise ValueError("保存路径不能包含符号链接") from exc
-                os.close(dir_fd)
-                dir_fd = next_fd
+                directory.close()
+                directory = child
 
-            original, original_stat, original_revision = read_current()
+            original, original_stat, original_revision = read_current(
+                keep_open=True)
             if (
                 capability is not None
                 and not capability.matches(
@@ -26924,31 +26920,29 @@ class WrapperMachine:
                 raise ValueError("保存内容超过 512 KiB 限制")
 
             temp_name = f".cc-remote-{uuid4().hex}.tmp"
-            temp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            temp_flags |= getattr(os, "O_CLOEXEC", 0)
-            temp_flags |= getattr(os, "O_NOFOLLOW", 0)
-            temp_fd = os.open(temp_name, temp_flags, 0o600, dir_fd=dir_fd)
+            temp_fd = directory.open_file(
+                temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
+                # Windows creates the temp with the directory's inherited
+                # DACL; restrict it before any new content reaches it.
+                platform_perms.make_private_fd(temp_fd)
                 view = memoryview(payload)
                 written = 0
                 while written < len(view):
                     written += os.write(temp_fd, view[written:])
-                os.fchmod(temp_fd, stat.S_IMODE(original_stat.st_mode))
+                platform_perms.copy_security_fd(original_fd, temp_fd)
                 os.fsync(temp_fd)
             finally:
                 os.close(temp_fd)
+                fd, original_fd = original_fd, None
+                os.close(fd)
 
             _, latest_stat, latest_revision = read_current()
             require_expected(latest_stat, latest_revision)
-            os.replace(
-                temp_name,
-                parts[-1],
-                src_dir_fd=dir_fd,
-                dst_dir_fd=dir_fd,
-            )
+            directory.replace(temp_name, parts[-1])
             temp_name = None
-            os.fsync(dir_fd)
-            saved_stat = os.stat(parts[-1], dir_fd=dir_fd, follow_symlinks=False)
+            directory.fsync()
+            saved_stat = directory.lstat(parts[-1])
             return (
                 display_path,
                 saved_stat.st_size,
@@ -26956,13 +26950,20 @@ class WrapperMachine:
                 hashlib.sha256(payload).hexdigest(),
             )
         finally:
-            if temp_name is not None and dir_fd is not None:
+            if original_fd is not None:
+                os.close(original_fd)
+            if temp_name is not None and directory is not None:
+                # Only reached while an error propagates; never mask it.
                 try:
-                    os.unlink(temp_name, dir_fd=dir_fd)
+                    directory.unlink(temp_name)
                 except FileNotFoundError:
                     pass
-            if dir_fd is not None:
-                os.close(dir_fd)
+                except OSError as exc:
+                    log.warning(
+                        "markdown save temp cleanup failed",
+                        error_type=type(exc).__name__)
+            if directory is not None:
+                directory.close()
 
     @classmethod
     def _read_markdown_preview(
@@ -38359,7 +38360,7 @@ class WrapperMachine:
         temp_dir: str,
         engine: str = "claude",
         *,
-        dir_fd: int | None = None,
+        directory: DirHandle | None = None,
     ) -> str:
         """Write validated files to a private per-turn directory. cc reads
         the `@path` convention; codex has no `@` layer over the app-server and
@@ -38373,7 +38374,8 @@ class WrapperMachine:
             name = f"{i:02d}-{safe}"
             path = os.path.join(temp_dir, name)
             data = decode_attachment(f.get("data", ""))
-            self._write_staged_attachment(path, name, data, dir_fd=dir_fd)
+            self._write_staged_attachment(
+                path, name, data, directory=directory)
             paths.append(path)
             log.info("attachment stashed", index=i, bytes=len(data))
         if engine == "codex":
@@ -38388,25 +38390,25 @@ class WrapperMachine:
         name: str,
         data: bytes,
         *,
-        dir_fd: int | None = None,
+        directory: DirHandle | None = None,
     ) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = (
-            os.open(name, flags, 0o600, dir_fd=dir_fd)
-            if dir_fd is not None
-            else os.open(path, flags, 0o600)
+            directory.open_file(name, flags, 0o600)
+            if directory is not None
+            else platform_files.open_nofollow(path, flags, 0o600)
         )
         try:
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
-                or info.st_uid != current_euid()
+                or not platform_perms.owned_info(
+                    descriptor, info, effective=True)
                 or info.st_nlink != 1
             ):
                 raise RuntimeError("attachment target is not a private file")
             os.fchmod(descriptor, 0o600)
+            platform_perms.make_private_fd(descriptor)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(data)
                 stream.flush()
@@ -38417,49 +38419,39 @@ class WrapperMachine:
     @contextmanager
     def _open_work_upload_dir(cwd: str, msg_id: str):
         """Bind a Work upload directory without following mutable path links."""
-        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-            raise RuntimeError("secure Work upload directories are unsupported")
-        flags = (
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        workspace_fd = uploads_fd = message_fd = -1
+        workspace = uploads = message = None
         try:
             try:
-                workspace_fd = os.open(cwd, flags)
-                workspace_info = os.fstat(workspace_fd)
+                workspace = DirHandle.open_root(cwd)
+                workspace_info = os.fstat(workspace.fd)
                 if (
                     not stat.S_ISDIR(workspace_info.st_mode)
-                    or workspace_info.st_uid != current_euid()
+                    or not platform_perms.owned_info(
+                        workspace.fd, workspace_info, effective=True)
                 ):
                     raise RuntimeError(
                         "Work workspace is not a private directory")
 
                 created_uploads = False
                 try:
-                    os.mkdir("uploads", mode=0o700, dir_fd=workspace_fd)
+                    workspace.mkdir("uploads", 0o700)
                     created_uploads = True
                 except FileExistsError:
                     pass
-                uploads_fd = os.open("uploads", flags, dir_fd=workspace_fd)
-                uploads_info = os.fstat(uploads_fd)
+                uploads = workspace.open_dir("uploads")
+                uploads_info = os.fstat(uploads.fd)
                 if (
                     not stat.S_ISDIR(uploads_info.st_mode)
-                    or uploads_info.st_uid != current_euid()
+                    or not platform_perms.owned_info(
+                        uploads.fd, uploads_info, effective=True)
                 ):
                     raise RuntimeError(
                         "Work uploads path is not a private directory")
                 if created_uploads:
-                    marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                    marker_flags |= (
-                        os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-                    marker_fd = os.open(
+                    marker_fd = uploads.open_file(
                         WORK_UPLOADS_MARKER,
-                        marker_flags,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                         0o600,
-                        dir_fd=uploads_fd,
                     )
                     try:
                         with os.fdopen(
@@ -38470,13 +38462,7 @@ class WrapperMachine:
                     finally:
                         os.close(marker_fd)
 
-                marker_fd = os.open(
-                    WORK_UPLOADS_MARKER,
-                    os.O_RDONLY
-                    | os.O_NOFOLLOW
-                    | getattr(os, "O_CLOEXEC", 0),
-                    dir_fd=uploads_fd,
-                )
+                marker_fd = uploads.open_file(WORK_UPLOADS_MARKER, os.O_RDONLY)
                 try:
                     marker_info = os.fstat(marker_fd)
                     with os.fdopen(
@@ -38486,7 +38472,8 @@ class WrapperMachine:
                             len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
                     if (
                         not stat.S_ISREG(marker_info.st_mode)
-                        or marker_info.st_uid != current_euid()
+                        or not platform_perms.owned_info(
+                            marker_fd, marker_info, effective=True)
                         or marker_info.st_nlink != 1
                         or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
                     ):
@@ -38494,24 +38481,25 @@ class WrapperMachine:
                             "Work uploads path conflicts with workspace content")
                 finally:
                     os.close(marker_fd)
-                os.fchmod(uploads_fd, 0o700)
+                uploads.make_private()
 
-                os.mkdir(msg_id, mode=0o700, dir_fd=uploads_fd)
-                message_fd = os.open(msg_id, flags, dir_fd=uploads_fd)
-                message_info = os.fstat(message_fd)
+                uploads.mkdir(msg_id, 0o700)
+                message = uploads.open_dir(msg_id)
+                message_info = os.fstat(message.fd)
                 if (
                     not stat.S_ISDIR(message_info.st_mode)
-                    or message_info.st_uid != current_euid()
+                    or not platform_perms.owned_info(
+                        message.fd, message_info, effective=True)
                 ):
                     raise RuntimeError("Work message upload path is unsafe")
-                os.fchmod(message_fd, 0o700)
+                message.make_private()
             except OSError as exc:
                 raise RuntimeError("Work upload directory is unsafe") from exc
-            yield str(Path(cwd) / "uploads" / msg_id), message_fd
+            yield str(Path(cwd) / "uploads" / msg_id), message
         finally:
-            for descriptor in (message_fd, uploads_fd, workspace_fd):
-                if descriptor >= 0:
-                    os.close(descriptor)
+            for handle in (message, uploads, workspace):
+                if handle is not None:
+                    handle.close()
 
     def _stash_work_attachments(
         self,
@@ -38522,12 +38510,12 @@ class WrapperMachine:
         msg_id: str,
         engine: str,
     ) -> tuple[str, list[str], str]:
-        with self._open_work_upload_dir(cwd, msg_id) as (directory, dir_fd):
+        with self._open_work_upload_dir(cwd, msg_id) as (directory, handle):
             if files:
                 prompt = self._stash_files(
-                    prompt, files, directory, engine, dir_fd=dir_fd)
+                    prompt, files, directory, engine, directory=handle)
             image_paths = (
-                self._stash_images(images, directory, dir_fd=dir_fd)
+                self._stash_images(images, directory, directory=handle)
                 if images else [])
         return prompt, image_paths, directory
 
@@ -38568,7 +38556,7 @@ class WrapperMachine:
         images: list,
         temp_dir: str,
         *,
-        dir_fd: int | None = None,
+        directory: DirHandle | None = None,
     ) -> list:
         """Write validated images to the private turn directory for Codex."""
         _ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
@@ -38579,7 +38567,8 @@ class WrapperMachine:
             name = f"image-{i:02d}{_ext[mt]}"
             path = os.path.join(temp_dir, name)
             data = decode_attachment(img.get("data", ""))
-            self._write_staged_attachment(path, name, data, dir_fd=dir_fd)
+            self._write_staged_attachment(
+                path, name, data, directory=directory)
             paths.append(path)
             log.info("image stashed", index=i, bytes=len(data))
         return paths
