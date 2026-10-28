@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from cc_remote.log import logger
-from cc_remote.platform import perms
+from cc_remote.platform import files as platform_files
 from cc_remote.wrapper.child_env import claude_profile_process_env
 from cc_remote.wrapper.claude_controls import valid_claude_model
 from cc_remote.wrapper.claude_runtime import resolve_claude_cli
@@ -85,12 +85,13 @@ async def _read_catalog(
         if work_only:
             # Match Work's sole policy source and provider allowlist. Never load
             # user/project customizations or put provider credentials in argv.
-            settings = scope.enter_context(tempfile.NamedTemporaryFile(
-                mode="w+", prefix="cc-remote-models-", suffix=".json"))
-            perms.make_private(settings.name, directory=False)
-            json.dump(_claude_runtime_settings(config_dir), settings)
-            settings.flush()
-            args.extend(["--setting-sources", "", "--settings", settings.name])
+            # The child reopens it by name: close it first, remove it after.
+            fd, settings = platform_files.create_private_temp(
+                tempfile.gettempdir(), prefix="cc-remote-models-", suffix=".json")
+            scope.callback(Path(settings).unlink, missing_ok=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(_claude_runtime_settings(config_dir), stream)
+            args.extend(["--setting-sources", "", "--settings", settings])
         elif isolate_account_env:
             args.extend(["--setting-sources", "user"])
         return await _initialize_catalog(args, cwd, env)

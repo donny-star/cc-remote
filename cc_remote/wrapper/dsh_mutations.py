@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-from cc_remote.platform import files as platform_files
+from cc_remote.platform import files as platform_files, perms
 from cc_remote.wrapper.dsh_client import DshError
 
 
@@ -32,7 +32,10 @@ class DshMutationJournal:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd = platform_files.open_nofollow(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.close(fd)
+            try:
+                perms.make_private_fd(fd)
+            finally:
+                os.close(fd)
             with closing(sqlite3.connect(self.path, timeout=10)) as db:
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA synchronous=FULL")

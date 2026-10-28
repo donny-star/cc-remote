@@ -1,13 +1,13 @@
 """Crash windows at the native write/receipt/ACK boundaries, without a model."""
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
 
 from cc_remote.protocol import CompactSession, ForkSession, NewSession, Query, SetDshControl
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_mutations import DshMutationJournal
+from tests.platform_assertions import assert_private_file, foreign_readable_dir
 from tests.test_dsh_runtime import setup_runtime
 
 
@@ -389,6 +389,7 @@ async def test_request_identity_binds_payload_owner_and_native_authority():
 
 
 def test_journal_serializes_claims_and_rejects_payload_reuse(tmp_path):
+    foreign_readable_dir(tmp_path)
     journal = DshMutationJournal(tmp_path)
     assert journal.begin("id", "original")[0]
     other = DshMutationJournal(tmp_path)
@@ -400,4 +401,4 @@ def test_journal_serializes_claims_and_rejects_payload_reuse(tmp_path):
     _, entry = other.begin("id", "original")
     assert entry["sid"] == "dsh@session"
     assert json.loads(entry["result"]) == {"reply": None}
-    assert Path(journal.path).stat().st_mode & 0o777 == 0o600
+    assert_private_file(journal.path)

@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -16,11 +17,17 @@ from cc_remote.wrapper import session_artifacts
 from cc_remote.wrapper.session_artifacts import (
     ArtifactStorageFull, SessionArtifactStore, image_thumbnail, local_links, public_entry,
 )
+from tests.platform_assertions import assert_private_dir, assert_private_file, foreign_readable_dir
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 def test_artifact_upload_survives_reopen_and_has_isolated_identity(tmp_path):
+    foreign_readable_dir(tmp_path)
+    # A pre-existing root that inherited the foreign read grant is made private.
+    (tmp_path / "session-artifacts").mkdir()
     store = SessionArtifactStore(tmp_path)
+    assert_private_dir(store.root)
+    assert_private_file(store.path)
     files = [{"filename": "notes.txt", "data": base64.b64encode(b"keep me").decode()}]
     store.uploads("session-a", "msg", files)
     store.uploads("session-a", "msg", files)
@@ -28,7 +35,7 @@ def test_artifact_upload_survives_reopen_and_has_isolated_identity(tmp_path):
     rows, _, more = reopened.page("session-a")
     assert len(rows) == 1 and not more
     assert Path(rows[0]["path"]).read_bytes() == b"keep me"
-    assert Path(rows[0]["path"]).stat().st_mode & 0o777 == 0o600
+    assert_private_file(rows[0]["path"])
     assert reopened.page("session-b")[0] == []
     assert reopened.get("session-b", rows[0]["id"]) is None
     assert public_entry(rows[0])["available"] is True
@@ -394,6 +401,21 @@ async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalo
     assert {row["path"] for row in service.store.page(cold_scope)[0]} == {
         str(output / name) for name in names}
     assert service.store.page(service.scope(engine, "code", "unrelated"))[0] == []
+
+
+def test_artifact_root_directory_link_is_rejected(tmp_path):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    link = tmp_path / "session-artifacts"
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(OSError, match="unsafe artifact directory"):
+        SessionArtifactStore(tmp_path)
+    assert list(target.iterdir()) == []
 
 
 def test_artifact_root_symlink_is_rejected(tmp_path):

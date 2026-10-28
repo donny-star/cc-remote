@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cc_remote.wrapper import claude_models as models
-from tests.platform_assertions import assert_private_file
+from tests.platform_assertions import assert_private_file, foreign_readable_dir
 
 
 def test_native_catalog_keeps_new_models_and_exact_effort_capabilities():
@@ -114,12 +114,17 @@ async def test_probe_only_initializes_and_always_reaps_child(
     async def spawn_child(*args, **kwargs):
         if work_only:
             path = Path(args[args.index("--settings") + 1])
+            assert path.parent == shared_temp
             assert_private_file(path)
             assert json.loads(path.read_text()) == {
                 "model": "work-model", "env": {"ANTHROPIC_API_KEY": "profile-key"}}
         return proc
 
     spawn = AsyncMock(side_effect=spawn_child)
+    shared_temp = tmp_path / "shared-temp"
+    shared_temp.mkdir()
+    foreign_readable_dir(shared_temp)
+    monkeypatch.setattr(models.tempfile, "tempdir", str(shared_temp))
     monkeypatch.setattr(models.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(models, "_TIMEOUT", 0.01)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-credential")

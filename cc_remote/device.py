@@ -11,7 +11,6 @@ import os
 import platform
 import socket
 import sys
-import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -51,11 +50,11 @@ def _write_private_text(path: Path, content: str, *, replace: bool) -> None:
         raise FileExistsError(
             f"device config already exists: {path} (pass --replace to replace it)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, staged_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, staged_name = platform_files.create_private_temp(
+        path.parent, prefix=f".{path.name}.")
     staged = Path(staged_name)
     try:
-        os.fchmod(fd, 0o600)
-        perms.make_private(staged, directory=False)
+        platform_files.fchmod(fd, staged, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(content)

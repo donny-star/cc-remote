@@ -10,7 +10,6 @@ import asyncio
 import getpass
 import json
 import os
-import tempfile
 from pathlib import Path
 
 from cc_remote.platform import files as platform_files, perms
@@ -25,10 +24,9 @@ def save_connection(connection: DshConnection, path: Path) -> None:
     info = path.parent.stat()
     if not perms.owned_info(path.parent, info) or not perms.no_foreign_write_info(path.parent, info):
         raise DshError("invalid_connection", "配对文件所在目录必须由当前用户拥有且其他用户不可写。")
-    fd, staging = tempfile.mkstemp(prefix=".dsh-pair-", dir=path.parent)
+    fd, staging = platform_files.create_private_temp(path.parent, prefix=".dsh-pair-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            perms.make_private(staging, directory=False)
             json.dump({"schema": 1, "origin": connection.origin, "token": connection.token}, stream)
             stream.write("\n")
             stream.flush()

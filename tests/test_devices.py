@@ -18,7 +18,9 @@ from cc_remote.relay.auth import SESSION_COOKIE_NAME, session_token_claims
 from cc_remote.relay import server
 from cc_remote.relay.devices import DeviceStore
 from cc_remote.relay.server import create_app
-from tests.platform_assertions import assert_private_file, grant_foreign_read
+from tests.platform_assertions import (
+    assert_private_file, foreign_readable_dir, grant_foreign_read,
+)
 
 
 def _cfg(tmp_path, **overrides) -> RelayConfig:
@@ -323,6 +325,7 @@ def test_pairing_cli_writes_private_config_without_printing_token(
             }
 
     monkeypatch.setattr(device_cli.httpx, "post", lambda *args, **kwargs: Response())
+    foreign_readable_dir(tmp_path)
     target = tmp_path / "device.json"
     args = Namespace(
         relay="https://remote.example",

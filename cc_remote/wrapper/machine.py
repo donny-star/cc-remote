@@ -9058,7 +9058,7 @@ class WrapperMachine:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(tmp, path)
+            platform_files.replace(tmp, path)
             # Make the rename durable, not merely atomic in the page cache.
             platform_files.fsync_directory(path.parent)
         except Exception as exc:
