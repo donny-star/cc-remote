@@ -11,6 +11,11 @@ _WAIT_TIMEOUT = 0x102
 _PROCESS_COMMAND_LINE_INFORMATION = 60
 _TH32CS_SNAPPROCESS = 0x00000002
 _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+_ERROR_ACCESS_DENIED = 5
+_PROCESS_VM_READ = 0x0010
+_PROCESS_BASIC_INFORMATION = 0
+_MAX_CWD_BYTES = 32 * 1024
+_MAX_ENVIRONMENT_BYTES = 256 * 1024
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ntdll = ctypes.WinDLL("ntdll")
@@ -26,6 +31,13 @@ _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
 _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 _kernel32.LocalFree.restype = ctypes.c_void_p
+_kernel32.ReadProcessMemory.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_kernel32.ReadProcessMemory.restype = wintypes.BOOL
+_kernel32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+_kernel32.IsWow64Process.restype = wintypes.BOOL
 _ntdll.NtQueryInformationProcess.argtypes = [
     wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
     ctypes.POINTER(wintypes.ULONG),
@@ -62,6 +74,17 @@ _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEn
 _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
 
 
+class _ProcessBasicInformation(ctypes.Structure):
+    _fields_ = [
+        ("ExitStatus", ctypes.c_long),
+        ("PebBaseAddress", ctypes.c_void_p),
+        ("AffinityMask", ctypes.c_size_t),
+        ("BasePriority", ctypes.c_long),
+        ("UniqueProcessId", ctypes.c_size_t),
+        ("InheritedFromUniqueProcessId", ctypes.c_size_t),
+    ]
+
+
 def _open(pid: int, access: int = _PROCESS_QUERY_LIMITED_INFORMATION) -> int | None:
     if pid <= 0:
         return None
@@ -84,6 +107,23 @@ def creation_time(pid: int) -> int | None:
         return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
     finally:
         _kernel32.CloseHandle(handle)
+
+
+def access_denied(pid: int) -> bool:
+    """Whether a live process refuses the access :func:`creation_time` needs.
+
+    ``creation_time`` is None both once a process exited and when this token
+    may not open it; scans that must fail closed on a hidden live process
+    tell the two apart here. A missing PID fails with ERROR_INVALID_PARAMETER.
+    """
+    if pid <= 0:
+        return False
+    handle = _kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid)
+    if handle:
+        _kernel32.CloseHandle(handle)
+        return False
+    return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
 
 
 def command_line(pid: int) -> str | None:
@@ -171,3 +211,71 @@ def all_pids() -> tuple[int, ...]:
     import win32process
 
     return tuple(int(pid) for pid in win32process.EnumProcesses())
+
+
+def _read(handle: int, address: int, size: int) -> bytes | None:
+    """Exactly ``size`` bytes of the target's memory, or None."""
+    if address <= 0 or size < 0:
+        return None
+    buffer = ctypes.create_string_buffer(size)
+    read = ctypes.c_size_t(0)
+    if not _kernel32.ReadProcessMemory(
+            handle, ctypes.c_void_p(address), buffer, size, ctypes.byref(read)):
+        return None
+    return buffer.raw if read.value == size else None
+
+
+def _environment_entries(block: bytes) -> tuple[str, ...]:
+    """``K=V`` entries of a UTF-16 environment block, up to its double NUL."""
+    text = block.decode("utf-16-le", "surrogatepass")
+    return tuple(item for item in text.split("\0\0", 1)[0].split("\0") if item)
+
+
+def process_parameters(pid: int) -> tuple[str, tuple[str, ...]] | None:
+    """Current directory and environment of a 64-bit process, from its PEB.
+
+    Offsets are those of the x64 PEB and RTL_USER_PROCESS_PARAMETERS
+    (ProcessParameters +0x20; CurrentDirectory.DosPath +0x38; Environment
+    +0x80; EnvironmentSize +0x3F0). WOW64 targets, unreadable memory and
+    empty or oversized blocks return None; callers recheck the identity.
+    """
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        return None
+    handle = _open(pid, _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_VM_READ)
+    if handle is None:
+        return None
+    try:
+        wow64 = wintypes.BOOL(False)
+        if not _kernel32.IsWow64Process(handle, ctypes.byref(wow64)) or wow64.value:
+            return None
+        basic = _ProcessBasicInformation()
+        returned = wintypes.ULONG(0)
+        if _ntdll.NtQueryInformationProcess(
+                handle, _PROCESS_BASIC_INFORMATION, ctypes.byref(basic),
+                ctypes.sizeof(basic), ctypes.byref(returned)) != 0:
+            return None
+        raw = _read(handle, int(basic.PebBaseAddress or 0) + 0x20, 8)
+        if raw is None:
+            return None
+        parameters = int.from_bytes(raw, "little")
+        raw = _read(handle, parameters + 0x38, 16)
+        if raw is None:
+            return None
+        length = int.from_bytes(raw[0:2], "little")
+        if not length or length % 2 or length > _MAX_CWD_BYTES:
+            return None
+        text = _read(handle, int.from_bytes(raw[8:16], "little"), length)
+        raw_env = _read(handle, parameters + 0x80, 8)
+        raw_size = _read(handle, parameters + 0x3F0, 8)
+        if text is None or raw_env is None or raw_size is None:
+            return None
+        size = int.from_bytes(raw_size, "little")
+        if not size or size % 2 or size > _MAX_ENVIRONMENT_BYTES:
+            return None
+        block = _read(handle, int.from_bytes(raw_env, "little"), size)
+        if block is None:
+            return None
+        cwd = os.path.normpath(text.decode("utf-16-le", "surrogatepass"))
+        return cwd, _environment_entries(block)
+    finally:
+        _kernel32.CloseHandle(handle)

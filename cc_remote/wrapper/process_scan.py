@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -317,6 +318,114 @@ def darwin_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
     return result, complete
 
 
+_WIN32_HEADLESS_ARGS = frozenset({b"app-server", b"mcp-server", b"exec", b"execpolicy"})
+
+
+def win32_tty(args: tuple[bytes, ...]) -> int:
+    """Stand-in for tty_nr on Windows, which has no controlling terminal to read.
+
+    Codex helpers that never own a terminal (app-server, proxies, exec, MCP)
+    count as headless (0); every other process counts as interactive (1).
+    The ownership predicates only compare tty_nr with 0, so this reproduces
+    their POSIX classification from argv alone.
+    """
+    return 0 if _WIN32_HEADLESS_ARGS.intersection(args) else 1
+
+
+def _win32_row(pid: int, ppid: int) -> DarwinProcessInfo | None:
+    """One row while the creation time is stable around the argv read.
+
+    Unreadable or oversized argv yields ``()`` like /proc cmdline, so the row
+    still links ancestry; only a vanished or unopenable process is dropped.
+    """
+    from cc_remote.platform import win32_process
+
+    before = win32_process.creation_time(pid)
+    if before is None:
+        return None
+    args = win32_process.argv(pid)
+    if win32_process.creation_time(pid) != before:
+        return None
+    if args is None or sum(len(arg) + 1 for arg in args) > MAX_CMDLINE_BYTES:
+        args = ()
+    return ProcessIdentity(pid, before), ppid, win32_tty(args), args
+
+
+def _win32_live_parent(ppid: int, child_ticks: int, parent_ticks: int | None) -> int:
+    # Windows never reparents orphans: a parent pid created after its child
+    # names a reused pid, not the real (exited) parent.
+    return 0 if parent_ticks is not None and parent_ticks > child_ticks else ppid
+
+
+def win32_process_info(pid: int) -> DarwinProcessInfo | None:
+    """One exact Windows process row, or None once it exited or is unopenable."""
+    from cc_remote.platform import win32_process
+
+    if pid in (0, 4):
+        return None
+    parents = win32_process.parent_map()
+    if parents is None or pid not in parents:
+        return None
+    row = _win32_row(pid, parents[pid])
+    if row is None:
+        return None
+    identity, ppid, tty_nr, args = row
+    ppid = _win32_live_parent(
+        ppid, identity.start_ticks, win32_process.creation_time(ppid))
+    return identity, ppid, tty_nr, args
+
+
+def win32_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
+    """Windows counterpart of :func:`darwin_process_snapshot` (same row shape).
+
+    Processes that cannot be opened (protected, elevated or another user's)
+    are skipped without making the scan incomplete: they are not this login's
+    Claude/Codex clients, and failing closed on them would make every session
+    read-only forever.
+    """
+    from cc_remote.platform import win32_process
+
+    parents = win32_process.parent_map()
+    if parents is None or len(parents) > MAX_PROC_SCAN:
+        return [], False
+    rows: list[DarwinProcessInfo] = []
+    for pid, ppid in parents.items():
+        if pid in (0, 4):  # System Idle Process, System
+            continue
+        row = _win32_row(pid, ppid)
+        if row is not None:
+            rows.append(row)
+    ticks = {row[0].pid: row[0].start_ticks for row in rows}
+    return [
+        (identity, _win32_live_parent(ppid, identity.start_ticks, ticks.get(ppid)),
+         tty_nr, args)
+        for identity, ppid, tty_nr, args in rows
+    ], True
+
+
+def win32_process_cwds(pids: Collection[int]) -> tuple[dict[int, str], bool]:
+    """Current directories by pid; incomplete when a live process hides its cwd."""
+    from cc_remote.platform import win32_process
+
+    result: dict[int, str] = {}
+    complete = True
+    for pid in pids:
+        before = win32_process.creation_time(pid)
+        if before is None:
+            if win32_process.access_denied(pid):
+                complete = False
+            continue
+        params = win32_process.process_parameters(pid)
+        after = win32_process.creation_time(pid)
+        if after != before:
+            continue  # exited or replaced: no longer the process asked about
+        if params is None:
+            complete = False
+            continue
+        result[pid] = os.path.realpath(params[0])
+    return result, complete
+
+
 def process_identity(pid: int, *, proc_root: str = "/proc",
                      parent_pid: int | None = None) -> ProcessIdentity | None:
     if IS_WINDOWS and proc_root == "/proc":
@@ -422,6 +531,21 @@ def process_command_environment_value(
         or any(not (char.isalnum() or char == "_") for char in key)
     ):
         return False, None, None
+    if IS_WINDOWS and proc_root == "/proc":
+        from cc_remote.platform import win32_process
+
+        if win32_process.creation_time(identity.pid) != identity.start_ticks:
+            return False, None, None
+        args = win32_process.argv(identity.pid)
+        params = win32_process.process_parameters(identity.pid)
+        if (args is None or params is None
+                or win32_process.creation_time(identity.pid) != identity.start_ticks):
+            return False, None, None
+        environment = tuple(os.fsencode(item) for item in params[1])
+        if sum(len(item) + 1 for item in environment) > MAX_ENVIRON_BYTES:
+            return False, None, None
+        complete, value = _environment_value(environment, key)
+        return complete, args, value
     proc_dir = Path(proc_root) / str(identity.pid)
     stat = _process_stat(proc_dir)
     if stat is not None:
