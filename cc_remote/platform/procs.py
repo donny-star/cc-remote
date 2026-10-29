@@ -211,7 +211,8 @@ def hide_child_consoles() -> None:
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetConsoleWindow.restype = ctypes.c_void_p
-    if kernel32.GetConsoleWindow() or not kernel32.AllocConsole():
+    # A windowless console (CREATE_NO_WINDOW) has no window but a code page.
+    if kernel32.GetConsoleCP() or not kernel32.AllocConsole():
         return
     window = kernel32.GetConsoleWindow()
     if window:
