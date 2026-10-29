@@ -198,4 +198,27 @@ else:
     def killpg(pid: int, sig: int) -> None:
         os.killpg(pid, sig)
 
-__all__ = ["SIGKILL", "SIGTERM", "SIGTERM_IS_GRACEFUL", "create_subprocess_exec_group", "killpg", "popen_group"]
+def hide_child_consoles() -> None:
+    """Give a console-less (pythonw) process one hidden console for its children.
+
+    Windows opens a new visible window for every console program (node.exe,
+    claude.exe, git) started by a process that has no console. Children
+    inherit this hidden console instead. No-op on POSIX or with a console.
+    """
+    if not IS_WINDOWS:
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+    if kernel32.GetConsoleWindow() or not kernel32.AllocConsole():
+        return
+    window = kernel32.GetConsoleWindow()
+    if window:
+        ctypes.WinDLL("user32").ShowWindow(ctypes.c_void_p(window), 0)  # SW_HIDE
+
+
+__all__ = [
+    "SIGKILL", "SIGTERM", "SIGTERM_IS_GRACEFUL", "create_subprocess_exec_group",
+    "hide_child_consoles", "killpg", "popen_group",
+]

@@ -5,6 +5,7 @@ import asyncio
 
 from cc_remote.config import validate_wrapper_config, wrapper_config
 from cc_remote.log import logger
+from cc_remote.platform import procs
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.transport import WrapperTransport
 from cc_remote.wrapper.child_env import scrub_parent_control_secrets
@@ -62,6 +63,7 @@ async def run_wrapper() -> None:
 
 
 if __name__ == "__main__":
+    procs.hide_child_consoles()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
