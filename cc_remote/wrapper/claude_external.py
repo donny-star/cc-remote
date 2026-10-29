@@ -17,8 +17,10 @@ from typing import Callable, Collection, Literal, Mapping
 from cc_remote.wrapper.codex_external import (
     HolderScan,
 )
+from cc_remote.platform import IS_WINDOWS
 from cc_remote.wrapper.process_scan import (
     MAX_PROC_SCAN,
+    DarwinProcessInfo,
     ProcessIdentity,
     _process_cmdline,
     _process_start_ticks,
@@ -26,6 +28,8 @@ from cc_remote.wrapper.process_scan import (
     darwin_process_snapshot,
     process_command_environment_value,
     process_identity,
+    win32_process_cwds,
+    win32_process_snapshot,
 )
 
 
@@ -335,7 +339,15 @@ def _darwin_process_cwds(
     return result, True
 
 
-def _darwin_claude_session_holders(
+def _win32_canonical_cwds(
+    pids: Collection[int],
+) -> tuple[dict[int, str], bool]:
+    """PEB current directories, spelled like the realpath'd session cwds."""
+    cwds, complete = win32_process_cwds(pids)
+    return {pid: os.path.realpath(cwd) for pid, cwd in cwds.items()}, complete
+
+
+def _snapshot_claude_session_holders(
     paths: Mapping[str, str],
     cwds: Mapping[str, str],
     *,
@@ -347,9 +359,11 @@ def _darwin_claude_session_holders(
     native_session_ids: Mapping[str, str] | None,
     default_config_dir: str | None,
     owner_identities: Collection[ProcessIdentity] = (),
+    snapshot_reader: Callable[[], tuple[list[DarwinProcessInfo], bool]] | None = None,
+    cwd_reader: Callable[[Collection[int]], tuple[dict[int, str], bool]] | None = None,
 ) -> HolderScan:
     holders = {sid: set() for sid in paths}
-    snapshot, complete = darwin_process_snapshot()
+    snapshot, complete = (snapshot_reader or darwin_process_snapshot)()
     if not complete:
         return HolderScan(holders, False)
     parent_by_pid = {info[0].pid: info[1] for info in snapshot}
@@ -364,7 +378,7 @@ def _darwin_claude_session_holders(
     if len(candidates) > _MAX_DARWIN_CLAUDE_CANDIDATES:
         return HolderScan(holders, False)
 
-    process_cwds, cwd_scan_complete = _darwin_process_cwds(
+    process_cwds, cwd_scan_complete = (cwd_reader or _darwin_process_cwds)(
         [info[0].pid for info in candidates])
     cwd_sids: dict[str, set[str]] = {}
     for sid in paths:
@@ -493,7 +507,7 @@ def claude_session_holders(
     candidates = (
         continue_candidates if continue_candidates is not None else {})
     if sys.platform == "darwin" and proc_root == "/proc":
-        return _darwin_claude_session_holders(
+        return _snapshot_claude_session_holders(
             paths,
             cwds,
             wrapper_pid=wrapper_pid,
@@ -504,6 +518,21 @@ def claude_session_holders(
             native_session_ids=native_session_ids,
             default_config_dir=default_config_dir,
             owner_identities=owner_identities,
+        )
+    if IS_WINDOWS and proc_root == "/proc":
+        return _snapshot_claude_session_holders(
+            paths,
+            cwds,
+            wrapper_pid=wrapper_pid,
+            continue_bindings=bindings,
+            continue_candidates=candidates,
+            continue_resolver=continue_resolver,
+            config_dirs=config_dirs,
+            native_session_ids=native_session_ids,
+            default_config_dir=default_config_dir,
+            owner_identities=owner_identities,
+            snapshot_reader=win32_process_snapshot,
+            cwd_reader=_win32_canonical_cwds,
         )
     owned_roots = {
         identity.pid for identity in owner_identities

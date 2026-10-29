@@ -651,7 +651,7 @@ def test_claude_takeover_signals_only_same_identity_and_uid(monkeypatch):
         signals = []
         monkeypatch.setattr(machine_module, "process_identity", current)
         monkeypatch.setattr(
-            machine_module, "process_owner_uid", lambda _pid: machine_module.os.getuid())
+            machine_module, "process_owner_uid", lambda _pid: machine_module.current_uid())
         monkeypatch.setattr(
             machine_module.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
